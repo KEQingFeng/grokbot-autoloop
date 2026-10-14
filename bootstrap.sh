@@ -1,246 +1,138 @@
 #!/usr/bin/env bash
-# AutoLoop bootstrap — one run per cloud box, safe to re-run.
+# 一键安装 AutoLoop 监工插件：装进 dsh 的技能目录，并对目标仓库做预检。
 #
-#   bash bootstrap.sh                probe only, writes .autoloop/boot.json
-#   bash bootstrap.sh --install      print the exact package commands, change nothing
-#   bash bootstrap.sh --install --yes  run those commands, then probe again
-#   bash bootstrap.sh --repo /path/to/repo
+# 可重复执行（idempotent）：已经装着且内容一致时只报告，不覆盖；内容有变化时
+# 更新，并在更新前把旧版本备份到 ~/.dsh/skills-backup/。
 #
-# What this script never does:
-#   * install a system dependency without --install AND --yes (both flags, no default)
-#   * start, register or claim any daemon, service, or scheduled task
-#   * write a credentials or token anywhere
-#   * pick a worker CLI for you (it lists what exists; you set runner.cmd)
-#   * report ok=true for a tool it did not actually execute
+#   bash bootstrap.sh                       # 安装 + 探测环境 + 对当前目录跑 preflight
+#   bash bootstrap.sh /path/to/目标仓库      # 同上，位置参数也接受
+#   bash bootstrap.sh --repo /path/to/仓库   # 同上，长选项
+#   bash bootstrap.sh --install              # 额外打印缺失工具的安装命令（只打印）
+#   AUTOLOOP_TEST_CMD='npm test' bash bootstrap.sh /path/to/仓库
+#   FORCE=1 bash bootstrap.sh               # 内容不一致时强制刷新
 #
-# boot.json is the stamp the engine reads. A tick whose boot.json is missing or
-# ok=false reports "never bootstrapped" instead of quietly failing later.
+# 这个脚本不装任何后台进程、不改你的 git 配置、不碰 GitHub、不替你 apt-get ——
+# 它只做三件事：复制技能文件、检查环境、告诉你下一步该敲哪条命令。
+# --install 会列出 env.manifest 里缺失项对应的安装命令，但坚持由你亲手执行：
+# §八 把「为解决问题而大规模重装、覆盖或重置现有环境」列为禁止项，插件不自作主张。
 set -uo pipefail
 
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MANIFEST="$SELF_DIR/env.manifest"
-ENGINE="$SELF_DIR/scripts/autoloop.py"
-REPO_ARG=""
-INSTALL=0
-YES=0
-PLAN_ONLY=0
+SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEST_ROOT="${DSH_SKILLS:-$HOME/.dsh/skills}"
+DEST="$DEST_ROOT/grokbot-autoloop"
+BACKUP_ROOT="${DSH_SKILLS_BACKUP:-$HOME/.dsh/skills-backup}"
+TARGET=""
+PLAN=0
+TEST_CMD="${AUTOLOOP_TEST_CMD:-}"
+PY="${PYTHON:-python3}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --repo)    REPO_ARG="${2:-}"; shift 2 ;;
-    --install) INSTALL=1; shift ;;
-    --yes)     YES=1; shift ;;
-    --plan)    INSTALL=1; PLAN_ONLY=1; shift ;;
-    -h|--help) sed -n '1,26p' "${BASH_SOURCE[0]}"; exit 0 ;;
-    *) echo "unknown flag: $1 (try --help)" >&2; exit 2 ;;
+    --repo)  TARGET="${2:-}"; if [ $# -ge 2 ]; then shift 2; else shift; fi ;;
+    --install|--install-yes|--yes) PLAN=1; shift ;;
+    --force) FORCE=1; shift ;;
+    -h|--help) sed -n '1,17p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    --*) echo "!! 未知参数: $1（--repo <路径> / --install / --force / --help）" >&2; exit 2 ;;
+    *)   TARGET="$1"; shift ;;
   esac
 done
-
-say()  { printf '%s\n' "$*"; }
-miss() { MISSING="$MISSING $1"; NOTES="$NOTES|$2"; }
-MISSING=""
-NOTES=""
-TOOLS=""
-WORKERS_FOUND=""
-
-# ---------------------------------------------------------------- repo
-if [ -z "$REPO_ARG" ]; then REPO_ARG="${AUTOLOOP_REPO:-$(pwd)}"; fi
-REPO="$(cd "$REPO_ARG" 2>/dev/null && pwd)" || { say "REPO PATH NOT FOUND: $REPO_ARG"; exit 2; }
-if [ ! -d "$REPO/.git" ] && ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
-  say "NOT A GIT REPO: $REPO"
-  say "  autoloop works on one repository at a time — cd into it or pass --repo."
-  say "  boot.json was NOT written (a false 'ok' in the wrong place is worse than none)."
+RAW_TARGET="${TARGET:-${AUTOLOOP_REPO:-$PWD}}"
+TARGET="$(cd "$RAW_TARGET" 2>/dev/null && pwd)" || {
+  echo "!! 目标仓库路径不存在: $RAW_TARGET —— 用 --repo <真实路径>，或先 cd 进仓库" >&2
   exit 2
-fi
-
-sha256() {
-  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" 2>/dev/null | awk '{print $1}'
-  else shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'; fi
 }
-firstline() { printf '%s' "$1" | tr -d '\r' | sed -n '1p' | cut -c1-44; }
 
-say "== AutoLoop bootstrap — $REPO"
-say ""
+echo "AutoLoop bootstrap"
+echo "  源: $SRC"
+echo "  目标仓库: $TARGET"
 
-# ---------------------------------------------------------------- probe
-if [ ! -f "$MANIFEST" ]; then
-  say "! $MANIFEST missing — cannot probe the environment honestly."
-  exit 2
-fi
+for need in git "$PY"; do
+  command -v "$need" >/dev/null 2>&1 || { echo "!! 缺少 $need，先装它（§八 禁止脚本自动重装环境）"; exit 2; }
+done
 
-TOOL_LINES=""
-while IFS=$'	' read -r NAME REQ CHECK HINT WHY; do
-  case "$NAME" in ''|'#'*) continue ;; esac
-  [ "$NAME" = "name" ] && continue
-  if [ "$REQ" = "worker" ]; then
-    printf '  [info] %-10s %-8s which CLIs exist is listed below; runner.cmd decides who pays\n' "$NAME" "$REQ"
-    continue
-  fi
-  if bash -c "$CHECK" >/dev/null 2>&1; then
-    VER="$(bash -c "$CHECK" 2>/dev/null | head -1)"
-    [ -z "$TOOLS" ] || TOOLS="$TOOLS, "
-    if [ -n "$VER" ]; then TOOLS="$TOOLS$NAME=$(firstline "$VER")"; else TOOLS="$TOOLS$NAME"; fi
-    printf '  [ok]   %-10s %-8s %s\n' "$NAME" "$REQ" "$(firstline "$VER")"
-  else
-    printf '  [MISS] %-10s %-8s %s\n' "$NAME" "$REQ" "$WHY"
-    case "$REQ" in
-      required) miss "$NAME" "required tool missing: $NAME — $WHY" ;;
-      pr)       NOTES="$NOTES|gh missing — ticks will push branches and print PR bodies instead of opening PRs" ;;
-      sched)    NOTES="$NOTES|crontab missing — use a Grok Bot native scheduled task to wake the bot" ;;
-      *)        NOTES="$NOTES|optional: $NAME absent" ;;
+# env.manifest 是工具清单（TAB 分隔）。这里只探测、只打印，不执行 install_hint。
+if [ -f "$SRC/env.manifest" ]; then
+  echo
+  echo "── 环境探测（env.manifest；required 缺了跑不了循环，pr 缺了只能出分支不能出 PR）"
+  while IFS=$'\t' read -r alo_name alo_req alo_check alo_hint alo_why; do
+    case "$alo_name" in ''|\#*|name) continue ;;
     esac
-  fi
-  # worker row is a policy, not a binary: enumerate the real CLIs separately below
-  [ "$NAME" = "worker" ] && continue
-done < "$MANIFEST"
-
-for CLI in dsh codex claude qoder grok aider opencode; do
-  if command -v "$CLI" >/dev/null 2>&1; then
-    V="$(bash -c "$CLI --version" 2>/dev/null | head -1)"
-    [ -z "$WORKERS_FOUND" ] || WORKERS_FOUND="$WORKERS_FOUND, "
-    WORKERS_FOUND="$WORKERS_FOUND$CLI$( [ -n "$V" ] && printf ' (%s)' "$(firstline "$V")")"
-  fi
-done
-say ""
-say "worker CLIs on this box: ${WORKERS_FOUND:-NONE}"
-RUNNER="${AUTOLOOP_WORKER_CMD:-}"
-[ -z "$RUNNER" ] && [ -f "$REPO/.autoloop/config.json" ] && \
-  RUNNER="$(python3 -c 'import json,sys;print((json.load(open(sys.argv[1])).get("runner") or {}).get("cmd",""))' \
-            "$REPO/.autoloop/config.json" 2>/dev/null)"
-if [ -z "$RUNNER" ]; then
-  say "runner.cmd: NOT SET — every tick will report 'no-runner' and do no coding. That is"
-  say "            the engine refusing to guess which account pays for the work."
-  if [ -n "$WORKERS_FOUND" ]; then
-    NOTES="$NOTES|runner.cmd not set although these worker CLIs exist: $WORKERS_FOUND"
-  else
-    NOTES="$NOTES|no worker CLI found on PATH (dsh/codex/claude/qoder/grok/aider/opencode)"
-  fi
-else
-  say "runner.cmd: $RUNNER"
-  NOTES="$NOTES|runner.cmd is set but its headless flag is unverified — run one job by hand before scheduling"
-fi
-
-GH_AUTH="absent"
-if command -v gh >/dev/null 2>&1; then
-  if gh auth status >/dev/null 2>&1; then GH_AUTH="ok"; else GH_AUTH="NOT LOGGED IN"; fi
-  say "gh auth: $GH_AUTH"
-  [ "$GH_AUTH" = "NOT LOGGED IN" ] && \
-    NOTES="$NOTES|gh is installed but unauthenticated — run 'gh auth login' on this box before relying on the PR step"
-fi
-
-ENGINE_SHA="$(sha256 "$ENGINE" 2>/dev/null)"
-PY="$(python3 -c 'import platform;print(platform.python_version())' 2>/dev/null)"
-PKG="none"
-for C in apt-get dnf yum apk brew; do
-  if command -v "$C" >/dev/null 2>&1; then PKG="$C"; break; fi
-done
-SUDO=""
-if [ "$(id -u)" != "0" ] && command -v sudo >/dev/null 2>&1; then SUDO="sudo"; fi
-
-# ---------------------------------------------------------------- install (opt-in)
-if [ "$INSTALL" = 1 ]; then
-  say ""
-  say "== missing packages (install plan)"
-  ANY=0
-  while IFS=$'	' read -r NAME REQ CHECK HINT WHY; do
-    case "$NAME" in ''|'#'*|name) continue ;; esac
-    bash -c "$CHECK" >/dev/null 2>&1 && continue
-    [ -z "$HINT" ] || [ "$HINT" = "—" ] && continue
-    ANY=1
-    say "  $SUDO bash -c \"$HINT\"     # $WHY"
-    [ "$REQ" = "sched" ] && say "    ^ this one starts the box's cron daemon. A Grok Bot native" \
-                             && say "      scheduled task does the same job without touching services."
-  done < "$MANIFEST"
-  if [ "$ANY" = 0 ]; then
-    say "  nothing the manifest lists is missing."
-  elif [ "$PKG" = "none" ]; then
-    say "  no known package manager on PATH — install by hand, then re-run."
-  elif [ "$YES" != 1 ] || [ "$PLAN_ONLY" = 1 ]; then
-    say ""
-    say "PLAN ONLY. Nothing was installed. Re-run with:  bash bootstrap.sh --install --yes"
-    say "(this box may auto-update when idle, so a re-probe after any install is expected.)"
-  else
-    say ""
-    say "installing (explicit --yes; this touches system packages):"
-    while IFS=$'	' read -r NAME REQ CHECK HINT WHY; do
-      case "$NAME" in ''|'#'*|name) continue ;; esac
-      bash -c "$CHECK" >/dev/null 2>&1 && continue
-      [ -z "$HINT" ] || [ "$HINT" = "—" ] && continue
-      say "  $SUDO bash -c \"$HINT\""
-      # word-split on purpose: "$HINT" is one command string, so run it through bash -c
-      $SUDO bash -c "$HINT" >/dev/null 2>&1 || NOTES="$NOTES|install of $NAME failed: $HINT"
-    done < "$MANIFEST"
-    say ""
-    if [ "${AUTOLOOP_BOOT_REPROBED:-}" = 1 ]; then
-      say "already re-probed once after installing — stopping here instead of looping."
-      say "run: bash bootstrap.sh   to read the state of this box again."
-      exit 1
+    if sh -c "$alo_check" >/dev/null 2>&1; then
+      printf '  [ok]   %-9s %s\n' "$alo_name" "$alo_req"
+    else
+      printf '  [缺]   %-9s %s — %s\n' "$alo_name" "$alo_req" "$alo_why"
+      if [ "$PLAN" = 1 ] && [ -n "$alo_hint" ] && [ "$alo_hint" != "—" ]; then
+        printf '         → 由你执行: %s\n' "$alo_hint"
+      fi
     fi
-    say "re-probing (once; AUTOLOOP_BOOT_REPROBED guards against a loop). No --install"
-    say "on the re-run, so this pass only reads the box and rewrites the stamp."
-    AUTOLOOP_BOOT_REPROBED=1 exec bash "${BASH_SOURCE[0]}" --repo "$REPO"
+  done < "$SRC/env.manifest"
+  if [ "$PLAN" != 1 ]; then
+    echo "  （加 --install 才打印缺失项的安装命令；本脚本不会替你执行它们）"
   fi
 fi
 
-# ---------------------------------------------------------------- stamp
-OK_JSON=true
-[ -n "$MISSING" ] && OK_JSON=false
-NOTES_JSON="$(printf '%s' "$NOTES" | tr '|' '\n' | sed '/^$/d' | python3 -c '
-import json,sys
-print(json.dumps([l.strip() for l in sys.stdin if l.strip()], ensure_ascii=False))
-' 2>/dev/null)"
-[ -n "$NOTES_JSON" ] || NOTES_JSON="[]"
-CFG="missing"; [ -f "$REPO/.autoloop/config.json" ] && CFG="present"
-GATE="missing"; [ -f "$REPO/.autoloop/verify.sh" ] && GATE="present"
-DOCTOR="not-run"
-if [ -n "$PY" ] && [ -n "$ENGINE_SHA" ]; then
-  if python3 "$ENGINE" --repo "$REPO" doctor >/dev/null 2>&1; then DOCTOR="pass"; else DOCTOR="fail"; fi
+changed=0
+if [ -d "$DEST" ]; then
+  if diff -rq --exclude=.git --exclude=__pycache__ --exclude=.autoloop "$SRC" "$DEST" \
+      >/dev/null 2>&1; then
+    echo "  已安装且内容一致，跳过复制（FORCE=1 可强制刷新）"
+  else
+    mkdir -p "$BACKUP_ROOT"
+    ts="$(date +%Y%m%d-%H%M%S)"
+    cp -R "$DEST" "$BACKUP_ROOT/grokbot-autoloop.$ts"
+    echo "  内容有变化：旧版本备份到 $BACKUP_ROOT/grokbot-autoloop.$ts"
+    changed=1
+  fi
+fi
+if [ ! -d "$DEST" ] || [ "$changed" = 1 ] || [ "${FORCE:-0}" = 1 ]; then
+  mkdir -p "$DEST_ROOT"
+  rsync -a --delete --exclude .git --exclude __pycache__ --exclude .autoloop \
+    "$SRC/" "$DEST/" 2>/dev/null || {
+    # 没有 rsync 就走 cp -R（先清掉旧目录里的托管文件）
+    rm -rf "$DEST"; mkdir -p "$DEST"; cp -R "$SRC/." "$DEST/"
+  }
+  echo "  已安装 → $DEST"
 fi
 
-mkdir -p "$REPO/.autoloop"
-BOOT_TMP="$REPO/.autoloop/boot.json.tmp"
-python3 - "$BOOT_TMP" "$OK_JSON" "$MISSING" "$TOOLS" "$WORKERS_FOUND" "$RUNNER" \
-          "$ENGINE_SHA" "$PY" "$PKG" "$GH_AUTH" "$CFG" "$GATE" "$DOCTOR" "$REPO" "$NOTES_JSON" <<'PY'
-import json, sys, time
-(out, ok, missing, tools, workers, runner, sha, py, pkg, gh, cfg, gate, doctor, repo, notes) = sys.argv[1:16]
-payload = {
-    "ok": ok == "true",
-    "at": time.strftime("%Y-%m-%d %H:%M:%S"),
-    "repo": repo,
-    "python": py or "absent",
-    "pkg_manager": pkg,
-    "gh_auth": gh,
-    "engine_sha256": sha[:16] or "absent",
-    "tools": tools,
-    "missing_required": [m for m in missing.split() if m],
-    "worker_clis": workers or "none",
-    "runner_cmd": runner or "NOT SET",
-    "config_json": cfg,
-    "verify_sh": gate,
-    "engine_doctor": doctor,
-    "notes": json.loads(notes),
-    "daemon": "none — this stamp records an environment probe, nothing was scheduled or backgrounded",
+# 技能文件必须可执行，否则 tick 跑不了闸门
+chmod +x "$DEST/scripts/autoloop.py" 2>/dev/null || true
+[ -f "$DEST/tests/selftest.py" ] && chmod +x "$DEST/tests/selftest.py" 2>/dev/null || true
+[ -f "$DEST/tests/bin/dsh" ] && chmod +x "$DEST/tests/bin/dsh" 2>/dev/null || true
+[ -f "$DEST/tests/fake_worker.py" ] && chmod +x "$DEST/tests/fake_worker.py" 2>/dev/null || true
+[ -f "$DEST/tests/fake_gh.py" ] && chmod +x "$DEST/tests/fake_gh.py" 2>/dev/null || true
+[ -f "$DEST/install-cron.sh" ] && chmod +x "$DEST/install-cron.sh" 2>/dev/null || true
+
+ENGINE="$DEST/scripts/autoloop.py"
+
+echo
+echo "── 前置体检（只读：缺什么给什么命令，本脚本不会替你修 GitHub）"
+"$PY" "$ENGINE" --repo "$TARGET" preflight || {
+  rc=$?
+  echo
+  echo "preflight 退出码 $rc —— 上面的 → 后面就是需要你自己做的步骤。"
+  echo "典型缺口：git 身份、SSH key 未加到 GitHub、gh 未登录、没配 worker CLI。"
+  exit "$rc"
 }
-with open(out, "w", encoding="utf-8") as fh:
-    json.dump(payload, fh, ensure_ascii=False, indent=2)
-    fh.write("\n")
-PY
-if [ $? -ne 0 ]; then say "! could not write boot.json (python3 broken?)"; exit 1; fi
-mv -f "$BOOT_TMP" "$REPO/.autoloop/boot.json"
-say ""
-say "wrote $REPO/.autoloop/boot.json"
-python3 -c 'import json;d=json.load(open("'"$REPO"'/.autoloop/boot.json"));print(json.dumps(d,ensure_ascii=False,indent=2))' 2>/dev/null
 
-say ""
-if [ "$OK_JSON" = true ]; then
-  say "RESULT: ok — required tools present. Engine doctor: $DOCTOR"
+echo
+echo "── 初始化目标仓库（幂等；已存在则保留你的 config/policy/queue）"
+if [ -n "$TEST_CMD" ]; then
+  "$PY" "$ENGINE" --repo "$TARGET" init --test-cmd "$TEST_CMD" || exit 1
 else
-  say "RESULT: NOT ok — missing required:${MISSING}"
+  "$PY" "$ENGINE" --repo "$TARGET" init
+  echo "   （没给 AUTOLOOP_TEST_CMD，闸门里的 test 还是空的 —— 空闸门永远不可能变绿，"
+  echo "     补一条：$PY $ENGINE --repo $TARGET init --test-cmd '<仓库真实测试命令>' --force-gate）"
 fi
-if [ "$CFG" = missing ]; then
-  say "next: python3 $ENGINE --repo $REPO init --runner '<verified headless command {prompt_file}>'"
-else
-  say "next: python3 $ENGINE --repo $REPO tick   (then: status / report / suggest / queue)"
-fi
-say "note: no timer was installed. See install-cron.sh for the two honest options."
-[ -n "$MISSING" ] && exit 1 || exit 0
+
+echo
+echo "── 下一步（在你自己的 agent 会话里，不需要定时任务）"
+cat <<EOF
+1. 每轮开发前先跑：$PY $ENGINE --repo $TARGET round
+   它会打印 $DEST/PROTOCOL.md 的路径和 sha256 —— 完整读入那份协议再开工。
+2. 让候选池有活：$PY $ENGINE --repo $TARGET suggest
+3. 前台看护循环（约每分钟一次 tick，worker 喊完成就在一分钟内收尾交付，不装后台）：
+   $PY $ENGINE --repo $TARGET watch --minutes 240
+   要用定时任务的话：bash $DEST/install-cron.sh $TARGET
+4. 每小时巡检汇报用模板，别自己组织语言：
+   $PY $ENGINE --repo $TARGET report --patrol
+EOF

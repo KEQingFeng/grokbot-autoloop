@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""`dsh` stand-in for the AutoLoop self-test — the DeepSeekHarness headless adapter.
+
+Named exactly `dsh` and put on PATH by the scenario, so `runner_cli()` really
+resolves the configured command to "dsh" and the whole adapter contract gets
+exercised instead of being asserted from a dictionary:
+
+  * `dsh --profile headless --json < prompt`  (WORKER_CLIS["dsh"].cmd)
+  * the stream opens with a `session` event whose id the supervisor must persist
+  * a repair round comes back with `--session-id <that id>` (protocol §六: 由原开发
+    Agent 继续修复, not a stranger with no memory of the diff)
+  * `dsh --profile headless --help` prints both flags, which is what `preflight`
+    probes for before a loop is allowed to start
+
+Every invocation is appended to $AUTOLOOP_DSH_CALLS so a test can read back the
+argv the engine actually produced. The work itself is delegated to fake_worker.py,
+which behaves according to $FAKE_WORKER_MODE.
+"""
+
+import json
+import os
+import sys
+import time
+
+HELP = """dsh 0.0.0-selftest (stand-in)
+
+Usage:
+  dsh [--profile NAME] [--json] [-] [prompt]
+
+Flags:
+  --json          emit the turn as newline-delimited events
+  --session-id    resume an existing session
+  --profile       named configuration (headless = no interactive approval)
+"""
+
+SESSION_ID = os.environ.get("FAKE_DSH_SESSION", "dsh-selftest-1")
+
+
+def main(argv):
+    log = os.environ.get("AUTOLOOP_DSH_CALLS")
+    if log:
+        try:
+            with open(log, "a", encoding="utf-8") as fh:
+                fh.write(" ".join(argv) + "\n")
+                fh.flush()
+        except OSError:
+            pass
+
+    if "--help" in argv or not argv:
+        sys.stdout.write(HELP)
+        return 0
+
+    # the event stream: `session` first, then the turn, then `final` — same shape
+    # the real harness produces, and what capture_session() reads out of the log.
+    events = [{"type": "session", "session_id": SESSION_ID,
+               "profile": "headless", "ts": time.time()},
+              {"type": "item", "role": "assistant",
+               "text": "working on %s" % os.environ.get("AUTOLOOP_TASK", "?")}]
+    for event in events:
+        print(json.dumps(event), flush=True)
+
+    # stdin is the task card (the engine redirects the prompt file in); the real CLI
+    # reads it as the turn. Drain it so a pipe writer is never blocked.
+    try:
+        sys.stdin.read()
+    except (OSError, ValueError):
+        pass
+
+    worker = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "fake_worker.py")
+    resumed = "--session-id" in argv
+    text = ("resumed " + argv[argv.index("--session-id") + 1]) if resumed else "fresh session"
+    print(json.dumps({"type": "item", "role": "assistant", "text": text}), flush=True)
+    os.environ["FAKE_DSH_RESUMED"] = SESSION_ID if resumed else ""
+    sys.stdout.flush()
+    os.execv(sys.executable, [sys.executable, worker])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

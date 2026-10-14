@@ -11,11 +11,31 @@ merged PR, force a 429, or read back what the supervisor actually opened.
 and one of the assertions is that it never even tries.
 """
 
+import fcntl
 import json
 import os
 import sys
 
 STATE = os.environ.get("FAKE_GH_STATE", "")
+
+
+class locked(object):
+    """One state file, several callers: in `delivery.owner=worker` two agents push and
+    open their PRs at the same moment, so a read-modify-write without a lock loses a
+    PR and the test then blames the engine for a bug in the stand-in."""
+
+    def __enter__(self):
+        self.handle = None
+        if STATE:
+            self.handle = open(STATE + ".lock", "w")
+            fcntl.flock(self.handle, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        if self.handle:
+            fcntl.flock(self.handle, fcntl.LOCK_UN)
+            self.handle.close()
+        return False
 
 
 def load():
@@ -48,7 +68,7 @@ def opt(argv, name, default=None):
     return default
 
 
-def main(argv):
+def handle(argv):
     data = load()
     if not argv:
         sys.stderr.write("fake-gh: no arguments\n")
@@ -130,6 +150,11 @@ def main(argv):
     save(data)
     sys.stderr.write("fake-gh: unsupported call: %s\n" % " ".join(argv))
     return 2
+
+
+def main(argv):
+    with locked():
+        return handle(argv)
 
 
 if __name__ == "__main__":

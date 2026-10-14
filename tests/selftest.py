@@ -14,10 +14,12 @@ Nothing here touches a real repository, a real GitHub, or your own machine state
 beyond a temp directory it deletes again.
 """
 
+import hashlib
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -29,6 +31,10 @@ ROOT = os.path.dirname(HERE)
 ENGINE = os.path.join(ROOT, "scripts", "autoloop.py")
 WORKER = os.path.join(HERE, "fake_worker.py")
 FAKEGH = os.path.join(HERE, "fake_gh.py")
+DSH = os.path.join(HERE, "bin", "dsh")
+PROTOCOL = os.path.join(ROOT, "PROTOCOL.md")
+# the adapter contract the engine was written against; `dsh --help` must print both
+DSH_CMD = "dsh --profile headless --json < {prompt_file}"
 
 PASS = []
 FAIL = []
@@ -55,6 +61,14 @@ def check(cond, label, detail=""):
 
 def head(title):
     print("\n── %s" % title)
+
+
+def read_text(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except OSError:
+        return ""
 
 
 # --------------------------------------------------------------- fixture repo
@@ -112,7 +126,7 @@ class Box:
     counter = 0
 
     def __init__(self, name, reference=False, caps=None, base_branch=None,
-                 init_args=(), test_cmd="bash tests/run.sh"):
+                 init_args=(), test_cmd="bash tests/run.sh", owner="supervisor"):
         Box.counter += 1
         raw = tempfile.mkdtemp(prefix="autoloop-%s-%d-" % (re.sub(r"\W+", "", name),
                                                            Box.counter))
@@ -145,6 +159,10 @@ class Box:
         cfg = self.config()
         cfg["reference_enabled"] = reference
         cfg.setdefault("runner", {})["cmd"] = ""
+        # the v1 suite was written when the supervisor pushed and opened every PR;
+        # keep that contract under test and let the worker-delivery scenarios opt in
+        cfg["delivery"] = {"owner": owner}
+        self.owner = owner
         # the throwaway box is on a real disk: keep the floor out of the way unless
         # the scenario is precisely about the floor
         wanted = dict(caps or {})
@@ -284,7 +302,35 @@ class Box:
         return tid
 
     def cleanup(self):
+        self.kill_jobs()
         shutil.rmtree(self.dir, ignore_errors=True)
+
+    def kill_jobs(self):
+        """The 空转 cases keep their worker alive for a minute on purpose; a scenario
+        that stops mid-run must not leave that process behind for the next one."""
+        jobs = os.path.join(self.alo, "jobs")
+        if not os.path.isdir(jobs):
+            return
+        for name in sorted(os.listdir(jobs)):
+            if not name.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(jobs, name), encoding="utf-8") as fh:
+                    pid = int(json.load(fh).get("pid") or 0)
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            if pid:
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+
+    def pid_alive(self, pid):
+        try:
+            os.kill(int(pid), 0)
+        except OSError:
+            return False
+        return True
 
 
 # -------------------------------------------------------------------- scenarios
@@ -1086,6 +1132,408 @@ def s_empty_gate():
         box.cleanup()
 
 
+# ------------------------------------------------------- v1.1: 空转 + 交付 + 协议
+
+
+def s_protocol_text():
+    head("PROTOCOL.md：协议原文出厂即完整，round 每轮把它交给监工")
+    check(os.path.exists(PROTOCOL), "the protocol ships inside the plugin", PROTOCOL)
+    text = read_text(PROTOCOL)
+    for sec in ("一、角色与唯一职责", "二、必须先完成的初始化", "三、开发仓库与职责边界",
+                "四、持续开发循环", "五、PR 交付数量要求", "六、PR 创建后的自动接续",
+                "七、每小时监督与汇报", "八、异常处理与自动恢复", "九、低成本运行原则",
+                "十、持久化状态与上下文恢复"):
+        check(sec in text, "协议完整含「%s」" % sec, text[:160])
+    for line in ("不亲自编写、修改、重构或修复项目业务代码",
+                 "每轮监督周期至少争取交付 2 条有效 PR。",
+                 "不得将 PR 自动合并。",
+                 "暴露、打印或提交 API Key、Token、密码及其他凭据。",
+                 "不能仅在提示词中声明每小时汇报，就认为后台定时执行已经建立。"):
+        check(line in text, "原文逐字保留：「%s」" % line[:24], "")
+    digest = hashlib.sha256(open(PROTOCOL, "rb").read()).hexdigest()
+    box = Box("protocol-round", owner="worker")
+    try:
+        rc, out = box.run("round")
+        check(rc == 0, "round runs on a fresh box", out)
+        check("PROTOCOL.md" in out and digest[:12] in out,
+              "round prints the path + a real sha256 prefix", out)
+        check(box.state()["slots"] == {"A": None, "B": None}, "round dispatches nothing",
+              box.state()["slots"])
+        rc, outj = box.run("round", "--json")
+        rec = json.loads(outj)
+        check(rec["插件技能安装及验证状态"]["protocol_sha256"] == digest[:12],
+              "the §十 record fingerprints the protocol it will inject",
+              rec["插件技能安装及验证状态"])
+        for key in ("目标仓库地址", "基分支", "运行中的 Agent 和任务", "本轮有效 PR 数量",
+                    "PR 目标", "待我授权", "下一次巡检与调度状态", "成本闸"):
+            check(key in rec, "状态记录含「%s」" % key, sorted(rec))
+        check(rec["PR 目标"] == 2, "§五 的目标写进记录，不靠监工记性", rec.get("PR 目标"))
+        check("cadence_s" in rec["下一次巡检与调度状态"],
+              "记录写清下一次巡检的节拍，而不是「记得每小时汇报」",
+              rec["下一次巡检与调度状态"])
+    finally:
+        box.cleanup()
+
+
+def s_worker_delivers_pr():
+    head("§四/§五：开发 Agent 自己建分支、开 PR；两个并行 agent 一轮交付 2 条")
+    box = Box("workerpr", owner="worker")
+    try:
+        t1 = box.add_task("Guard the parser", ["src/a/*"],
+                          accept=["test -f src/a/autoloop_helper.py"])
+        t2 = box.add_task("Cover the writer", ["src/b/*"],
+                          accept=["test -f src/b/autoloop_helper.py"])
+        rc, out = box.tick(mode="good")
+        check("slot A: started" in out and "slot B: started" in out,
+              "both slots dispatched in parallel", out)
+        rc, out = box.tick(mode="good")
+        gh = box.gh()
+        check(len(gh["prs"]) == 2, "each worker opened its own PR", gh["prs"])
+        heads = sorted(p["headRefName"] for p in gh["prs"])
+        check(heads == ["auto/" + t1, "auto/" + t2], "one PR per task branch", heads)
+        check(all(p["baseRefName"] == box.base() for p in gh["prs"]),
+              "every PR targets the real base branch", gh["prs"])
+        check(all(p["body"].strip() for p in gh["prs"]),
+              "the delivery report came with the PR", gh["prs"][0]["body"][:120])
+        check(box.state()["slots"] == {"A": None, "B": None}, "both slots freed",
+              box.state()["slots"])
+        c = box.state()["counters"]
+        check(c["pr_today"] == 2 and c["prs_valid_today"] == 2,
+              "2 有效 PR counted for §五", c)
+        lines = [json.loads(l) for l in open(os.path.join(box.alo, "ledger.jsonl"),
+                                             encoding="utf-8").read().strip().splitlines()]
+        prs = [l for l in lines if l.get("result") == "pr_open"]
+        check(len(prs) == 2 and all(l.get("by") == "worker" for l in prs),
+              "the ledger credits the worker, not the supervisor", prs)
+        calls = " ".join(gh["calls"])
+        for banned in ("pr merge", "pr close", "pr review"):
+            check(banned not in calls, "the engine never ran `%s`" % banned, calls)
+        for tid in (t1, t2):
+            rc, _ = box.git("rev-parse", "-q", "--verify", "refs/remotes/origin/auto/" + tid)
+            check(rc == 0, "worker pushed `%s` itself" % tid, rc)
+        rc, out = box.run("report", "--patrol")
+        check("- 本轮有效 PR：2 条" in out and "（已达）" in out,
+              "patrol reads the same counter, not a chat memory", out)
+    finally:
+        box.cleanup()
+
+
+def s_finish_guard():
+    head("空转修复①：worker 一喊完成就结束会话，闸门与交付在同一轮跑完")
+    box = Box("finish", owner="worker", caps={"finish_grace_s": 1, "job_timeout_s": 600})
+    env = {"FAKE_WORKER_HANG": "120"}
+    try:
+        box.add_task("Declare done then sit", ["src/*"],
+                     accept=["test -f src/autoloop_helper.py"])
+        rc, out = box.tick(mode="hang", env=env, wait=False)
+        check("slot A: started" in out, "worker launched", out)
+        jid = box.state()["slots"]["A"]["job"]
+        pid = int(json.loads(read_text(os.path.join(box.alo, "jobs", jid + ".json")))["pid"])
+        time.sleep(2.5)
+        started = time.time()
+        rc, out = box.tick(mode="hang", env=env, wait=False)
+        spent = time.time() - started
+        check("session closed" in out, "the supervisor ended the session itself", out)
+        check(spent < 20, "closed + gate + delivered in %.1fs (timeout was %ss)"
+              % (spent, 600), out)
+        check(not box.pid_alive(pid), "the finished worker process is really gone", pid)
+        check("worker PR #" in out, "the PR the worker opened was adopted", out)
+        check(box.state()["slots"]["A"] is None, "slot recycled at once",
+              box.state()["slots"])
+        check(box.state()["counters"]["prs_valid_today"] == 1, "counts toward the §五 quota")
+        logtext = read_text(os.path.join(box.alo, "jobs", jid + ".log"))
+        check("AUTOLOOP_DONE" in logtext, "the finish marker is what ended the run", logtext)
+    finally:
+        box.cleanup()
+
+
+def s_nomarker_guard():
+    head("空转修复②：提交完就沉默的 worker 照样收尾；它没开 PR 时监工兜底交付")
+    box = Box("nomarker", owner="worker", caps={"finish_grace_s": 1, "job_timeout_s": 600})
+    env = {"FAKE_WORKER_HANG": "120"}
+    try:
+        box.add_task("Commit then go mute", ["src/*"],
+                     accept=["test -f src/autoloop_helper.py"])
+        rc, out = box.tick(mode="nomarker", env=env, wait=False)
+        check("started" in out, "worker launched", out)
+        jid = box.state()["slots"]["A"]["job"]
+        pid = int(json.loads(read_text(os.path.join(box.alo, "jobs", jid + ".json")))["pid"])
+        time.sleep(2.5)
+        started = time.time()
+        rc, out = box.tick(mode="nomarker", env=env, wait=False)
+        spent = time.time() - started
+        check("closing anyway" in out, "committed + silent counts as finished", out)
+        check(spent < 20, "no %ss wait for a protocol line nobody will print" % 600, out)
+        check(not box.pid_alive(pid), "the silent session was closed", pid)
+        check("VERIFY GREEN" in out, "the committed diff is judged on its merits", out)
+        check("NO PR exists" in out, "engine refuses to invent a delivery", out)
+        rec = box.state()["slots"]["A"] or {}
+        check(rec.get("state") == "pr_ready" and rec.get("verify") == "green",
+              "slot parked at pr_ready, waiting on delivery", rec)
+        check("pr A" in str(rec.get("next")), "next action names the fallback", rec)
+        check(box.state()["counters"]["prs_valid_today"] == 0,
+              "an undelivered round does not count", box.state()["counters"])
+        rc, out = box.run("pr", "A", "--auto-body", env=env)
+        check(rc == 0, "the supervisor fallback delivers it", out)
+        check(len(box.gh()["prs"]) == 1, "exactly one PR from the fallback", box.gh()["prs"])
+        check(box.state()["counters"]["prs_valid_today"] == 1,
+              "a green PR opened by the fallback still counts toward §五",
+              box.state()["counters"])
+    finally:
+        box.cleanup()
+
+
+def s_stall_guard():
+    head("空转修复③：静默不产出的 worker 被停掉，不占着 slot 等一个没人答的审批")
+    box = Box("stall", owner="worker",
+              caps={"stall_s": 1, "finish_grace_s": 1, "job_timeout_s": 600})
+    env = {"FAKE_WORKER_HANG": "120"}
+    try:
+        box.add_task("Spin in place", ["src/*"])
+        rc, out = box.tick(mode="silent", env=env, wait=False)
+        check("started" in out, "worker launched", out)
+        jid = box.state()["slots"]["A"]["job"]
+        pid = int(json.loads(read_text(os.path.join(box.alo, "jobs", jid + ".json")))["pid"])
+        time.sleep(2.5)
+        started = time.time()
+        rc, out = box.tick(mode="silent", env=env, wait=False)
+        spent = time.time() - started
+        check("stalled → session closed" in out, "silence + no commits → stopped", out)
+        check(spent < 20, "stopped in %.1fs instead of holding the slot %ss"
+              % (spent, 600), out)
+        check(not box.pid_alive(pid), "the spinning process was actually killed", pid)
+        rec = box.state()["slots"]["A"] or {}
+        reds = " ".join(str(r) for r in rec.get("red_reasons", []))
+        check("went silent" in reds, "the red reason names the silence", reds)
+        check("AUTOLOOP_DONE" in reds, "and names the marker it never printed", reds)
+        check(rec.get("state") == "repairing", "a repair round took the slot over", rec)
+        check(box.gh()["prs"] == [], "a silent run ships nothing", box.gh()["prs"])
+        check(box.state()["counters"]["prs_valid_today"] == 0, "nothing counted")
+        rc, out = box.run("report", "--patrol")
+        check(out.startswith("【异常告警｜"), "§七 switches to the alert template", out[:60])
+        check("静默" in out, "the alert reports the stall in words", out)
+    finally:
+        box.cleanup()
+
+
+def s_badpr_unverified():
+    head("§六：worker 已开 PR 但闸门是红的 —— 不合并、不关闭、只标注给人看")
+    box = Box("badpr", owner="worker")
+    try:
+        tid = box.add_task("Broken but delivered", ["src/*"])
+        rc, out = box.tick(mode="badpr")
+        rc, out = box.tick(mode="badpr")
+        check("未过闸门" in out and "不合并、不关闭、不覆盖" in out,
+              "the red tick annotates the existing PR instead of touching it", out)
+        rec = box.state()["slots"]["A"] or {}
+        check(rec.get("pr") and rec.get("pr_unverified"),
+              "the slot record carries PR# + why it is not verified", rec)
+        check(rec.get("verify") == "red", "it is still red — annotation is not approval",
+              rec.get("verify"))
+        gh = box.gh()
+        check(len(gh["prs"]) >= 1 and gh["prs"][0]["state"] == "OPEN",
+              "the PR under review is still open", gh["prs"])
+        check(all(p["headRefName"] == "auto/" + tid for p in gh["prs"]),
+              "every PR on this slot is the same task branch", gh["prs"])
+        calls = " ".join(gh["calls"])
+        for banned in ("pr merge", "pr close"):
+            check(banned not in calls, "the engine never ran `%s`" % banned, calls)
+        rc, out = box.run("report", "--patrol")
+        check("已建但未过监工闸门，勿合并" in out,
+              "the human is told which PR must not be merged", out)
+        check("异常类型" in out, "and it arrives through the alert template", out)
+    finally:
+        box.cleanup()
+
+
+def s_dsh_adapter():
+    head("DeepSeekHarness 适配：--json 事件、会话 id 落盘、修复轮 resume 同一个 agent")
+    box = Box("dsh", owner="worker")
+    env = {"PATH": os.path.dirname(DSH) + os.pathsep + os.environ.get("PATH", ""),
+           "AUTOLOOP_WORKER_CMD": DSH_CMD,
+           "AUTOLOOP_DSH_CALLS": os.path.join(box.dir, "dsh-calls.txt")}
+    try:
+        rc, out = box.run("preflight", "--json", env=env)
+        data = json.loads(out)
+        by_name = {c["name"]: c for c in data["checks"]}
+        check(rc == 0, "preflight passes on a wired box", out[:300])
+        check("dsh headless 接口" in by_name, "preflight probes the runner that is set",
+              sorted(by_name))
+        check(by_name.get("dsh headless 接口", {}).get("ok") is True,
+              "the probe found --json and --session-id", by_name.get("dsh headless 接口"))
+        box.add_task("Resume the same agent", ["src/*"],
+                     accept=["test -f src/autoloop_helper.py"])
+        rc, out = box.tick(mode="good", env=env)
+        jid = box.state()["slots"]["A"]["job"]
+        rc, out = box.tick(mode="good", env=env)
+        meta = json.loads(read_text(os.path.join(box.alo, "jobs", jid + ".json")))
+        check(meta.get("cli") == "dsh", "the engine resolved the runner as dsh", meta)
+        check(meta.get("session_id") == "dsh-selftest-1",
+              "a worker that finishes inside one tick still has its session captured",
+              meta)
+        box.add_task("Break the gate", ["src/b/*"])
+        rc, out = box.tick(mode="failtest", env=env)
+        rc, out = box.tick(mode="failtest", env=env)
+        check("repair resumes session dsh-selftest-1" in out,
+              "the repair round says it resumes the original agent", out)
+        calls = read_text(os.path.join(box.dir, "dsh-calls.txt")).strip().splitlines()
+        # calls[0] is the preflight probe (`--help`); the rest are real runs. Find the
+        # resume by content, not by index — an extra tick would silently move it.
+        dispatch = [c for c in calls if "--help" not in c]
+        check(len(dispatch) >= 2, "dsh was invoked again for the repair", calls)
+        resumed = [c for c in dispatch if "--session-id" in c]
+        check(resumed and "dsh-selftest-1" in resumed[-1],
+              "§六 由原开发 Agent 继续修复：the argv really carries the session id", dispatch)
+        check(resumed and "--json" in resumed[-1] and "<" not in resumed[-1],
+              "the prompt reaches dsh over stdin, never as a bare argument",
+              resumed[-1] if resumed else dispatch)
+        # The `<` is consumed by the shell the engine spawns, so it can only show up in
+        # the wrapper script the job ran from — that is where "flag before the redirect"
+        # has to be proven.
+        wrappers = [os.path.join(box.alo, "jobs", n) for n in os.listdir(
+            os.path.join(box.alo, "jobs"))] if os.path.isdir(
+            os.path.join(box.alo, "jobs")) else []
+        wrappers = sorted([p for p in wrappers if p.endswith(".sh")
+                           and "--session-id" in read_text(p)], key=os.path.getmtime)
+        check(bool(wrappers), "a repair wrapper carries the resume flag",
+              os.listdir(os.path.join(box.alo, "jobs")))
+        line = [l for l in read_text(wrappers[-1]).splitlines() if "--session-id" in l][-1]
+        before, sep, after = line.partition(" < ")
+        check(sep and "--session-id" in before and "<" not in after,
+              "the resume flag is inserted before the stdin redirect", line[:240])
+    finally:
+        box.cleanup()
+
+
+def s_preflight_gaps():
+    head("前置流程：GitHub 没接通时给出确切命令，而不是自己上手改环境")
+    box = Box("preflight")
+    try:
+        box.add_task("Scheduled but untouched", ["src/*"])
+        rc, out = box.run("preflight")
+        check(rc == 0, "a fully wired box passes", out)
+        for probe in ("git identity", "origin reachable", "gh CLI", "gh auth",
+                      "worker CLI", "监督协议", "闸门有可跑的命令"):
+            check(probe in out, "preflight checks %s" % probe, out)
+        check(box.state()["slots"] == {"A": None, "B": None}, "preflight dispatches nothing")
+        check(not os.path.isdir(os.path.join(box.alo, "jobs"))
+              or os.listdir(os.path.join(box.alo, "jobs")) == [],
+              "no job was launched", os.listdir(os.path.join(box.alo, "jobs")))
+        calls = " ".join(box.gh()["calls"])
+        check("pr create" not in calls and "pr merge" not in calls,
+              "preflight only asks gh who it is — it opens nothing", calls)
+        check(len(box.coll("queue.json")) == 1 and box.gh()["prs"] == [],
+              "the pool and GitHub are untouched", (box.coll("queue.json"), box.gh()["prs"]))
+
+        # A checkout nobody has `init`ed must come out of preflight exactly as it went
+        # in: the command asks questions, it does not leave a state directory behind in
+        # the user's repo (§八).
+        fresh = os.path.join(box.dir, "fresh")
+        os.makedirs(os.path.join(fresh, "src"))
+        with open(os.path.join(fresh, "src", "a.py"), "w", encoding="utf-8") as fh:
+            fh.write("print(1)\n")
+        subprocess.run(["git", "init", "-q"], cwd=fresh, env=box.env, check=True)
+        proc = subprocess.run([sys.executable, ENGINE, "--repo", fresh, "preflight"],
+                              cwd=fresh, env=box.env, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, universal_newlines=True,
+                              timeout=120)
+        check(not os.path.exists(os.path.join(fresh, ".autoloop")),
+              "preflight on an un-initialised repo writes nothing into the checkout",
+              sorted(os.listdir(fresh)))
+        check(proc.returncode == 3 and "origin" in proc.stdout,
+              "an un-connected repo is reported as a gap, not as a pass",
+              proc.stdout[-260:])
+        init = subprocess.run([sys.executable, ENGINE, "--repo", fresh, "init",
+                               "--test-cmd", "python3 -m pytest -q"],
+                              cwd=fresh, env=box.env, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, universal_newlines=True,
+                              timeout=120)
+        check(init.returncode == 0 and os.path.exists(
+                  os.path.join(fresh, ".autoloop", "state.json")),
+              "so `init` is still the first thing to create the state dir",
+              init.stdout[-260:])
+
+        box.gh_state({"prs": [], "next": 1, "auth": False, "search": "ok", "calls": []})
+        rc, out = box.run("preflight")
+        check(rc == 3, "an unauthenticated gh exits 3", out)
+        check("gh auth login" in out, "and prints the exact login command", out)
+        check("先修" in out, "the verdict names the blockers", out)
+        box.gh_state({"prs": [], "next": 1, "auth": True, "search": "ok", "calls": []})
+
+        rc, out = box.run("preflight", env={"AUTOLOOP_GH": "/nonexistent/gh"})
+        check(rc == 3 and "delivery.owner=supervisor" in out,
+              "no gh at all → says how to run without it", out)
+        rc, out = box.run("preflight", env={"AUTOLOOP_WORKER_CMD": ""})
+        check(rc == 3 and "init --runner" in out,
+              "no worker CLI → prints the runner line to paste", out)
+        rc, out = box.run("preflight", "--json", env={"AUTOLOOP_WORKER_CMD": ""})
+        data = json.loads(out)
+        check(data["ok"] is False and "worker CLI" in data["blockers"],
+              "--json gives the machine-readable blocker list", data["blockers"])
+        gap = [c for c in data["checks"] if c["name"] == "worker CLI"][0]
+        check(gap["fix"] and gap["level"] == "required", "every gap ships a fix", gap)
+    finally:
+        box.cleanup()
+
+
+def s_watch_idle_exit():
+    head("空转修复④：连续 6 轮无事可做就停下汇报，watch 不会空转到天亮")
+    box = Box("idlespin")
+    try:
+        out = ""
+        for _ in range(6):
+            rc, out = box.tick(mode="good", env={"AUTOLOOP_WORKER_CMD": ""})
+        check(box.state()["counters"]["idle_ticks"] == 6, "six idle ticks counted",
+              box.state()["counters"])
+        check("空转 6 轮" in out, "the tick says more ticking will not help", out)
+        check("别再 tick" in str(box.state().get("next")), "next action is not `tick`",
+              box.state().get("next"))
+        rc, out = box.run("watch", "--interval", "5", env={"AUTOLOOP_WORKER_CMD": ""})
+        check(rc == 4, "watch stops instead of burning the nightly budget", out)
+        check("连续空转" in out, "watch says why it stopped", out)
+        rc, out = box.run("report", "--patrol")
+        check("连续空转 7 轮" in out or "空转" in out, "the patrol reports the spin", out)
+        box.add_task("Something real", ["src/*"])
+        rc, out = box.tick(mode="good")
+        check("started" in out, "a real task dispatches again", out)
+        check(box.state()["counters"]["idle_ticks"] == 0, "a productive tick resets the count",
+              box.state()["counters"])
+    finally:
+        box.cleanup()
+
+
+def s_patrol_templates():
+    head("§七：两个固定模板由真实状态填好，且不含各 agent 的功能细节")
+    box = Box("patrol", owner="worker")
+    try:
+        title = "导出 PDF 批量转换"
+        box.add_task(title, ["src/*"], accept=["test -f src/autoloop_helper.py"])
+        box.tick(mode="good")
+        rc, out = box.tick(mode="good")
+        check("worker PR #" in out, "one valid PR this round", out)
+        rc, out = box.run("report", "--patrol")
+        check(out.startswith("【定时巡检｜"), "a clean round uses 定时巡检", out[:60])
+        for line in ("- 总体状态：正常", "- 开发循环：", "- 本轮有效 PR：1 条",
+                     "- PR 目标：至少 2 条（还差 1 条）", "- 异常情况：无",
+                     "- 采取的恢复措施：", "- 是否需要我介入："):
+            check(line in out, "巡检模板含「%s」" % line, out)
+        check(title not in out and "autoloop_helper" not in out,
+              "§七 明确禁止汇报每个 agent 在开发什么功能", out)
+        rc, out = box.run("halt", "--reason", "self-test")
+        rc, out = box.run("report", "--patrol")
+        check(out.startswith("【异常告警｜"), "a halted loop alerts instead of polling",
+              out[:60])
+        for line in ("- 异常类型：", "- 影响范围：", "- 已执行的恢复措施：", "- 当前状态：",
+                     "- 是否需要我授权或处理：", "- 下一步监督动作："):
+            check(line in out, "告警模板含「%s」" % line, out)
+        check("已暂停" in out, "the halt is reflected in 当前状态", out)
+        rc, out = box.run("round")
+        check("report --patrol" in out, "round tells the supervisor to use the templates",
+              out)
+    finally:
+        box.cleanup()
+
+
 # ------------------------------------------------------------------------ main
 
 def _lines(path):
@@ -1123,6 +1571,16 @@ SCENARIOS = [
     ("ledger", s_ledger_and_journal),
     ("backup", s_backup_queue),
     ("manual", s_dispatch_by_hand),
+    ("protocol", s_protocol_text),
+    ("workerpr", s_worker_delivers_pr),
+    ("finish", s_finish_guard),
+    ("nomarker", s_nomarker_guard),
+    ("stall", s_stall_guard),
+    ("badpr", s_badpr_unverified),
+    ("dsh", s_dsh_adapter),
+    ("preflight", s_preflight_gaps),
+    ("idlespin", s_watch_idle_exit),
+    ("patrol", s_patrol_templates),
 ]
 
 

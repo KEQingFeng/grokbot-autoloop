@@ -1,11 +1,12 @@
 ---
 name: grokbot-autoloop
-description: Turn Grok Bot into a 7×24 development supervisor on its own cloud computer — one spoken instruction starts a loop where the bot only plans and judges, headless worker CLIs on that box write the code with their own keys, and everything stops at a branch plus a PR for the human to merge in the morning. Use when the user says 全天候开发, 自动开发, 开始循环, 挂个循环, 一直开发到早上, 明早看 PR, 监工, or asks to keep developing a repo unattended, or before any multi-hour coding job that would otherwise run inside the bot's own context. Also use to stop, resume, or review such a loop.
+description: Turn Grok Bot into a 7×24 development supervisor on its own cloud computer — one spoken instruction starts a loop where the bot only plans and judges, headless worker CLIs on that box write the code with their own keys and open their own PR, and everything stops at a branch plus a PR for the human to merge in the morning. Use when the user says 直接开发 xx 项目, 开发 xx 项目, 全天候开发, 自动开发, 开始循环, 挂个循环, 一直开发到早上, 明早看 PR, 监工, or asks to keep developing a repo unattended, or before any multi-hour coding job that would otherwise run inside the bot's own context. Also use to stop, resume, or review such a loop, and use it FIRST for 我要开发个项目 / GitHub 还没连上这类请求 — preflight tells the user exactly what is missing instead of the bot quietly changing their environment.
 metadata:
-  version: "1.0.0"
-  supervisor: Grok Bot — plans, judges, approves; never types the diff
+  version: "1.1.0"
+  supervisor: Grok Bot — plans, monitors, recovers, schedules; never types the diff (§一)
   workers: whatever headless agent CLI lives on that box (dsh / codex / claude / qoder / grok / aider)
-  delivery: branch + PR only, merged by hand
+  delivery: branch + PR only — the 开发 Agent opens its own PR, the human merges it (§四/§六)
+  protocol: PROTOCOL.md in this plugin is the prompt to inject before every round (§二)
   license: MIT
 ---
 
@@ -27,32 +28,70 @@ decides *who inside the loop* does the thinking. They stack.
 
 ## 1. One instruction → the loop runs
 
-The user says something like "对 repo X 开始全天候开发". Do exactly this, in order,
-and report each step's real output. Do not write your own loop script.
+The user says something like "直接开发 repo X" or "对 repo X 开始全天候开发". Do exactly
+this, in order, and report each step's real output. Do not write your own loop script.
 
 ```bash
 cd <repo>
-bash <plugin>/bootstrap.sh --repo <repo>          # probe; opt-in --install for missing pkgs
-python3 <plugin>/scripts/autoloop.py --repo <repo> init \
-    --runner '<verified headless command, e.g. dsh headless {prompt_file}>' \
-    --test-cmd '<the real test command of this repo>'
-python3 <plugin>/scripts/autoloop.py --repo <repo> suggest --limit 5
-python3 <plugin>/scripts/autoloop.py --repo <repo> tick
+ALO="python3 <plugin>/scripts/autoloop.py --repo <repo>"
+
+$ALO preflight                    # §二 前置流程：只读检查，缺什么给什么命令
+bash <plugin>/bootstrap.sh --repo <repo>          # 装进 dsh 技能目录 + env 探测 + preflight + init
+bash <plugin>/bootstrap.sh --repo <repo> --install  # 多打印缺失项的安装命令——只打印，不执行
+$ALO init --runner 'dsh --profile headless --json < {prompt_file}' \
+          --test-cmd '<the real test command of this repo>'
+$ALO suggest --limit 5
+$ALO round                        # 轮前注入：协议路径 + §十 状态记录 + 本轮动作
+$ALO watch --minutes 240          # or one `tick` per scheduled task
 ```
+
+`bootstrap.sh` takes `--repo <path>` (or a bare positional path, or nothing = cwd), and
+knows only three things: copy the skill files into `~/.dsh/skills/grokbot-autoloop`,
+probe `env.manifest` with `[ok]`/`[缺]` lines, then run `preflight` and `init`. `--install`
+adds the install command next to each missing tool and stops there — it never runs one,
+because §八 forbids the loop from reinstalling the environment to keep itself going.
+
+`preflight` before `init` is not bureaucracy. It answers the questions a loop cannot
+discover by itself — git identity, an SSH key that GitHub actually accepts, an
+authenticated `gh`, an origin whose base branch exists, a worker CLI whose headless flag
+is real on *this* version, the protocol file being present — and for each gap it prints
+the command. **You print those commands, you do not run them** (§八): adding a key,
+`gh auth login`, changing `git config` or reinstalling toolchains are the user's calls,
+and a loop that "fixes" the environment to keep going has already broken the rules. If
+preflight reports a blocker at `level=pr`, `delivery.owner=supervisor` still delivers
+`auto/*` branches plus a printed PR body; say which half is unavailable instead of
+pretending.
 
 Then arrange the wake-up (the loop does **not** run by itself — nothing here installs
-a daemon): either Grok Bot's own scheduled task running `tick` every 5–10 min, or
+a daemon): either `watch` in the foreground of a session you are already in, or Grok
+Bot's own scheduled task running `tick` every 5–10 min.
 
 ```bash
-bash <plugin>/install-cron.sh --repo <repo>          # prints both options, writes nothing
-bash <plugin>/install-cron.sh --repo <repo> --write   # only if the user chose box cron
+$ALO watch --minutes 240              # 60s cadence, no daemon, exits when 空转 6 轮
+bash <plugin>/install-cron.sh --repo <repo>          # prints all three drivers, writes nothing
+bash <plugin>/install-cron.sh --repo <repo> --write  # only if the user chose box cron
 ```
+
+`watch` exists because of 空转: a `tick`-only driver re-checks the box when the bot
+happens to wake, so a worker that finished three minutes ago still holds its slot for
+another seven. `watch` reaps every 60 s, which is the "about a minute after the Agent
+stops typing, the session closes and the PR exists" behaviour. It is a foreground loop
+you run inside a session — when it exits with code 4 it has spun 6 ticks with nothing to
+do and says so; that is the correct time to `suggest`, `approve`, or report the
+environment/cap problem in §七 words.
 
 `init` refusing to guess is a feature: with no `--test-cmd` it says *"a loop without an
 external gate cannot prove anything"* and every diff stays red. That is correct — fill
 the gate commands from what the repo actually supports.
 
 ## 2. Who decides what
+
+`PROTOCOL.md` (next to this file) is the 《DeepSeekHarness 持续自主开发监督协议》 the
+user wrote — ten sections, in their words. It is the prompt to inject **before every
+round of development**, not once at install: run `round`, which prints the protocol path
+plus its real sha256 and the §十 state record rebuilt from git/gh. Do not reconstruct
+that record from chat memory; a supervisor that lost its context cannot remember it is
+not allowed to merge.
 
 | The bot (you) decides | `autoloop.py` decides |
 |---|---|
@@ -61,6 +100,7 @@ the gate commands from what the repo actually supports.
 | Whether a `needs_approval` candidate is safe (`approve` / `reject`) | Red lines: forbidden paths, test mutation, `paths` scope, secrets, churn |
 | When to stop, freeze, or change direction | Caps: turns / jobs / PRs per day, disk floor, gh cooldown, nightly window |
 | What to tell the user | Whether a hung worker gets killed (it does, by process group) |
+| Whether delivery is `worker` (default) or `supervisor` — one config knob, `delivery.owner` | Whether the PR the worker claims exists: it re-reads it from `gh` by head branch |
 
 Anything you cannot point at in `status` / `report` / `ledger.jsonl` did not happen.
 
@@ -82,14 +122,37 @@ Per tick, do exactly four things:
 Those six words are the only failure modes you need to escalate. Everything else the
 engine handles by itself.
 
+Hourly, report with `report --patrol` instead of writing your own prose. It fills the
+two §七 templates from real state — 定时巡检 (总体状态 / 开发循环 / 本轮有效 PR / PR 目标 /
+异常情况 / 采取的恢复措施 / 是否需要我介入) and, when something is actually wrong,
+异常告警 (异常类型 / 影响范围 / 已执行的恢复措施 / 当前状态 / 是否需要我授权或处理 / 下一步
+监督动作). It deliberately omits what each agent is developing: §七 forbids feature-level
+detail, and a patrol that reads like a changelog is the one the user stops reading.
+Declaring "I will report every hour" in a prompt is not a schedule — say which driver
+(`watch`, a bot scheduled task, box cron) is actually running and that you verified it.
+
+Six consecutive ticks that accomplish nothing is a result, not a stall: the engine
+prints `空转 6 轮（原因 …）`, sets `下一步` to stop ticking, and `watch` exits 4. That is
+the moment to `suggest`, `approve`, or report the environment/cap reason. Keep ticking
+and you spend the turn budget to produce the same log line again.
+
 ## 4. Red lines are code, not manners
 
 The engine refuses these mechanically. Do not work around them, do not do it yourself
 instead, do not lower quality to keep the loop green:
 
 - no auto-merge, no deploy, no DB migration, no paid API, no mail/comment/notification
-  to a real user — workers are told never to push or open a PR either, and the gate
-  checks they did not;
+  to a real user. Under the default `delivery.owner=worker` the 开发 Agent pushes its own
+  `auto/<task>` branch and opens its own PR (§四 of the protocol — the supervisor only
+  starts, monitors, recovers and schedules); that worker prompt still forbids merging,
+  closing, rebasing or touching `main` and another agent's branch, and the engine never
+  issues `pr merge`/`pr close`/`pr review` itself. Set `delivery.owner=supervisor` to
+  get the v1.0.0 behaviour, where no worker touches the remote and the engine opens the
+  PR after the gate goes green;
+- a PR that exists but did not pass the gate is **annotated, never touched**: the slot
+  keeps `pr_unverified`, the patrol says 已建但未过监工闸门，勿合并, and the repair round
+  updates that same PR (§六). Closing or force-pushing over it would destroy work the
+  human may already be reviewing;
 - lockfiles, dependency manifests, `migrations/`, `.github/`, `Dockerfile*`,
   `docker-compose*`, `.env*`, key files, and `.autoloop/**` itself are forbidden paths;
 - modifying, weakening or deleting an **existing** test or snapshot is red. Adding
@@ -118,6 +181,15 @@ When `nightly_max_jobs`, `max_turns_per_day`, `pr_max_per_day`, the disk floor, 
 `fail_gate` hits: **report it and stop**. Do not raise caps to keep going;
 `AUTOLOOP_NO_LIMIT=1` exists for debugging and has no place in a scheduled task.
 
+Three knobs exist only to kill 空转, and they are the reason a finished worker no longer
+squats in a slot for 30 minutes: `finish_grace_s` (60 — after the worker's session says
+it is done, or after it commits and goes quiet, the engine closes it and runs the gate
+within about a minute), `stall_s` (420 — a log that has produced nothing *and* no commits
+for 7 minutes is judged dead: the process group is killed and the diff goes to the repair
+round with the original agent resumed), and `watch_interval_s` (60 — the cadence `watch`
+and the `下一步` hint use). `job_timeout_s` (1800) stays as the outer bound, not the
+normal path.
+
 Stop / resume, in that order of severity:
 
 ```bash
@@ -135,22 +207,34 @@ that manufactures TODOs to look busy is worse than a loop that stopped. Maintena
 mode (after `fail_gate` consecutive reds) does tests/docs/lint only, never new
 business code.
 
+§五 asks for **at least 2 有效 PR per round**, and 有效 is the protocol's definition: the
+PR really exists, on the right branch, with real code changes, with a summary plus
+verification plus known issues, and not merged by the supervisor. `report --patrol`
+counts `prs_valid_today` against that floor and names the shortfall — an agent's
+self-reported "I opened a PR" that `gh` cannot find counts as zero, and the patrol says
+so. Two empty TODOs are worth less than one real fix.
+
 ## 7. Morning routine
 
 ```bash
 autoloop.py report --journal     # what happened, incl. the fixed footer line
+autoloop.py report --patrol      # §七 template, filled from real state
 autoloop.py status               # slots, ready-to-open PRs, blocked reasons
 autoloop.py queue                # needs_approval queue → approve / reject
+autoloop.py round                # 轮前注入（协议 + §十 记录），新一轮开始前读它
 autoloop.py prbody A > /tmp/pr.md   # then fill the three judgement fields by hand
-autoloop.py pr A --body /tmp/pr.md  # push + open, never merge
+autoloop.py pr A --body /tmp/pr.md  # supervisor-mode fallback: push + open, never merge
 autoloop.py sync                 # merged/closed upstream → done.json, so slots refill
 autoloop.py budget               # counters against every cap
 ```
 
 Merge nothing yourself from within the loop. The user merges in the morning. PRs are
-labelled `auto-ready` (risk < 20 and churn < 50) or `auto-needs-review`, and every
-body ends with the fixed line `PR created by the AutoLoop supervisor. Never merged
-automatically.`
+labelled `auto-ready` (risk < 20 and churn < 50) or `auto-needs-review`, and an
+engine-opened body ends with the fixed line `PR created by the AutoLoop supervisor.
+Never merged automatically.` Under `delivery.owner=worker` the body is the agent's own
+work — the prompt card gives it the six sections and that same disclaimer, but you
+cannot vouch for wording you did not write, so `status`/`report` is the authority on
+whether the PR is real, not its text.
 
 ## 8. Reference projects are read-only input
 
@@ -164,14 +248,17 @@ reference repo trigger a dependency addition or a public-API change (both are
 
 All of it is files under `<repo>/.autoloop/` (git-excluded, `backup` snapshots them to
 branch `autoloop/state`): `state.json` `queue.json` `candidates.json` `blocked.json`
-`done.json` `policy.json` `config.json` `verify.sh` `boot.json` `ledger.jsonl`
-`log/<day>.md` `history/<day>.json` `jobs/`.
+`done.json` `policy.json` `config.json` `verify.sh` `boot.json` `preflight.json`
+`ledger.jsonl` `log/<day>.md` `history/<day>.json` `jobs/`, plus the `STOP` / `HALTED`
+marker files when a human has paused the loop.
 
 Lost context, box reboot, or a suspect state:
 
 ```bash
+autoloop.py preflight   # is the box still able to deliver at all (identity/ssh/gh/runner)
 autoloop.py doctor      # box truth: tools, gh auth, cron, workers, disk, caps
 autoloop.py recover     # rebuild slots from real git + gh state
+autoloop.py round       # rebuild §十's state record instead of trusting chat memory
 autoloop.py tick        # resume
 ```
 

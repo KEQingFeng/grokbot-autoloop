@@ -24,7 +24,10 @@
     "max_business_lines": 400,
     "night_window": "22:00-08:00",
     "gh_cooldown_min": 15,
-    "gh_daily_rate_hits": 3
+    "gh_daily_rate_hits": 3,
+    "finish_grace_s": 60,
+    "stall_s": 420,
+    "watch_interval_s": 60
   },
 
   "caps_notes": {
@@ -37,7 +40,19 @@
     "min_free_disk_mb": "Below this no worktree is created — a full disk on a shared box breaks everything else.",
     "max_business_lines": "Churn ceiling for one task; bigger work must be split, not squeezed through.",
     "night_window": "Wall clock for the conservative档; night only runs policy.auto_apply kinds.",
-    "gh_daily_rate_hits": "After this many gh rate-limit hits in a day the reference search disables itself."
+    "gh_daily_rate_hits": "After this many gh rate-limit hits in a day the reference search disables itself.",
+    "finish_grace_s": "空转 guard 1: the worker printed AUTOLOOP_DONE (or committed and went quiet) — close its session and run the gate within this many seconds, then deliver. This is the '写完约一分钟内结束会话、接着交付 PR' behaviour.",
+    "stall_s": "空转 guard 2: no log bytes and no commits for this long — the worker is waiting on something nobody will answer (a sandbox approval prompt, a sub-agent). Kill its process group, count the try, repair or block. Do not raise this above 600 in a live loop: an hour of silence is 1/30 of the daily turn budget.",
+    "watch_interval_s": "Cadence of `watch` and the tick hint while workers run. 60 keeps detection latency at about a minute."
+  },
+
+  "delivery": {
+    "owner": "worker",
+    "notes": {
+      "worker": "监督协议 §三/§四 的分工：开发 Agent 自己建分支、提交、push、开 PR 并写交付报告；监工只启动/监控/恢复/调度，并用 gh pr list 核验 PR 是否真实存在、基分支是否正确 —— 不信它的聊天自述。红线与闸门照跑，红了的 PR 标 `pr_unverified` 并计入异常汇报，绝不合并。",
+      "supervisor": "v1.0.0 行为：worker 禁止碰远程，监工跑完闸门后 push + 开 PR。worker 没有 gh 授权、或你要求「未过闸门的 diff 不许公开」时用它。",
+      "switch": "AUTOLOOP_DELIVERY_OWNER=supervisor 临时覆盖；两条流水线可以不同。"
+    }
   },
 
   "verify": {
@@ -54,8 +69,14 @@
   },
 
   "runner": {
-    "cmd": "dsh headless {prompt_file}",
-    "note": "VERIFY THE FLAG ON THIS BOX FIRST: `printf 'reply with the single word ok\\n' | dsh headless` — headless syntax differs per CLI and per version (dsh headless / codex exec / claude -p / qoder -p / grok -p). {prompt_file} and {worktree} are substituted; the prompt is always also available at $AUTOLOOP_PROMPT_FILE."
+    "cmd": "dsh --profile headless --json < {prompt_file}",
+    "cmd_alt": [
+      "dsh --profile headless < {prompt_file}",
+      "codex exec {prompt_file}",
+      "claude -p < {prompt_file}",
+      "qoder -p < {prompt_file}"
+    ],
+    "note": "DeepSeekHarness 实测口径（@deepseek-ai/dsh 0.2.0-rc.2，本机 2026-10-14 读包内 README 核对）：headless 的任务来自位置参数，或省略/单独的 `-` 时来自 stdin —— 位置参数是「任务文本」不是文件路径，所以必须用 `< {prompt_file}` 而不是把路径当参数丢给它。`--json` 把输出换成按行事件（session → status/text/thinking/tool_call/tool_result → final），监工靠它认会话 id 和静默时长；不带 --json 时推理增量走 stderr，日志一样会长，空转检测照样有效。退出码：turn end=0，aborted/error=1。`--session-id <id>` 延续同一会话（未知 id 直接失败，不静默开新会话）；修复轮会自动带上它，让原 worker 改自己的 PR。其它 CLI 的 headless 写法不同，换 runner.cmd 前先 `dsh --profile headless --help` 亲自确认，别照抄本文件。"
   },
 
   "reference_enabled": true,
@@ -64,10 +85,14 @@
   "env_overrides": {
     "AUTOLOOP_REPO": "repository path, when you cannot cd into it",
     "AUTOLOOP_WORKER_CMD": "overrides runner.cmd",
+    "AUTOLOOP_DELIVERY_OWNER": "worker | supervisor — who pushes and opens the PR",
     "AUTOLOOP_MAX_PARALLEL": "int, overrides caps.max_parallel",
     "AUTOLOOP_PR_MAX_PER_DAY": "int",
     "AUTOLOOP_NIGHTLY_MAX_JOBS": "int",
     "AUTOLOOP_JOB_TIMEOUT_S": "int",
+    "AUTOLOOP_FINISH_GRACE_S": "int, seconds from AUTOLOOP_DONE to closing the session",
+    "AUTOLOOP_STALL_S": "int, seconds of silence + no commits before the run is called dead",
+    "AUTOLOOP_WATCH_INTERVAL_S": "int, `watch` cadence and the tick hint while workers run",
     "AUTOLOOP_HARD_STOP": "any value = refuse all business work this tick",
     "AUTOLOOP_GH": "path to a gh stand-in (used by the self-test)",
     "AUTOLOOP_NO_LIMIT": "1 = remove every money/delivery cap. Debug only, and never set it in a scheduled task."
