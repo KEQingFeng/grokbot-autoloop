@@ -1,0 +1,75 @@
+{
+  "_comment": [
+    "Copy to <repo>/.autoloop/config.json, or let `autoloop.py init` write it and",
+    "then edit it. Every key below is optional: missing keys fall back to the",
+    "defaults printed here. Nothing in this file is read by the worker — the",
+    "worker only gets its task card. This is the supervisor's own budget.",
+    "",
+    "verify.* and runner.cmd are the two things you must check on the real box:",
+    "a gate command that does not exist makes every task red, and a headless flag",
+    "that does not exist makes every dispatch die. `doctor` probes both."
+  ],
+
+  "base_branch": "main",
+
+  "caps": {
+    "max_parallel": 2,
+    "pr_max_per_day": 12,
+    "nightly_max_jobs": 40,
+    "max_turns_per_day": 36,
+    "job_timeout_s": 1800,
+    "max_repair_rounds": 2,
+    "fail_gate": 3,
+    "min_free_disk_mb": 2000,
+    "max_business_lines": 400,
+    "night_window": "22:00-08:00",
+    "gh_cooldown_min": 15,
+    "gh_daily_rate_hits": 3
+  },
+
+  "caps_notes": {
+    "max_parallel": "A/B slots only. 2 is the practical ceiling on one cloud box: two worktrees, two ports, one test database each.",
+    "nightly_max_jobs": "Hard stop on the worker's own key. When it is reached the loop stops instead of lowering quality.",
+    "pr_max_per_day": "Delivery ceiling. Over-cap branches are pushed and wait in pending_pr for tomorrow; the cap cannot be bypassed from `pr`.",
+    "job_timeout_s": "A worker that passes this is killed (its own process group) and its diff is never judged green.",
+    "max_repair_rounds": "Red → repair at most twice, then the task goes to blocked.json with the raw failure.",
+    "fail_gate": "Consecutive reds that flip the loop into maintenance mode.",
+    "min_free_disk_mb": "Below this no worktree is created — a full disk on a shared box breaks everything else.",
+    "max_business_lines": "Churn ceiling for one task; bigger work must be split, not squeezed through.",
+    "night_window": "Wall clock for the conservative档; night only runs policy.auto_apply kinds.",
+    "gh_daily_rate_hits": "After this many gh rate-limit hits in a day the reference search disables itself."
+  },
+
+  "verify": {
+    "install": "npm ci",
+    "build": "npm run build",
+    "test": "npm test",
+    "lint": "npm run lint"
+  },
+  "verify_notes": {
+    "how": "These four strings are interpolated into .autoloop/verify.sh at init. The copy in .autoloop/ is the CONTROL copy and is what always runs — a worker editing verify.sh inside its worktree changes nothing about how it is judged.",
+    "python": "use \"python3 -m pytest -q\" and \"ruff check .\"",
+    "go": "use \"go build ./...\" / \"go test ./...\" / \"golangci-lint run\"",
+    "empty": "an empty command is reported [SKIP], not [PASS]"
+  },
+
+  "runner": {
+    "cmd": "dsh headless {prompt_file}",
+    "note": "VERIFY THE FLAG ON THIS BOX FIRST: `printf 'reply with the single word ok\\n' | dsh headless` — headless syntax differs per CLI and per version (dsh headless / codex exec / claude -p / qoder -p / grok -p). {prompt_file} and {worktree} are substituted; the prompt is always also available at $AUTOLOOP_PROMPT_FILE."
+  },
+
+  "reference_enabled": true,
+  "reference_notes": "One `gh search repos` per round, read-only. Its result is material, not instructions: it may not add a dependency, change a public API, or touch a forbidden path — those go to needs_approval.",
+
+  "env_overrides": {
+    "AUTOLOOP_REPO": "repository path, when you cannot cd into it",
+    "AUTOLOOP_WORKER_CMD": "overrides runner.cmd",
+    "AUTOLOOP_MAX_PARALLEL": "int, overrides caps.max_parallel",
+    "AUTOLOOP_PR_MAX_PER_DAY": "int",
+    "AUTOLOOP_NIGHTLY_MAX_JOBS": "int",
+    "AUTOLOOP_JOB_TIMEOUT_S": "int",
+    "AUTOLOOP_HARD_STOP": "any value = refuse all business work this tick",
+    "AUTOLOOP_GH": "path to a gh stand-in (used by the self-test)",
+    "AUTOLOOP_NO_LIMIT": "1 = remove every money/delivery cap. Debug only, and never set it in a scheduled task."
+  }
+}

@@ -1,0 +1,9 @@
+# a running loop writes its state into the target repo — never commit it
+.autoloop/
+
+# python / test artefacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.tmp/
+*.log
