@@ -20,7 +20,7 @@ instance resumes from `status` / `tick` with no chat history.
 Stdlib only. Subcommands:
   doctor init tick status plan dispatch reap verify prbody pr suggest report
   approve reject queue budget sync stop go halt resume recover backup ref
-  watch round preflight
+  watch round preflight timeline
 """
 
 import argparse
@@ -121,6 +121,81 @@ SLOTS = ("A", "B")
 ACTIVE_STATES = ("developing", "verifying", "repairing")
 DONE_STATES = ("pr_open", "pr_ready", "blocked", "idle", None)
 
+# §三 task lifecycle. Slot states above describe *where the work is running*; these
+# describe what is known about the task itself, and they are the states a recovering
+# supervisor is allowed to reason in. UNKNOWN is a real state, not a placeholder: a task
+# whose external outcome could not be confirmed sits there until git/gh is re-read, and
+# §三 forbids promoting it to DONE on the way past.
+TASK_STATES = ("QUEUED", "RUNNING", "BLOCKED", "RECOVERING", "VERIFYING",
+               "DONE", "FAILED", "UNKNOWN")
+TERMINAL_STATES = ("DONE", "FAILED")
+# What may follow what. Deliberately missing edges are the point: nothing reaches DONE
+# except through VERIFYING, and nothing leaves UNKNOWN except by re-reading real state.
+TASK_TRANSITIONS = {
+    "QUEUED": ("RUNNING", "BLOCKED", "FAILED", "UNKNOWN"),
+    "RUNNING": ("VERIFYING", "BLOCKED", "RECOVERING", "FAILED", "UNKNOWN"),
+    "VERIFYING": ("DONE", "FAILED", "BLOCKED", "RECOVERING", "UNKNOWN"),
+    "BLOCKED": ("QUEUED", "RUNNING", "RECOVERING", "FAILED", "UNKNOWN"),
+    "RECOVERING": ("QUEUED", "RUNNING", "VERIFYING", "BLOCKED", "FAILED", "UNKNOWN"),
+    "UNKNOWN": ("QUEUED", "RUNNING", "VERIFYING", "BLOCKED", "FAILED", "DONE"),
+    "DONE": (),
+    "FAILED": ("QUEUED", "RECOVERING", "UNKNOWN"),
+}
+
+# The slot machine predates §三 and its vocabulary is about *who is doing what
+# right now* (developing/verifying/repairing/pr_open/blocked). Rewriting it would
+# break every existing state.json, so the eight-state machine is a projection of
+# it rather than a replacement: one table, one direction, no new persistence.
+SLOT_TO_TASK_STATE = {
+    None: "QUEUED",
+    "idle": "QUEUED",
+    "developing": "RUNNING",
+    "repairing": "RUNNING",
+    "verifying": "VERIFYING",
+    "pr_ready": "VERIFYING",
+    "blocked": "BLOCKED",
+}
+
+
+def can_transition(old, new):
+    """Is this move legal on the §三 machine? An unrecorded `old` may go anywhere."""
+    if old == new:
+        return True
+    if old not in TASK_TRANSITIONS:
+        return new in TASK_STATES
+    return new in TASK_TRANSITIONS[old]
+
+
+def task_state_of(rec):
+    """Project a slot record onto the eight-state machine.
+
+    §六 forbids rounding "PR 已创建" up to success, so a delivered PR is DONE only
+    when the gate was green; a red-gate PR is a BLOCKED task that happens to have a
+    PR attached, and an unrecognised slot state is UNKNOWN — never DONE."""
+    if not rec:
+        return "QUEUED"
+    st = rec.get("state")
+    if st == "pr_open":
+        return "DONE" if rec.get("verify") == "green" else "BLOCKED"
+    return SLOT_TO_TASK_STATE.get(st, "UNKNOWN")
+
+
+def scrub_secrets(val):
+    """Redact anything SECRET_LINE_RE recognises before it reaches a log or a PR body.
+
+    Applied to every value written into `events.jsonl`: a command line, an error message
+    or a worker's own output can carry a token, and §八 forbids printing or committing
+    credentials — an append-only log that captured one would keep it forever.
+    """
+    if isinstance(val, str):
+        return SECRET_LINE_RE.sub("<redacted:credential-pattern>", val)
+    if isinstance(val, dict):
+        return {k: scrub_secrets(v) for k, v in val.items()}
+    if isinstance(val, (list, tuple)):
+        return [scrub_secrets(v) for v in val]
+    return val
+
+
 # The one line a worker must print when its diff is committed and its own checks
 # have run. It is a *signal to the supervisor*, not a claim of correctness: the
 # gate in .autoloop/verify.sh still decides green/red. Without it the supervisor
@@ -203,6 +278,30 @@ def append_jsonl(path, obj):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(obj, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def read_jsonl(path, limit=None):
+    """Read an append-only log, skipping torn lines.
+
+    A truncated final line is the normal signature of being killed mid-write
+    (§十一 「持久化写入失败安全处理」), so it is skipped rather than raising — a
+    reader that dies on one bad line cannot answer any of §六's questions."""
+    out = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except FileNotFoundError:
+        return out
+    except OSError:
+        return out
+    return out[-limit:] if limit else out
 
 
 def run(argv, cwd=None, timeout=120, env=None, shell=False):
@@ -421,6 +520,7 @@ class Ctx:
         # visible there, not only inside state.json
         self.journal("- day rollover: counters reset for %s, yesterday kept in %s"
                      % (today(), os.path.basename(archive)))
+        self.event("loop", "day_rollover", day=self.state["day"], archive=archive)
         return True
 
     # -- collections ------------------------------------------------------
@@ -439,6 +539,47 @@ class Ctx:
         rec = dict(rec)
         rec.setdefault("ts", stamp())
         append_jsonl(os.path.join(self.alo, "ledger.jsonl"), rec)
+
+    def event(self, phase, kind, task=None, op=None, **fields):
+        """Append one line to `events.jsonl` — the record §六 asks for.
+
+        `ledger.jsonl` is the round summary a human skims; this is the machine-readable
+        timeline. Every task transition, gate run, dispatch, PR action, breaker trip and
+        recovery step lands here with an id, so `timeline` can answer "where did it stop,
+        what was the last thing that really succeeded, and where would a recovery resume"
+        without reading chat history or guessing from a file's mtime.
+
+        Append-only, never rewritten, and values are scrubbed through SECRET_LINE_RE
+        before they are written: an event log is exactly the file that ends up pasted into
+        a bug report, so a token that leaked into one field would leak into every copy.
+        """
+        rec = {"ts": stamp(), "epoch": now(), "event_id": self._next_event_id(),
+               "phase": phase, "kind": kind}
+        if task:
+            rec["task_id"] = task
+        if op:
+            rec["op_id"] = op
+        for key, val in fields.items():
+            rec[key] = scrub_secrets(val)
+        try:
+            append_jsonl(os.path.join(self.alo, "events.jsonl"), rec)
+        except OSError as exc:
+            # §十: a persistent-write failure is itself an alertable event, and losing the
+            # log must not take the loop down with it — say so where the journal still is.
+            self.note("events.jsonl write failed: %s" % exc)
+            # Most callers save() before emitting, so the note would otherwise die
+            # with the process and the failure would be invisible — exactly the
+            # "silent" outcome §十 forbids.
+            try:
+                self.save()
+            except OSError:
+                pass
+            return None
+        return rec["event_id"]
+
+    def _next_event_id(self):
+        self._event_seq = getattr(self, "_event_seq", 0) + 1
+        return "%d-%d-%d" % (time.time_ns() // 1000, os.getpid(), self._event_seq)
 
     def journal(self, text):
         os.makedirs(self.log_dir, exist_ok=True)
@@ -731,6 +872,11 @@ def adopt_worker_pr(ctx, rec, slot, pol, lines, verified):
                 row["pr"] = rec["pr"]
                 row["branch"] = rec["branch"]
                 row["pr_state"] = pr.get("state")
+                # §三: DONE here means "the task delivered", not "the PR merged" —
+                # task_state_of refuses DONE unless the gate was green.
+                row["task_state"] = task_state_of(rec)
+                row["task_state_at"] = stamp()
+                row["last_progress_at"] = now()
     ctx.set_coll("queue.json", queue)
     ctx.set_coll("candidates.json", cands)
     note = ""
@@ -748,6 +894,12 @@ def adopt_worker_pr(ctx, rec, slot, pol, lines, verified):
     ctx.ledger({"turn": ctx.state["turn"], "branch": rec["branch"], "task": rec.get("task"),
                 "result": "pr_open", "pr": rec["pr"], "by": "worker",
                 "verified": bool(verified), "slot": slot})
+    # §六/§七: the PR number, its real state read back from gh, the gate verdict and
+    # the merge SHA are the four things a timeline must be able to answer later.
+    ctx.event("deliver", "pr_adopted", task=rec.get("task"), slot=slot,
+              branch=rec["branch"], pr=rec["pr"], pr_url=rec.get("pr_url"),
+              pr_state=pr.get("state"), gate="green" if verified else "red",
+              opened_by="worker", wrong_base=pr.get("baseRefName") if wrong_base else None)
     return True
 
 
@@ -767,6 +919,8 @@ def mark_unverified_pr(ctx, rec, slot, lines, red):
     rec["pr_unverified"] = red[:3]
     lines.append("- slot %s: worker 已开 PR #%s 但未过闸门 —— 不合并、不关闭、不覆盖，"
                  "修复轮会更新同一条 PR（§六）" % (slot, pr.get("number")))
+    ctx.event("deliver", "pr_unverified", task=rec.get("task"), slot=slot,
+              branch=rec.get("branch"), pr=rec["pr"], red=red[:3])
     return True
 
 
@@ -1903,9 +2057,18 @@ def cmd_tick(args):
 
         # 8. fail gate
         if c["fails_consecutive"] >= ctx.cap("fail_gate"):
+            tripped = not st.get("maintenance")
             st["maintenance"] = True
             lines.append("- gate A: %s consecutive red verifications → maintenance mode "
                          "(docs/candidates/state repair only)" % c["fails_consecutive"])
+            if tripped:
+                # §五/§十: the breaker trip is an alertable event, and it is emitted
+                # once per trip (not once per tick) so the log stays readable.
+                ctx.event("guard", "breaker_trip", gate="fail_gate",
+                          fails_consecutive=c.get("fails_consecutive"),
+                          limit=ctx.cap("fail_gate"), action="maintenance mode",
+                          reason="%s consecutive red verifications"
+                                 % c.get("fails_consecutive"))
         # 9. decide next action for the judgement layer
         st["next"] = next_action(ctx)
         _finish(ctx, lines, st.get("idle_reason"), args.quiet)
@@ -1938,6 +2101,13 @@ def _finish(ctx, lines, idle, quiet=False):
     ctx.journal("\n".join(lines))
     ctx.ledger({"turn": ctx.state["turn"], "result": idle or "ok",
                 "slots": {s: (ctx.state["slots"].get(s) or {}).get("state") for s in SLOTS}})
+    # Only a tick that produced nothing gets an event line: the interesting ones
+    # already emitted dispatch/gate/PR/block events, and writing a line per idle
+    # check is free but writing one per busy tick would bury them.
+    if idle:
+        ctx.event("loop", "idle_tick", idle_reason=idle, turn=ctx.state["turn"],
+                  idle_ticks=c.get("idle_ticks"),
+                  slots={s: (ctx.state["slots"].get(s) or {}).get("state") for s in SLOTS})
     if quiet:
         return
     log("\n".join(lines))
@@ -2110,6 +2280,9 @@ def _block(ctx, rec, reason):
     ctx.ledger({"turn": ctx.state["turn"], "branch": rec.get("branch"),
                 "task": rec.get("task"), "result": "blocked", "pr": None,
                 "reason": reason[:200]})
+    ctx.event("guard", "task_blocked", task=rec.get("task"), slot=rec.get("slot"),
+              branch=rec.get("branch"), tries=rec.get("tries", 0),
+              reason=reason[:600])
 
 
 def _advance(ctx, rec, slot, pol, lines):
@@ -2142,6 +2315,10 @@ def _advance(ctx, rec, slot, pol, lines):
                          % (slot, verdict, "pid %s killed" % meta.get("pid") if stopped
                             else "process had already left", ctx.cap("job_timeout_s")))
             rec["worker_exit"] = None
+            ctx.event("run", "job_stopped", task=rec.get("task"), slot=slot,
+                      op=rec.get("job"), job=rec.get("job"),
+                      session_id=meta.get("session_id"), verdict=verdict,
+                      detail=detail[:300], killed=stopped, pid=meta.get("pid"))
             if verdict == "stalled":
                 rec["stalled"] = True
                 rec["tries"] = rec.get("tries", 0) + 1
@@ -2161,6 +2338,11 @@ def _advance(ctx, rec, slot, pol, lines):
             rec["worker_report"] = tail[-2500:]
             rec["last_action"] = "job %s%s" % (jstat, "" if code is None else "/exit%s" % code)
             rec["worker_exit"] = code
+            ctx.event("run", "job_exit", task=rec.get("task"), slot=slot,
+                      op=rec.get("job"), job=rec.get("job"), status=jstat, exit=code,
+                      session_id=meta.get("session_id"),
+                      done_signal=rec.get("done_signal"),
+                      log_tail=(tail or "")[-400:])
             lines.append("- slot %s: job %s (exit %s)" % (slot, jstat, code))
             rec["state"] = "verifying"
             if jstat in ("timeout", "dead"):
@@ -2226,6 +2408,12 @@ def verify_slot(ctx, rec, slot, pol, lines):
         c["fails_today"] = c.get("fails_today", 0) + 1
         rec["verify"] = "red"
         rec["red_reasons"] = red[:6]
+        ctx.event("verify", "gate_red", task=rec.get("task"), slot=slot,
+                  branch=rec.get("branch"), tries=rec.get("tries"), red=red[:6],
+                  churn=churn, files=[p for _, p in rows][:20],
+                  steps=[{"state": s.get("state"), "cmd": (s.get("cmd") or "")[:120]}
+                         for s in (vres.get("steps") or [])][:12],
+                  evidence=vres.get("evidence"))
         if delivery_owner(ctx) == "worker":
             mark_unverified_pr(ctx, rec, slot, lines, red)
         lines.append("- slot %s VERIFY RED (%d reason(s)): %s"
@@ -2248,6 +2436,16 @@ def verify_slot(ctx, rec, slot, pol, lines):
     rec["verify"] = "green"
     rec["state"] = "pr_ready"
     rec["next"] = "open PR"
+    # §七: bind the green result to the exact SHA it was measured on. Without this
+    # "tested" and "merged" can silently refer to different commits.
+    _, head_sha, _ = git("rev-parse HEAD", cwd=wt)
+    rec["verified_sha"] = (head_sha or "").strip() or None
+    ctx.event("verify", "gate_green", task=rec.get("task"), slot=slot,
+              branch=rec.get("branch"), sha=rec["verified_sha"], churn=churn,
+              files=[p for _, p in rows][:20],
+              steps=[{"state": s.get("state"), "cmd": (s.get("cmd") or "")[:120]}
+                     for s in (vres.get("steps") or [])][:12],
+              evidence=vres.get("evidence"))
     lines.append("- slot %s VERIFY GREEN (%s changed file(s), %s lines) → ready for PR"
                  % (slot, len(rows), churn))
     if adopt_worker_pr(ctx, rec, slot, pol, lines, verified=True):
@@ -2334,6 +2532,10 @@ def start_task(ctx, task, label, slot, mode, lines):
            "tries": 0, "started": now(), "port_base": port,
            "last_action": "dispatched", "next": "wait for worker, then verify",
            "from": label}
+    # §七: the baseline SHA is recorded *before* the worker touches anything, so
+    # "what did this task change" is answerable from state alone later.
+    _, base_sha, _ = git("rev-parse %s" % shlex.quote(ctx.origin_base), cwd=ctx.root)
+    rec["base_sha"] = (base_sha or "").strip() or None
     ctx.state["slots"][slot] = rec
     ctx.state["counters"]["jobs_today"] = ctx.state["counters"].get("jobs_today", 0) + 1
     ctx.state["idle_reason"] = None
@@ -2342,6 +2544,9 @@ def start_task(ctx, task, label, slot, mode, lines):
     _persist_pool(ctx, task, "developing")
     ctx.ledger({"turn": ctx.state["turn"], "branch": branch, "task": tid,
                 "result": "dispatched", "pr": None, "slot": slot})
+    ctx.event("run", "job_dispatched", task=tid, slot=slot, op=meta["jid"],
+              branch=branch, job=meta["jid"], base_ref=ctx.origin_base,
+              base_sha=rec["base_sha"], worktree=wt, port_base=port, src=label)
 
 
 def _persist_pool(ctx, task, status):
@@ -2353,6 +2558,7 @@ def _persist_pool(ctx, task, status):
             if row.get("id") == task.get("id"):
                 row["status"] = status
                 row["last_action"] = "%s@%s" % (status, stamp())
+                _stamp_task_state(ctx, row, status)
                 hit = True
         if hit:
             ctx.set_coll(name, pool)
@@ -2360,8 +2566,29 @@ def _persist_pool(ctx, task, status):
     # manual dispatch of a task that is not in any pool: register it in the queue
     if status == "developing":
         pool = ctx.coll("queue.json")
-        pool.append(dict(task, status="developing"))
+        row = dict(task, status="developing")
+        _stamp_task_state(ctx, row, "developing")
+        pool.append(row)
         ctx.set_coll("queue.json", pool)
+
+
+def _stamp_task_state(ctx, row, slot_status):
+    """§三: every task row carries its canonical state and when it last moved.
+
+    `last_progress_at` only advances on a *state change*, which is what makes it
+    usable as a no-progress signal later — a task that keeps being touched without
+    changing state is exactly the loop §五 wants caught."""
+    new = SLOT_TO_TASK_STATE.get(slot_status, "UNKNOWN")
+    old = row.get("task_state")
+    row["task_state"] = new
+    row["task_state_at"] = stamp()
+    row.setdefault("last_progress_at", now())
+    if old != new:
+        row["last_progress_at"] = now()
+        if old and not can_transition(old, new):
+            # Not fatal — the projection table can lag a new slot state — but an
+            # illegal jump nobody is told about is how a state machine rots.
+            ctx.note("illegal task_state jump %s→%s on %s" % (old, new, row.get("id")))
 
 
 def note_reference(ctx, lines):
@@ -2695,6 +2922,8 @@ def cmd_pr(args):
             ctx.state["slots"][rec["slot"]] = None
             ctx.ledger({"turn": st.get("turn"), "branch": rec["branch"],
                         "task": rec["task"], "result": "pending_pr", "pr": None})
+            ctx.event("deliver", "pr_deferred", task=rec["task"], slot=rec["slot"],
+                      branch=rec["branch"], reason=soft[0])
             ctx.save()
             log("%s — branch pushed, PR queued (slot %s freed)" % (soft[0], rec["slot"]))
             return 1
@@ -2711,6 +2940,13 @@ def cmd_pr(args):
         rc, out, err = git("push -u origin %s" % shlex.quote(rec["branch"]),
                            cwd=rec["worktree"], timeout=300)
         if rc != 0:
+            # §七: the diff exists locally but never reached origin. Recording the
+            # scene before exiting is what makes the retry idempotent instead of a
+            # second blind attempt on an unknown remote state.
+            ctx.event("deliver", "push_failed", task=rec["task"], slot=rec["slot"],
+                      branch=rec["branch"], rc=rc, error=(err or out)[:600],
+                      worktree=rec["worktree"], sha=rec.get("verified_sha"))
+            ctx.save()
             die("push failed: %s" % (err or out)[:400])
         tmp = os.path.join(ctx.alo, "pr-body-%s.md" % rec["task"])
         write_text(tmp, body)
@@ -2720,6 +2956,14 @@ def cmd_pr(args):
                   shlex.quote(tmp)))
         rc, out, err = run(cmd, cwd=ctx.root, timeout=120, shell=True)
         if rc != 0:
+            # The branch is already on origin here, so "did the PR get created?" is
+            # genuinely unknown (gh may have died after the API call). Record it as
+            # UNKNOWN-shaped evidence and let `sync` re-read the truth from gh by
+            # head branch rather than re-creating a duplicate.
+            ctx.event("deliver", "pr_create_unknown", task=rec["task"], slot=rec["slot"],
+                      branch=rec["branch"], rc=rc, error=(err or out)[:600],
+                      pushed=True, resolve="sync (re-reads gh by head branch)")
+            ctx.save()
             die("gh pr create failed (branch is pushed): %s" % (err or out)[:400])
         num = re.search(r"(\d+)$", out or "")
         run("%s pr edit %s%s --add-label %s"
@@ -2745,10 +2989,16 @@ def cmd_pr(args):
                     row["pr"] = rec["pr"]
                     row["branch"] = rec["branch"]
                     row["pr_state"] = "OPEN"
+                    row["task_state"] = task_state_of(rec)
+                    row["task_state_at"] = stamp()
+                    row["last_progress_at"] = now()
         ctx.set_coll("queue.json", queue)
         ctx.set_coll("candidates.json", cands)
         ctx.ledger({"turn": ctx.state["turn"], "branch": rec["branch"], "task": rec["task"],
                     "result": "pr_open", "pr": rec["pr"], "risk": score, "label": tag})
+        ctx.event("deliver", "pr_created", task=rec["task"], slot=rec["slot"],
+                  branch=rec["branch"], pr=rec["pr"], risk=score, label=tag,
+                  sha=rec.get("verified_sha"), opened_by="supervisor")
         log("PR %s opened for %s (risk %s, label %s). Slot %s released — tick to refill."
             % (rec["pr"], rec["branch"], score, tag, rec["slot"]))
         ctx.save()
@@ -2965,6 +3215,8 @@ def cmd_stop(args):
     ctx.need_init()
     path = os.path.join(ctx.alo, "HALTED" if args.hard else "STOP")
     write_text(path, "%s\n%s\n" % (stamp(), args.reason or "stopped by operator"))
+    ctx.event("guard", "operator_stop", hard=bool(args.hard), flag=os.path.basename(path),
+              reason=args.reason or "stopped by operator")
     log("wrote %s — tick will refuse business work until removed" % path)
     return 0
 
@@ -2982,6 +3234,8 @@ def cmd_go(args):
     ctx.state["counters"]["fails_consecutive"] = 0
     ctx.state["mode_forced"] = args.mode if args.mode in ("day", "night") else ctx.state.get("mode_forced")
     ctx.save()
+    ctx.event("guard", "operator_go", removed=removed,
+              mode_forced=ctx.state.get("mode_forced") or "auto")
     log("removed %s; maintenance flag cleared; mode_forced=%s"
         % (", ".join(removed) or "nothing", ctx.state.get("mode_forced") or "auto"))
     return 0
@@ -3010,6 +3264,8 @@ def _resume_or_halt(args, halt):
         ctx.state["counters"]["fails_consecutive"] = 0
         log("HALTED removed, maintenance cleared, loop may take business work again")
     ctx.save()
+    ctx.event("guard", "operator_halt" if halt else "operator_resume",
+              reason=(args.reason or None) if halt else None)
     return 0
 
 
@@ -3024,6 +3280,11 @@ def cmd_recover(args):
         sync_prs(ctx, lines)
         recover_slots(ctx, lines)
         ctx.save()
+        # §四: recovery must be able to answer "what did the restart find?" from the
+        # log alone, without re-reading chat history.
+        ctx.event("recover", "recover_run",
+                  slots={s: (ctx.state["slots"].get(s) or {}).get("state") for s in SLOTS},
+                  findings=len(lines), summary=(lines[0][:300] if lines else None))
         log("\n".join(lines) or "- nothing to recover: state matches git/gh")
         log(report_text(ctx))
     return 0
@@ -3465,8 +3726,178 @@ def cmd_watch(args):
             left -= 2
 
 
-# --------------------------------------------------------------------- wiring
+# ------------------------------------------------------------------- timeline
 
+# §六 asks the log to answer seven questions. Answering them needs a fixed notion
+# of which event kinds count as "succeeded" and which as "failed" — otherwise the
+# reconstruction silently depends on whoever added the last event kind.
+SUCCESS_KINDS = ("gate_green", "pr_adopted", "pr_created", "operator_resume",
+                 "operator_go", "recover_run", "day_rollover")
+FAIL_KINDS = ("gate_red", "task_blocked", "job_stopped", "push_failed",
+              "pr_create_unknown", "breaker_trip", "pr_unverified", "job_failed")
+
+
+def _failed(ev):
+    if ev.get("kind") in FAIL_KINDS:
+        return True
+    if ev.get("kind") == "job_exit" and ev.get("exit") not in (0, None):
+        return True
+    return False
+
+
+def _succeeded(ev):
+    if ev.get("kind") in SUCCESS_KINDS:
+        return True
+    if ev.get("kind") == "job_exit" and ev.get("exit") == 0:
+        return True
+    return False
+
+
+def _fail_reason(ev):
+    for key in ("red", "reason", "error", "detail", "verdict"):
+        if ev.get(key):
+            val = ev[key]
+            if isinstance(val, list):
+                return "; ".join(str(v).splitlines()[0][:140] for v in val[:3])
+            return str(val).splitlines()[0][:300]
+    if ev.get("kind") == "job_exit":
+        return "worker process exited %s" % ev.get("exit")
+    return ev.get("kind")
+
+
+def _resume_hint(events, ctx, task):
+    """Where a restart should continue from — derived, never guessed as success.
+
+    §三 forbids promoting UNKNOWN to DONE, so the honest answer for a task whose
+    last event is a crash-shaped one is "verify the remote before touching it"."""
+    if not events:
+        return "no events recorded for %s — check whether the task ever left QUEUED" % task
+    last = events[-1]
+    kind = last.get("kind")
+    if kind in ("pr_adopted", "pr_created"):
+        pr = last.get("pr")
+        return ("PR %s exists; next step is `sync` to re-read its real state from gh, "
+                "then `review` — never assume merged" % pr)
+    if kind == "pr_create_unknown":
+        return ("gh pr create returned %s with the branch already pushed: run `sync` "
+                "to find out whether the PR exists before creating another one"
+                % last.get("rc"))
+    if kind == "push_failed":
+        return "push failed (rc=%s); the diff is still in %s — retry the push, do not re-run the worker" % (
+            last.get("rc"), last.get("worktree") or "the worktree")
+    if kind == "gate_red":
+        return "gate red on try %s; next step is the repair round (`--session-id` resume), not a fresh dispatch" % last.get("tries")
+    if kind == "task_blocked":
+        return "BLOCKED (%s) — needs a human decision or a different approach; auto-retry is refused by design" % _fail_reason(last)[:120]
+    if kind == "job_stopped":
+        return "worker was stopped for %s; verify the branch as-is (`verify %s`) before re-dispatching" % (
+            last.get("verdict"), last.get("slot") or "?")
+    if kind in ("job_exit", "job_dispatched"):
+        return "worker run ended at %s; next step is `verify %s` (the gate decides, not the exit code)" % (
+            last.get("ts"), last.get("slot") or "?")
+    if kind == "breaker_trip":
+        return "breaker is open (%s); `go` only after the underlying cause is fixed" % _fail_reason(last)[:120]
+    return "last event was %s/%s — run `tick` and let the slot machine decide" % (
+        last.get("phase"), kind)
+
+
+def task_timeline(events, ctx, task):
+    """The seven answers of §六 for one task, computed from events.jsonl only."""
+    evs = [e for e in events if e.get("task_id") == task]
+    started = next((e for e in evs if e.get("kind") == "job_dispatched"), None)
+    ok = [e for e in evs if _succeeded(e)]
+    bad = [e for e in evs if _failed(e)]
+    branches = sorted({e["branch"] for e in evs if e.get("branch")})
+    shas = sorted({e[s] for e in evs for s in ("sha", "verified_sha", "base_sha") if e.get(s)})
+    prs = sorted({str(e["pr"]) for e in evs if e.get("pr")})
+    sessions = sorted({e["session_id"] for e in evs if e.get("session_id")})
+    merged = [e for e in evs if e.get("kind") in ("pr_merged",)]
+    slot_state = None
+    for s in SLOTS:
+        rec = (ctx.state.get("slots", {}).get(s) or {})
+        if rec.get("task") == task:
+            slot_state = "%s=%s/verify=%s" % (s, rec.get("state"), rec.get("verify"))
+    return {
+        "task": task,
+        "started_at": (started or {}).get("ts"),
+        "current_step": ("%s/%s @ %s" % (evs[-1].get("phase"), evs[-1].get("kind"),
+                                         evs[-1].get("ts"))) if evs else None,
+        "slot_state": slot_state,
+        "last_success": ({"kind": ok[-1].get("kind"), "ts": ok[-1].get("ts"),
+                          "pr": ok[-1].get("pr"), "sha": ok[-1].get("sha")} if ok else None),
+        "last_failure": ({"kind": bad[-1].get("kind"), "ts": bad[-1].get("ts"),
+                          "reason": _fail_reason(bad[-1])} if bad else None),
+        "attempts": len([e for e in evs if e.get("kind") == "job_dispatched"]),
+        "gate_runs": len([e for e in evs if e.get("phase") == "verify"]),
+        "failures": len(bad),
+        "branches": branches,
+        "shas": shas,
+        "prs": prs,
+        "merged": [m.get("pr") for m in merged],
+        "sessions": sessions,
+        "events": len(evs),
+        "resume_from": _resume_hint(evs, ctx, task),
+        # §六's last requirement: an unverified result must be *labelled* unverified,
+        # never rounded up to success.
+        "confidence": ("merged" if merged else
+                       "pr_open" if prs else
+                       "verified" if any(e.get("kind") == "gate_green" for e in evs) else
+                       "unverified"),
+    }
+
+
+def cmd_timeline(args):
+    """Answer §六's seven questions from `events.jsonl` — no model, no gh, no git."""
+    ctx = Ctx(args.repo)
+    ctx.need_init()
+    events = read_jsonl(os.path.join(ctx.alo, "events.jsonl"))
+    if args.json and not args.task:
+        log(json.dumps([task_timeline(events, ctx, t) for t in _event_tasks(events)],
+                       ensure_ascii=False, indent=2))
+        return 0
+    tasks = [args.task] if args.task else _event_tasks(events)
+    if not tasks:
+        log("events.jsonl is empty — nothing to reconstruct yet (run a `tick`)")
+        return 0
+    out = []
+    for task in tasks:
+        tl = task_timeline(events, ctx, task)
+        if args.json:
+            out.append(tl)
+            continue
+        log("## %s  [%s]" % (task, tl["confidence"]))
+        log("- 何时启动: %s" % (tl["started_at"] or "未记录（没有 job_dispatched 事件）"))
+        log("- 当前停在哪一步: %s%s" % (tl["current_step"] or "-",
+                                       "｜slot %s" % tl["slot_state"] if tl["slot_state"] else ""))
+        log("- 最后成功操作: %s" % (json.dumps(tl["last_success"], ensure_ascii=False)
+                                    if tl["last_success"] else "无"))
+        log("- 最近失败原因: %s" % (json.dumps(tl["last_failure"], ensure_ascii=False)
+                                    if tl["last_failure"] else "无"))
+        log("- 资源消耗: 派发 %s 次｜闸门 %s 次｜失败 %s 次｜事件 %s 条｜会话 %s"
+            % (tl["attempts"], tl["gate_runs"], tl["failures"], tl["events"],
+               ", ".join(tl["sessions"]) or "无记录"))
+        log("- 代码留痕: 分支 %s｜SHA %s｜PR %s｜已合并 %s"
+            % (", ".join(tl["branches"]) or "-", ", ".join(s[:12] for s in tl["shas"]) or "-",
+               ", ".join("#" + p for p in tl["prs"]) or "-",
+               ", ".join("#" + str(m) for m in tl["merged"]) or "无"))
+        log("- 恢复应从哪继续: %s" % tl["resume_from"])
+        log("")
+    if args.json:
+        log(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _event_tasks(events):
+    """Task ids in first-seen order (stable, and matches the order work started)."""
+    seen = []
+    for ev in events:
+        tid = ev.get("task_id")
+        if tid and tid not in seen:
+            seen.append(tid)
+    return seen
+
+
+# --------------------------------------------------------------------- wiring
 
 def build_parser():
     p = argparse.ArgumentParser(
@@ -3553,6 +3984,9 @@ def build_parser():
         (("--reason",), {}))
     add("resume", cmd_resume, "clear HALTED + maintenance")
     add("recover", cmd_recover, "rebuild slots from real git + gh state")
+    add("timeline", cmd_timeline, "rebuild a task's history from events.jsonl — "
+                                  "answers §六's seven questions with no model call",
+        (("task",), {"nargs": "?"}), (("--json",), {"action": "store_true"}))
     add("sync", cmd_sync, "reconcile PR states (merged/closed → done.json)")
     add("backup", cmd_backup, "snapshot .autoloop/ (branch autoloop/state)",
         (("--push",), {"help": "remote url to push the snapshot branch to"}))

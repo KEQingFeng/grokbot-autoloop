@@ -1017,6 +1017,106 @@ def s_ledger_and_journal():
         box.cleanup()
 
 
+def s_event_timeline():
+    head("事件日志 + timeline：§六 的七个问题只从 events.jsonl 回答，不调模型")
+    box = Box("events")
+    try:
+        tid = box.add_task("Traceable work", ["src/*"])
+        box.tick(mode="good")
+        box.wait_jobs()
+        box.tick(mode="good")
+        box.run("pr", "A", "--auto-body")
+        path = os.path.join(box.alo, "events.jsonl")
+        check(os.path.exists(path), "events.jsonl 被写出来了", box.alo)
+        raw = open(path, encoding="utf-8").read().strip().splitlines()
+        evs = []
+        for line in raw:
+            try:
+                evs.append(json.loads(line))
+            except json.JSONDecodeError:
+                check(False, "每行都是合法 JSON", line)
+        kinds = [e.get("kind") for e in evs]
+        check(len(evs) >= 3, "每个生命周期节点一行", kinds)
+        for want in ("job_dispatched", "gate_green"):
+            check(want in kinds, "记录了 %s" % want, kinds)
+        check("pr_created" in kinds or "pr_adopted" in kinds, "记录了 PR", kinds)
+        for e in evs:
+            check(all(k in e for k in ("ts", "event_id", "phase", "kind")),
+                  "事件含 时间戳/事件ID/阶段/类型", e)
+        ids = [e["event_id"] for e in evs]
+        check(len(set(ids)) == len(ids), "event_id 不重复", ids)
+        disp = [e for e in evs if e["kind"] == "job_dispatched"][0]
+        check(disp.get("base_ref") and disp.get("base_sha"),
+              "派发前记下基线 SHA（§七）", disp)
+        green = [e for e in evs if e["kind"] == "gate_green"][0]
+        check(green.get("sha"), "绿灯结果绑定到具体 SHA", green)
+        check(green.get("steps"), "闸门各步结果留痕", green)
+        check(all(e["task_id"] == tid for e in evs if e.get("task_id")),
+              "事件都挂在同一个任务 ID 上", tid)
+        row = [r for r in box.coll("queue.json") if r.get("id") == tid]
+        check(row and row[0].get("task_state") == "DONE",
+              "任务行带八态机的规范状态", row)
+        check(row and row[0].get("last_progress_at"), "任务行带最后有效进展时间", row)
+        # the seven questions, answered from disk
+        rc, out = box.run("timeline", tid)
+        check(rc == 0, "timeline 退出 0", out[-400:])
+        for label in ("何时启动", "当前停在哪一步", "最后成功操作", "最近失败原因",
+                      "资源消耗", "代码留痕", "恢复应从哪继续"):
+            check(label in out, "timeline 回答「%s」" % label, out[-700:])
+        check(tid in out and "auto/" in out, "timeline 点名任务和分支", out[-500:])
+        rc, js = box.run("timeline", tid, "--json")
+        try:
+            tl = json.loads(js)[0]
+        except (ValueError, IndexError):
+            tl = {}
+            check(False, "timeline --json 可解析", js[-400:])
+        check(tl.get("confidence") == "pr_open",
+              "已开 PR 但未合并 → confidence=pr_open，不谎报 merged", tl.get("confidence"))
+        check(tl.get("attempts") == 1 and tl.get("gate_runs") == 1,
+              "派发次数/闸门次数可数", tl)
+        check(tl.get("prs") and not tl.get("merged"), "PR 有、合并记录没有", tl)
+        check("sync" in (tl.get("resume_from") or ""),
+              "恢复建议指向先核实远端，不是直接重跑", tl.get("resume_from"))
+        # §十一「持久化写入失败安全处理」: the log dying must not kill the loop.
+        os.remove(path)
+        os.makedirs(path)
+        rc, out = box.run("recover")
+        check(rc == 0, "events.jsonl 写不进去时 recover 仍然正常退出", out[-400:])
+        notes = " ".join(box.state().get("notes", []))
+        check("events.jsonl write failed" in notes,
+              "写入失败被记成告警而不是静默吞掉", notes[-300:])
+    finally:
+        box.cleanup()
+
+
+def s_redgate_timeline():
+    head("红灯任务：timeline 报 unverified，不会把失败说成完成")
+    box = Box("redevents")
+    try:
+        tid = box.add_task("Broken work", ["src/*"], accept=["must pass"])
+        box.tick(mode="bad")
+        box.wait_jobs()
+        box.tick(mode="bad")
+        evs = [json.loads(l) for l in
+               open(os.path.join(box.alo, "events.jsonl"), encoding="utf-8")
+               .read().strip().splitlines()]
+        kinds = [e.get("kind") for e in evs]
+        check("gate_red" in kinds, "红灯事件被记录", kinds)
+        red = [e for e in evs if e["kind"] == "gate_red"][0]
+        check(red.get("red"), "红灯事件带失败原因", red)
+        check(red.get("tries") == 1, "红灯事件带尝试次数", red.get("tries"))
+        rc, js = box.run("timeline", tid, "--json")
+        tl = json.loads(js)[0] if js.strip().startswith("[") else {}
+        check(tl.get("last_failure"), "timeline 给出最近失败原因", tl.get("last_failure"))
+        check(tl.get("confidence") in ("unverified", "pr_open"),
+              "未过闸门的任务不会被标成 verified", tl.get("confidence"))
+        check("repair" in (tl.get("resume_from") or "")
+              or "verify" in (tl.get("resume_from") or ""),
+              "恢复建议是修复轮/复验，不是重新派发", tl.get("resume_from"))
+    finally:
+        box.cleanup()
+
+
 def s_backup_queue():
     head("backup snapshots state on its own branch, never main")
     box = Box("backup")
@@ -1109,6 +1209,28 @@ def s_unit_rules():
     check(autoloop.status_path("R  old.py -> new.py") == "new.py"
           and autoloop.status_path("?? src/app.py") == "src/app.py",
           "porcelain lines yield the path that matters")
+    # §六: a credential that reaches an event field must not reach the log file.
+    dirty = {"cmd": "gh auth login --with-token", "env": {"K": "ghp_" + "A" * 30},
+             "list": ["xoxb-1234567890abc", "plain"], "n": 7, "ok": True}
+    clean = autoloop.scrub_secrets(dirty)
+    blob = json.dumps(clean)
+    check("ghp_" not in blob and "xoxb-" not in blob,
+          "scrub_secrets removes token shapes from nested structures", blob)
+    check(clean["n"] == 7 and clean["ok"] is True and "plain" in clean["list"],
+          "scrub_secrets keeps the non-secret parts intact", clean)
+    check(dirty["env"]["K"].startswith("ghp_"),
+          "scrub_secrets does not mutate the caller's dict", dirty["env"]["K"][:8])
+    # §三: DONE must not be reachable from a running task without passing VERIFYING,
+    # and UNKNOWN must never be a one-way street into success.
+    check(set(autoloop.TASK_TRANSITIONS) == set(autoloop.TASK_STATES),
+          "every declared state has a transition row", autoloop.TASK_STATES)
+    check("DONE" not in autoloop.TASK_TRANSITIONS["RUNNING"],
+          "RUNNING cannot jump straight to DONE", autoloop.TASK_TRANSITIONS["RUNNING"])
+    check(autoloop.TASK_TRANSITIONS["DONE"] == (),
+          "DONE is terminal", autoloop.TASK_TRANSITIONS["DONE"])
+    check(autoloop.can_transition("VERIFYING", "DONE")
+          and not autoloop.can_transition("QUEUED", "DONE"),
+          "can_transition enforces the table")
 
 
 def s_empty_gate():
@@ -1593,6 +1715,8 @@ SCENARIOS = [
     ("timeout", s_timeout),
     ("failgate", s_fail_gate),
     ("ledger", s_ledger_and_journal),
+    ("events", s_event_timeline),
+    ("redevents", s_redgate_timeline),
     ("backup", s_backup_queue),
     ("manual", s_dispatch_by_hand),
     ("protocol", s_protocol_text),
