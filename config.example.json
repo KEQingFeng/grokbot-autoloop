@@ -12,6 +12,14 @@
 
   "base_branch": "main",
 
+  "merge_method": "merge",
+  "merge_regression_cmd": "",
+  "merge_notes": {
+    "merge_method": "merge | squash | rebase, passed to `gh pr merge` as --merge/--squash/--rebase. `merge` keeps the worker's commits, which is what ties a merged commit back to its task id in the event log.",
+    "merge_regression_cmd": "Command run in the supervisor checkout *after each* merge (§PR-3「每次合并后运行适当回归」). Empty = no regression, and then the honest result is `pending_verification` — merged, reported as 待验证, never rounded up to success (§PR-6). Point it at something fast, e.g. \"bash tests/run.sh\" or \"python3 -m pytest -q\"; the full gate (.autoloop/verify.sh) also works but runs after every single merge.",
+    "safety": "Both of these only matter once caps.merge_enabled is true. The merge line is off by default because PROTOCOL.md §八 says the merge decision is yours: turning it on takes caps.merge_enabled=true *and* --yes-i-will-merge on every invocation. --admin and --force are never passed, a PR that fails the re-read stops the queue behind it, and a red regression is reported (with the base SHA it stopped at) rather than rolled back — the rollback is your decision."
+  },
+
   "caps": {
     "max_parallel": 2,
     "pr_max_per_day": 12,
@@ -27,7 +35,14 @@
     "gh_daily_rate_hits": 3,
     "finish_grace_s": 60,
     "stall_s": 420,
-    "watch_interval_s": 60
+    "watch_interval_s": 60,
+    "review_threshold": 3,
+    "review_batch_max": 5,
+    "review_max_age_h": 2,
+    "merge_threshold": 5,
+    "risk_low_max": 20,
+    "risk_mid_max": 45,
+    "merge_enabled": false
   },
 
   "caps_notes": {
@@ -41,9 +56,18 @@
     "max_business_lines": "Churn ceiling for one task; bigger work must be split, not squeezed through.",
     "night_window": "Wall clock for the conservative档; night only runs policy.auto_apply kinds.",
     "gh_daily_rate_hits": "After this many gh rate-limit hits in a day the reference search disables itself.",
+    "gh_cooldown_min": "Minutes the loop keeps off GitHub after a 429. The reference search is the only optional gh caller, so backing it off costs nothing but a suggestion.",
+    "max_turns_per_day": "Supervisor turns (not worker jobs). At a 10-minute cadence 36 is most of a day with room to spare; hitting it stops the loop rather than thinning the checks.",
     "finish_grace_s": "空转 guard 1: the worker printed AUTOLOOP_DONE (or committed and went quiet) — close its session and run the gate within this many seconds, then deliver. This is the '写完约一分钟内结束会话、接着交付 PR' behaviour.",
     "stall_s": "空转 guard 2: no log bytes and no commits for this long — the worker is waiting on something nobody will answer (a sandbox approval prompt, a sub-agent). Kill its process group, count the try, repair or block. Do not raise this above 600 in a live loop: an hour of silence is 1/30 of the daily turn budget.",
-    "watch_interval_s": "Cadence of `watch` and the tick hint while workers run. 60 keeps detection latency at about a minute."
+    "watch_interval_s": "Cadence of `watch` and the tick hint while workers run. 60 keeps detection latency at about a minute.",
+    "review_threshold": "§PR-1「累计 3 个待审 PR 时启动批量审查」. `review` always reports what it sees and makes no model call; this is the number of pending auto/* PRs that makes a batch *due* rather than optional.",
+    "review_batch_max": "One batch reviews at most this many PRs. 5 because a review nobody can read in one sitting is a review nobody reads. It never pushes an old or blocked-by PR out of the batch — see review_max_age_h.",
+    "review_max_age_h": "The oldest pending PR may not sit unreviewed longer than this: the batch starts early instead of padding to review_threshold (§PR-1).",
+    "merge_threshold": "§PR-5「默认参数：PR 阈值 5」: how many PRs must be *eligible* (verdict auto_merge_ok and risk ≤ risk_low_max) before the merge line acts by itself. Below it `merge` waits and says so in the event log. `--now` overrides the wait, never the per-PR re-read.",
+    "risk_low_max": "Ceiling on the 0-100 script-computed risk_score for 可自动合并. Green everywhere and ≤ this ⇒ verdict auto_merge_ok, which is the only verdict the merge line will act on.",
+    "risk_mid_max": "≤ this ⇒ 需加强审查 (needs_review): reported with its reasons and its blockers, never silently auto-merged. Above it ⇒ hold_high_risk, which waits for a human even when every check is green.",
+    "merge_enabled": "Ships false. PROTOCOL.md §八 says 「不擅自合并 PR」「所有 PR 合并决定交给我」, so turning the merge line on takes this *and* --yes-i-will-merge on every invocation; neither alone merges anything. `merge --dry-run` still works while it is false, because it only reads."
   },
 
   "delivery": {

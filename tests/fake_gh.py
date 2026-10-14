@@ -7,8 +7,10 @@ and reads its own argv, so the engine's `gh ...` shell-outs land here). Everythi
 it "knows" lives in the JSON file named by FAKE_GH_STATE, which lets a test seed a
 merged PR, force a 429, or read back what the supervisor actually opened.
 
-`pr merge` always fails on purpose: the contract says the supervisor never merges,
-and one of the assertions is that it never even tries.
+`pr merge` is refused unless the fixture sets `allow_merge: true` — the same shape
+as the engine's own `caps.merge_enabled`, so a scenario cannot merge by accident.
+`--admin` and `--force` are refused even then, because bypassing branch protection
+is forbidden from both sides of the contract.
 """
 
 import fcntl
@@ -68,6 +70,38 @@ def opt(argv, name, default=None):
     return default
 
 
+def _git_merge(head_ref, base_ref, method, num):
+    """Really merge origin/<head> into the checked-out base and push it.
+
+    Runs in the caller's cwd, which is the repo the engine pointed gh at."""
+    import subprocess
+
+    def git(*args):
+        proc = subprocess.run(["git"] + list(args), stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, universal_newlines=True)
+        return proc.returncode, (proc.stdout or "").strip()
+
+    rc, out = git("fetch", "-q", "origin")
+    if rc != 0:
+        return rc
+    rc, cur = git("rev-parse", "--abbrev-ref", "HEAD")
+    if rc != 0 or cur != base_ref:
+        rc, _ = git("checkout", "-q", base_ref)
+        if rc != 0:
+            return rc
+    flag = "--squash" if method == "squash" else "--no-ff"
+    rc, out = git("merge", flag, "-m", "Merge PR #%s (%s)" % (num, head_ref),
+                  "origin/" + head_ref)
+    if rc != 0:
+        return rc
+    if method == "squash":
+        rc, out = git("commit", "-qm", "Squash PR #%s (%s)" % (num, head_ref))
+        if rc != 0:
+            return rc
+    rc, out = git("push", "-q", "origin", base_ref)
+    return rc
+
+
 def handle(argv):
     data = load()
     if not argv:
@@ -92,8 +126,57 @@ def handle(argv):
             return 0
         if action == "merge":
             save(data)
-            sys.stderr.write("fake-gh: MERGE IS REFUSED — the supervisor must never merge\n")
-            return 1
+            # The refusal is the default and it stays the default: a scenario has to
+            # seed `allow_merge` explicitly, exactly like the engine requires
+            # caps.merge_enabled. `--admin` / `--force` are refused even then, because
+            # bypassing protection is forbidden in both directions.
+            joined = " ".join(rest)
+            if "--admin" in joined or "--force" in joined:
+                sys.stderr.write("fake-gh: REFUSED — --admin/--force bypasses protection\n")
+                return 1
+            if not data.get("allow_merge"):
+                sys.stderr.write("fake-gh: MERGE IS REFUSED — the supervisor must never merge\n")
+                return 1
+            num = None
+            for token in rest[1:]:
+                if str(token).isdigit():
+                    num = int(token)
+                    break
+            row = next((r for r in data["prs"] if r.get("number") == num), None)
+            if row is None:
+                sys.stderr.write("fake-gh: no such PR: %s\n" % num)
+                return 1
+            if str(row.get("mergeable") or "").upper() == "CONFLICTING":
+                sys.stderr.write("fake-gh: merge conflict\n")
+                return 1
+            # Do the merge for real so the engine's post-merge `git rev-parse` sees
+            # the base actually move — a fake that only flips a JSON field would let
+            # a broken SHA check pass.
+            head_ref = row.get("headRefName")
+            base_ref = row.get("baseRefName") or "main"
+            method = "squash" if "--squash" in joined else (
+                "rebase" if "--rebase" in joined else "merge")
+            rc = _git_merge(head_ref, base_ref, method, num)
+            if rc != 0:
+                sys.stderr.write("fake-gh: git merge failed rc=%s\n" % rc)
+                return rc
+            row["state"] = "MERGED"
+            save(data)
+            sys.stdout.write("https://github.com/fake/repo/pull/%s" % num)
+            return 0
+        if action == "view":
+            save(data)
+            num = None
+            for token in rest[1:]:
+                if str(token).isdigit():
+                    num = int(token)
+                    break
+            row = next((r for r in data["prs"] if r.get("number") == num), None)
+            if row is None:
+                sys.stderr.write("fake-gh: no such PR: %s\n" % num)
+                return 1
+            sys.stdout.write(json.dumps(row))
+            return 0
         if action == "create":
             num = int(data.get("next", 1))
             data["next"] = num + 1

@@ -340,6 +340,138 @@ class Box:
         return True
 
 
+# ------------------------------------------------------- shared PR/merge fixtures
+#
+# `review` and `merge` both need the same three things: a real branch on a real
+# remote, a `gh pr list` row describing it, and a record that *this box* verified
+# it. They live here so the shape of a PR row cannot drift between the scenarios,
+# and so neither scenario can pass by seeding a conclusion the engine never wrote.
+
+GREEN_CI = [{"name": "tests", "conclusion": "SUCCESS"}]
+RED_CI = [{"name": "tests", "conclusion": "FAILURE"}]
+
+
+def push_branch(box, branch, files):
+    """Commit `files` onto a new branch off origin/<base> and push it."""
+    base = box.base()
+    box.git("checkout", "-q", "-B", branch, "origin/" + base)
+    for path, body in files.items():
+        full = os.path.join(box.repo, path)
+        parent = os.path.dirname(full)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(full, "w", encoding="utf-8") as fh:
+            fh.write(body)
+    box.git("add", "-A")
+    box.git("commit", "-qm", "work on " + branch)
+    rc, out = box.git("push", "-q", "-u", "origin", branch)
+    check(rc == 0, "pushed %s" % branch, out)
+    box.git("checkout", "-q", base)
+    return rc == 0
+
+
+def pr_row(base, num, branch, created_h_ago, mergeable="MERGEABLE", ci=None,
+           state="OPEN", draft=False, base_ref=None):
+    """One `gh pr list --json …` row, shaped like the real CLI's."""
+    when = time.time() - created_h_ago * 3600
+    row = {"number": num, "headRefName": branch,
+           "baseRefName": base_ref or base, "state": state,
+           "title": "autoloop: " + branch,
+           "url": "https://github.com/fake/repo/pull/%s" % num,
+           "isDraft": draft, "mergeable": mergeable,
+           "mergeStateStatus": "CLEAN" if mergeable == "MERGEABLE" else "DIRTY",
+           "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(when)),
+           "additions": 5, "deletions": 1, "changedFiles": 1, "labels": []}
+    if ci is not None:
+        row["statusCheckRollup"] = ci
+    return row
+
+
+def seed_gate(box, branch, task_id, verdict="green"):
+    """Append a gate event naming the SHA origin really has for `branch`.
+
+    `review` refuses to auto-merge a branch this box never verified. A scenario
+    that wants a mergeable PR therefore has to produce that record the way the
+    engine does — an event pointing at a real commit — not a config flag."""
+    _, sha = box.git("rev-parse", "origin/" + branch)
+    sha = (sha or "").strip()
+    path = os.path.join(box.alo, "events.jsonl")
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "ts": "seed", "epoch": int(time.time()),
+            "event_id": "seed-%s-%s" % (branch, verdict), "phase": "verify",
+            "kind": "gate_green" if verdict == "green" else "gate_red",
+            "task_id": task_id, "branch": branch, "sha": sha,
+            "red": [] if verdict == "green" else ["seeded red for the self-test"],
+        }, ensure_ascii=False) + "\n")
+    return sha
+
+
+def seed_verified_task(box, tid, title, branch, pool="queue.json"):
+    """A pool row shaped like one the engine left behind after a green local gate.
+
+    Deliberately has no `task_state`: the merge is what has to write DONE, so a
+    scenario can tell "the engine recorded it" from "the fixture pre-filled it"."""
+    box.add_task(title, ["src/"], tid=tid, pool=pool)
+    sha = seed_gate(box, branch, tid)
+    rows = box.coll(pool)
+    for row in rows:
+        if row.get("id") == tid:
+            row.update({"branch": branch, "verify": "green", "verified_sha": sha,
+                        "status": "pr_open"})
+    box.write_coll(pool, rows)
+    return sha
+
+
+def events_of(box, kind=None):
+    path = os.path.join(box.alo, "events.jsonl")
+    if not os.path.exists(path):
+        return []
+    out = []
+    for line in read_text(path).strip().splitlines():
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if kind is None or ev.get("kind") == kind:
+            out.append(ev)
+    return out
+
+
+def origin_sha(box, base):
+    """What origin/<base> points at right now — fetched, never cached."""
+    box.git("fetch", "-q", "origin")
+    _, out = box.git("rev-parse", "origin/" + base)
+    return (out or "").strip()
+
+
+def is_ancestor(box, ref, target):
+    box.git("fetch", "-q", "origin")
+    rc, _ = box.git("merge-base", "--is-ancestor", ref, target)
+    return rc == 0
+
+
+def merge_calls(box):
+    """Every `gh pr merge` the engine actually issued, in order."""
+    return [c for c in box.gh()["calls"] if "pr merge" in c]
+
+
+def set_caps(box, **kw):
+    cfg = box.config()
+    cfg.setdefault("caps", {}).update(kw)
+    box.write_config(cfg)
+    return cfg
+
+
+def set_cfg(box, **kw):
+    """Top-level config keys — the merge line's command and method live here, not in
+    caps, because a cap is a budget and these are neither."""
+    cfg = box.config()
+    cfg.update(kw)
+    box.write_config(cfg)
+    return cfg
+
+
 # -------------------------------------------------------------------- scenarios
 
 def s_init_doctor():
@@ -1117,6 +1249,500 @@ def s_redgate_timeline():
         box.cleanup()
 
 
+def s_review_queue():
+    head("PR 批量审查：脚本级分级 + 依赖排序 + 阈值/紧急触发，全程不派发、不调模型")
+    box = Box("review")
+    base = box.base()
+    green_ci = GREEN_CI
+    try:
+        push_branch(box, "auto/one", {"src/one.py": "print('one')\n",
+                                      "tests/test_one.py": "def test_one():\n    assert 1\n"})
+        push_branch(box, "auto/two", {"src/one.py": "print('one and two')\n",
+                                      "src/two.py": "print('two')\n",
+                                      "tests/test_two.py": "def test_two():\n    assert 2\n"})
+        push_branch(box, "auto/mig", {"migrations/0001.sql": "DROP TABLE users;\n"})
+        box.git("fetch", "-q", "origin")
+        # The local gate record for auto/one: green, measured on a known SHA.
+        events = os.path.join(box.alo, "events.jsonl")
+        seed_gate(box, "auto/one", "t01-one")
+        box.gh_state({"prs": [
+            pr_row(base, 1, "auto/one", 0.5, ci=green_ci),
+            pr_row(base, 2, "auto/two", 3.0, ci=green_ci),
+            pr_row(base, 3, "auto/mig", 0.2, ci=green_ci),
+            pr_row(base, 4, "auto/gone", 9.0, state="MERGED"),
+        ], "next": 5, "auth": True, "search": "ok", "calls": []})
+
+        rc, out = box.run("review", "--json")
+        check(rc == 0, "review 退出 0", out[-700:])
+        res = json.loads(out)
+        check(res["pending"] == 3, "只数 OPEN 的 PR（MERGED 不算待审）", res["pending"])
+        check(res["reviewed"] == 3, "单批上限 5 内全部审查", res["reviewed"])
+        check(res["triggered"] is True and res["trigger_reason"],
+              "待审 3 ≥ 阈值 3 → 触发批量审查", res["trigger_reason"])
+        by_num = {r["pr"]: r for r in res["rows"]}
+        check(by_num[1]["verdict"] == "auto_merge_ok",
+              "小改动 + CI 绿 + 本地闸门绿 → 可自动合并", by_num[1])
+        check(by_num[1]["local_gate"] == "green" and by_num[1]["verified_sha"],
+              "审查引用的是本机真实闸门记录与 SHA", by_num[1]["verified_sha"])
+        check(by_num[3]["verdict"] == "hold"
+              and any("protected paths" in b for b in by_num[3]["blockers"]),
+              "碰 migrations/ 的 PR 被拦下，不进入自动序列", by_num[3]["blockers"])
+        check(by_num[2]["verdict"] == "hold"
+              and any("没有这条分支的闸门记录" in b for b in by_num[2]["blockers"]),
+              "本机没验过的分支不能自动合并", by_num[2]["blockers"])
+        check(2 in by_num[1]["blocked_by"] or 1 in by_num[2]["blocked_by"],
+              "改同一文件的两个 PR 被识别为相互依赖",
+              (by_num[1]["blocked_by"], by_num[2]["blocked_by"]))
+        check(res["merge_order"] and 3 not in res["merge_order"],
+              "合并顺序里没有高风险 PR", res["merge_order"])
+        check(os.path.exists(os.path.join(box.alo, "review.json")),
+              "结论落盘到 review.json")
+        evs = [json.loads(l) for l in
+               open(events, encoding="utf-8").read().strip().splitlines()]
+        check(len([e for e in evs if e.get("kind") == "pr_reviewed"]) == 3,
+              "每条 PR 一个独立审查事件", len(evs))
+        check(box.state()["counters"]["jobs_today"] == 0,
+              "review 不派发 worker —— 零模型调用",
+              box.state()["counters"])
+        check("merge 未启用" in box.run("review")[1],
+              "默认 merge_enabled=false，结论只落盘不动主分支")
+
+        # 紧急项提前触发：只有 1 条待审，但它已经等了 3 小时
+        box.gh_state({"prs": [pr_row(base, 9, "auto/one", 3.0, ci=green_ci)],
+                      "next": 10, "auth": True, "search": "ok", "calls": []})
+        rc, out = box.run("review", "--json")
+        res = json.loads(out)
+        check(res["pending"] == 1 and res["triggered"] is True,
+              "不足阈值但等待超时 → 仍然触发", res["trigger_reason"])
+        check(any("3.0h" in w or "3." in w for w in res["trigger_reason"]),
+              "触发原因写明是等待超时", res["trigger_reason"])
+
+        # 不足阈值且不紧急：明确说「不为凑数延迟」，也不假装审查过了
+        box.gh_state({"prs": [pr_row(base, 11, "auto/one", 0.1, ci=green_ci)],
+                      "next": 12, "auth": True, "search": "ok", "calls": []})
+        rc, out = box.run("review")
+        check("未触发" in out and "不为凑数延迟" in out,
+              "未达阈值时如实报告，不制造审查结论", out[-400:])
+
+        # CI 红 / 冲突 / draft 一律 hold
+        box.gh_state({"prs": [
+            pr_row(base, 21, "auto/one", 0.1, ci=RED_CI),
+            pr_row(base, 22, "auto/two", 0.1, mergeable="CONFLICTING", ci=green_ci),
+        ], "next": 23, "auth": True, "search": "ok", "calls": []})
+        rc, out = box.run("review", "--json")
+        res = json.loads(out)
+        by_num = {r["pr"]: r for r in res["rows"]}
+        check(by_num[21]["ci"] == "red" and by_num[21]["verdict"] == "hold",
+              "CI 红 → hold", by_num[21]["blockers"])
+        check(by_num[22]["verdict"] == "hold"
+              and any("conflict" in b for b in by_num[22]["blockers"]),
+              "冲突 → hold", by_num[22]["blockers"])
+        check(res["merge_order"] == [], "两条都被拦下时合并顺序为空", res["merge_order"])
+
+        # gh 不可用：报缺口，不给结论
+        rc, out = box.run("review", env={"FAKE_GH_STATE": "/nonexistent/ghstate.json"})
+        check(rc != 0 and "cannot review" in out,
+              "拿不到 PR 列表时如实报缺口，不假装通过", out[-300:])
+    finally:
+        box.cleanup()
+
+
+def s_merge_refusal_ladder():
+    head("合并的四道闸：配置开关 → dry-run → 命令行确认 → 阈值，每一道都能单独拦住")
+    box = Box("mergegate", caps={"merge_threshold": 2})
+    base = box.base()
+    try:
+        push_branch(box, "auto/alpha", {
+            "src/alpha.py": "ALPHA = 1\n",
+            "tests/test_alpha.py": "def test_alpha():\n    assert ALPHA == 1\n"})
+        push_branch(box, "auto/beta", {
+            "src/beta.py": "BETA = 2\n",
+            "tests/test_beta.py": "def test_beta():\n    assert BETA == 2\n"})
+        box.git("fetch", "-q", "origin")
+        seed_verified_task(box, "t01-alpha", "alpha 的边界情况", "auto/alpha")
+        seed_verified_task(box, "t02-beta", "beta 的边界情况", "auto/beta")
+        # allow_merge is already true here on purpose: the point of this scenario is
+        # that the *engine's* gates hold even when GitHub would happily say yes.
+        box.gh_state({"prs": [pr_row(base, 1, "auto/alpha", 4.0, ci=GREEN_CI),
+                              pr_row(base, 2, "auto/beta", 3.0, ci=GREEN_CI)],
+                      "next": 3, "auth": True, "search": "ok", "calls": [],
+                      "allow_merge": True})
+        sha0 = origin_sha(box, base)
+
+        rc, out = box.run("review", "--json")
+        check(rc == 0, "review 先给出逐条结论", out[-400:])
+        res = json.loads(out) if rc == 0 else {}
+        check(res.get("merge_order") == [1, 2],
+              "两条都够格自动合并，顺序按年龄不按编号", res.get("merge_order"))
+
+        # 闸 1：caps.merge_enabled=false（默认值）——连 --yes-i-will-merge 都拦得住
+        rc, out = box.run("merge", "--now", "--yes-i-will-merge")
+        check(rc == 3 and "merge 未启用" in out,
+              "第一道闸：默认不合并，命令行确认也不能绕过配置", out[-400:])
+        check("PROTOCOL §八" in out, "拒绝理由指向用户自己写下的红线", out[-400:])
+        check(not merge_calls(box), "一次 gh pr merge 都没发出去", merge_calls(box))
+        check(origin_sha(box, base) == sha0, "主分支没动", sha0[:12])
+
+        # dry-run 在关闭状态下允许：它只读，用途就是让人先看清要动哪些 PR
+        rc, out = box.run("merge", "--dry-run", "--now")
+        check(rc == 0 and "dry-run" in out,
+              "第二道闸的例外：--dry-run 只读，关闭状态下也能先看", out[-400:])
+        check("#1" in out and "#2" in out and "--admin" in out,
+              "dry-run 说清楚顺序、方法，以及不会绕过分支保护", out[-600:])
+        check(not merge_calls(box), "dry-run 不发 gh pr merge", merge_calls(box))
+        check(origin_sha(box, base) == sha0, "dry-run 之后主分支仍然没动")
+        mj = json.loads(read_text(os.path.join(box.alo, "merge.json")))
+        check(mj["dry_run"] is True and len(mj["merged"]) == 2 and mj["stopped"] is None,
+              "dry-run 的结果也落盘，并标明自己只是 dry-run", mj)
+
+        # 闸 2：配置开了，但没带 --yes-i-will-merge
+        set_caps(box, merge_enabled=True)
+        rc, out = box.run("merge", "--now")
+        check(rc == 3 and "--yes-i-will-merge" in out,
+              "第三道闸：开了配置也不够，每次执行都要显式确认", out[-400:])
+        check(not merge_calls(box), "缺确认时不发 gh pr merge", merge_calls(box))
+        check(origin_sha(box, base) == sha0, "主分支没动")
+
+        # 闸 3：两道开关都开了，但可合并数未到阈值，且没带 --now
+        set_caps(box, merge_threshold=5)
+        rc, out = box.run("merge", "--yes-i-will-merge")
+        check(rc == 0 and "未到合并线阈值" in out,
+              "第四道闸：阈值不够就等下一轮，不为「手上有东西可合」而动手", out[-400:])
+        check(not merge_calls(box), "阈值不够时不合并", merge_calls(box))
+        check(any(e.get("kind") == "merge_below_threshold" for e in events_of(box)),
+              "「这轮没合」进了事件日志，不是静默跳过", events_of(box)[-2:])
+        check(origin_sha(box, base) == sha0, "主分支没动")
+
+        # 没有逐条审查结论时，两道开关都开也不合并
+        os.remove(os.path.join(box.alo, "review.json"))
+        rc, out = box.run("merge", "--now", "--yes-i-will-merge")
+        check(rc == 1 and "先跑 `review`" in out,
+              "没有审查结论 → 不合并（结论不能被跳过）", out[-400:])
+        check(not merge_calls(box), "没有结论时也不发 gh pr merge", merge_calls(box))
+
+        # --json 的拒绝也是 JSON：读它的定时任务不会把散文当成结果
+        rc, out = box.run("merge", "--now", "--yes-i-will-merge", "--json")
+        try:
+            payload = json.loads(out)
+        except json.JSONDecodeError:
+            payload = {}
+        check(rc == 1 and payload.get("refused") is True
+              and payload.get("reason") == "no_review",
+              "--json 下拒绝也是可解析的 JSON，并写明原因", out[-400:])
+        check(payload.get("merged") == [], "拒绝时 merged 是空的，不含任何 PR", payload)
+    finally:
+        box.cleanup()
+
+
+def s_merge_serial():
+    head("受控串行合并：真推主分支、逐条重验，审查之后变红的那条让整队停在它前面")
+    box = Box("merge", caps={"merge_enabled": True, "merge_threshold": 1})
+    set_cfg(box, merge_regression_cmd="bash tests/run.sh")
+    base = box.base()
+    try:
+        push_branch(box, "auto/alpha", {
+            "src/alpha.py": "def alpha():\n    return 1\n",
+            "tests/test_alpha.py": "def test_alpha():\n    assert alpha() == 1\n"})
+        push_branch(box, "auto/beta", {
+            "src/beta.py": "def beta():\n    return 2\n",
+            "tests/test_beta.py": "def test_beta():\n    assert beta() == 2\n"})
+        push_branch(box, "auto/gamma", {
+            "src/gamma.py": "def gamma():\n    return 3\n",
+            "tests/test_gamma.py": "def test_gamma():\n    assert gamma() == 3\n"})
+        box.git("fetch", "-q", "origin")
+        seed_verified_task(box, "t01-alpha", "alpha 的边界情况", "auto/alpha")
+        seed_verified_task(box, "t02-beta", "beta 的边界情况", "auto/beta")
+        seed_verified_task(box, "t03-gamma", "gamma 的边界情况", "auto/gamma")
+        # 编号与年龄反着排：#3 最旧、#1 最新，用来证明串行顺序是按依赖和风险算的
+        box.gh_state({"prs": [
+            pr_row(base, 1, "auto/alpha", 0.5, ci=GREEN_CI),
+            pr_row(base, 2, "auto/beta", 2.0, ci=GREEN_CI),
+            pr_row(base, 3, "auto/gamma", 4.0, ci=GREEN_CI),
+        ], "next": 4, "auth": True, "search": "ok", "calls": [],
+            "allow_merge": True})
+        sha0 = origin_sha(box, base)
+
+        rc, out = box.run("review", "--json")
+        res = json.loads(out) if rc == 0 else {}
+        check(res.get("merge_order") == [3, 2, 1],
+              "串行顺序 = 最旧先走（#3 → #2 → #1），不按编号", res.get("merge_order"))
+
+        # 审查跑完之后 gamma 的 CI 才出结果：红。合并线必须在动手前重读到这件事。
+        st = box.gh()
+        for row in st["prs"]:
+            if row["number"] == 3:
+                row["statusCheckRollup"] = RED_CI
+        box.gh_state(st)
+
+        rc, out = box.run("merge", "--yes-i-will-merge", "--json")
+        check(rc == 1, "队里有一条不干净 → 退出码非 0，不报成功", out[-800:])
+        try:
+            mj = json.loads(out)
+        except json.JSONDecodeError:
+            mj = {}
+        check([m["pr"] for m in mj.get("merged", [])] == [],
+              "排在最前的 #3 就是变红那条 → 一条都没合，队列停在它前面", mj.get("merged"))
+        check((mj.get("stopped") or {}).get("pr") == 3
+              and (mj.get("stopped") or {}).get("stage") == "pre-merge",
+              "停下的位置写明是 #3 的合并前重验", mj.get("stopped"))
+        check(any("CI red" in b for b in (mj.get("stopped") or {}).get("blockers", [])),
+              "拦下它的理由是 CI 红，不是「感觉不对」",
+              (mj.get("stopped") or {}).get("blockers"))
+        check(mj.get("remaining") == [3, 2, 1],
+              "整队都还在等：后面两条不被跳过、也不被顺手合掉", mj.get("remaining"))
+        check(not merge_calls(box), "一条 gh pr merge 都没发出去", merge_calls(box))
+        check(origin_sha(box, base) == sha0, "主分支没动", sha0[:12])
+        check(not any(e.get("kind") == "pr_merged" for e in events_of(box)),
+              "没有合并就没有 pr_merged 事件", events_of(box, "pr_merged"))
+        check(any(e.get("kind") == "merge_queue_stopped" for e in events_of(box)),
+              "停队这件事进了事件日志", events_of(box, "merge_queue_stopped"))
+
+        # CI 恢复绿：同一份审查结论重跑。先用 --limit 1 只做一条，剩下的必须
+        # 如实报成「还在等」，而不是「没有了」。
+        st = box.gh()
+        for row in st["prs"]:
+            if row["number"] == 3:
+                row["statusCheckRollup"] = GREEN_CI
+        box.gh_state(st)
+        rc, out = box.run("merge", "--limit", "1", "--yes-i-will-merge", "--json")
+        check(rc == 0, "全绿 → 合并成功退出 0", out[-900:])
+        try:
+            mj = json.loads(out)
+        except json.JSONDecodeError:
+            mj = {}
+        check([m["pr"] for m in mj.get("merged", [])] == [3],
+              "--limit 1 就只合一条，而且是队首那条", mj.get("merged"))
+        check(mj.get("remaining") == [2, 1],
+              "剩下两条如实报为「还在等」，没有被 --limit 藏起来", mj.get("remaining"))
+        check(len(merge_calls(box)) == 1, "只发出一次 gh pr merge", merge_calls(box))
+        sha_mid = origin_sha(box, base)
+        check(is_ancestor(box, "origin/auto/gamma", "origin/" + base)
+              and not is_ancestor(box, "origin/auto/beta", "origin/" + base),
+              "只有 gamma 进了主分支，beta/alpha 还在等",
+              box.git("log", "--oneline", "-4", "origin/" + base)[1])
+
+        rc, out = box.run("merge", "--yes-i-will-merge", "--json")
+        check(rc == 0, "第二轮把剩下的两条合完", out[-900:])
+        try:
+            mj = json.loads(out)
+        except json.JSONDecodeError:
+            mj = {}
+        check([m["pr"] for m in mj.get("merged", [])] == [2, 1],
+              "两轮合起来的顺序 == 审查给出的串行顺序 #3 → #2 → #1", mj.get("merged"))
+        check(mj.get("remaining") == [], "合完之后没有剩的", mj.get("remaining"))
+        sha1 = origin_sha(box, base)
+        check(bool(sha1) and sha1 not in (sha0, sha_mid), "origin/%s 又前进了" % base,
+              (sha_mid[:12], sha1[:12]))
+        for branch in ("auto/alpha", "auto/beta", "auto/gamma"):
+            check(is_ancestor(box, "origin/" + branch, "origin/" + base),
+                  "%s 的提交进了主分支历史" % branch,
+                  box.git("log", "--oneline", "-6", "origin/" + base)[1])
+        first = (mj.get("merged") or [{}])[0]
+        check(first.get("base_before") == sha_mid
+              and first.get("base_after") not in (None, "", sha_mid),
+              "每条记录都写了合并前后的 base SHA（可追责到具体提交）", first)
+        check(all(m.get("result") == "merged" for m in mj.get("merged", [])),
+              "配了 merge_regression_cmd 且回归绿 → 才敢写 merged",
+              [m.get("result") for m in mj.get("merged", [])])
+        check(first.get("regression_rc") == 0, "每条合并后真跑了仓库自己的回归命令", first)
+        check(all("--admin" not in c and "--force" not in c for c in merge_calls(box)),
+              "从不绕过分支保护：没有 --admin，没有 --force", merge_calls(box))
+        check(len(merge_calls(box)) == 3, "三次合并 == 三次 gh pr merge，没有多余调用",
+              merge_calls(box))
+        check(all(c.endswith("--merge") for c in merge_calls(box)),
+              "用的是配置里的 merge 方法（保留提交与任务 ID 的关联）", merge_calls(box))
+
+        done = {d.get("branch"): d for d in box.coll("done.json")}
+        check(all(done.get(b, {}).get("merged") is True
+                  for b in ("auto/alpha", "auto/beta", "auto/gamma")),
+              "三条都进 done.json", sorted(done))
+        check(done.get("auto/gamma", {}).get("merge_sha") == sha_mid,
+              "done.json 记的是 gamma 那一轮合并后的 base SHA（不是最后一条的）",
+              done.get("auto/gamma"))
+        check(done.get("auto/alpha", {}).get("merge_sha") == sha1,
+              "最后合的那条记的才是 sha1", done.get("auto/alpha"))
+        check(all(m.get("base_before") and m.get("base_after")
+                  and m["base_before"] != m["base_after"] for m in mj.get("merged", [])),
+              "每条都记了合并前后的 base SHA，且主分支真的动了",
+              [(m.get("base_before"), m.get("base_after")) for m in mj.get("merged", [])])
+        check(mj["merged"][0]["base_before"] == sha_mid
+              and mj["merged"][-1]["base_after"] == sha1,
+              "串行合并首尾相接：#2 从 gamma 之后开始，#1 结束在 sha1",
+              (mj["merged"][0].get("base_before"), mj["merged"][-1].get("base_after")))
+        rc, head_out = box.git("rev-parse", "HEAD")
+        check((head_out or "").strip() == sha1,
+              "本地检出被快进到合并后的 base —— 否则回归命令跑的是旧树，"
+              "却报成新树的结论", (head_out or "").strip()[:12])
+        q = {r.get("id"): r for r in box.coll("queue.json")}
+        check(all(q.get(t, {}).get("status") == "merged"
+                  and q.get(t, {}).get("task_state") == "DONE"
+                  for t in ("t01-alpha", "t02-beta", "t03-gamma")),
+              "任务池里这三条不再被当作可派发的活",
+              {t: (q.get(t, {}).get("status"), q.get(t, {}).get("task_state"))
+               for t in ("t01-alpha", "t02-beta", "t03-gamma")})
+        evs = events_of(box, "pr_merged")
+        check(len(evs) == 3 and all(e.get("phase") == "merge" for e in evs),
+              "每条合并一个独立事件（timeline 可重建）", len(evs))
+        check(all(e.get("sha") for e in evs), "每个合并事件都带 base SHA",
+              [e.get("sha") for e in evs])
+        check(box.state()["counters"]["jobs_today"] == 0,
+              "merge 全程零模型调用", box.state()["counters"])
+        states = sorted((p["number"], p["state"]) for p in box.gh()["prs"])
+        check(states == [(1, "MERGED"), (2, "MERGED"), (3, "MERGED")],
+              "GitHub 侧三条 PR 都是 MERGED", states)
+        check(mj.get("remaining") == [], "合完之后没有剩的", mj.get("remaining"))
+
+        # 拿着同一份结论重跑：重读 gh 发现三条都已 MERGED → 一条都不再合，
+        # 而且这不是错误（下一轮 tick 拿到 rc=1 会以为出了事）。
+        rc, out = box.run("merge", "--yes-i-will-merge", "--json")
+        try:
+            mj2 = json.loads(out)
+        except json.JSONDecodeError:
+            mj2 = {}
+        check(rc == 0 and mj2.get("merged") == [],
+              "重跑不再合并任何 PR：按 PR 当前状态重算，不照旧结论动手", out[-500:])
+        check([s["pr"] for s in mj2.get("skipped", [])] == [3, 2, 1]
+              and all(s.get("result") == "already_merged" for s in mj2.get("skipped", [])),
+              "已合并的三条明确记为 already_merged，不是静默消失", mj2.get("skipped"))
+        check(mj2.get("stopped") is None and mj2.get("remaining") == [],
+              "没活干不报停队，也不虚报剩余", (mj2.get("stopped"), mj2.get("remaining")))
+        check(len(merge_calls(box)) == 3, "重跑没有发出第四次 gh pr merge",
+              merge_calls(box))
+        check(origin_sha(box, base) == sha1, "重跑之后主分支停在同一个 SHA", sha1[:12])
+        check(any(e.get("kind") == "pr_already_merged" for e in events_of(box)),
+              "「跳过已合并」进了事件日志", events_of(box)[-2:])
+        rc, out = box.run("merge", "--yes-i-will-merge")
+        check(rc == 0 and "已经在主分支上" in out,
+              "散文版说清这是重读 gh 确认的结论", out[-400:])
+
+        # 全部合完之后再 review：待审为空，合并线不会凭空造出可合并的 PR
+        rc, out = box.run("review", "--json")
+        res = json.loads(out) if rc == 0 else {}
+        check(res.get("pending") == 0 and res.get("merge_order") == [],
+              "MERGED 的 PR 不再算待审，合并顺序为空", (res.get("pending"),
+                                                        res.get("merge_order")))
+        rc, out = box.run("merge", "--now", "--yes-i-will-merge", "--json")
+        try:
+            mj3 = json.loads(out)
+        except json.JSONDecodeError:
+            mj3 = {}
+        check(rc == 1 and mj3.get("reason") == "no_review" and mj3.get("merged") == [],
+              "没有审查结论就拒绝合并，不靠上一轮的旧结论动手", out[-400:])
+        check(len(merge_calls(box)) == 3, "整个过程只有三次 gh pr merge", merge_calls(box))
+    finally:
+        box.cleanup()
+
+
+def s_merge_regression_red():
+    head("合并后回归红灯：如实说「已经在主分支上、我不自动回滚」，不四舍五入成成功")
+    box = Box("mergered", caps={"merge_enabled": True, "merge_threshold": 1})
+    set_cfg(box, merge_regression_cmd="bash tests/run.sh")
+    base = box.base()
+    try:
+        push_branch(box, "auto/good", {
+            "src/good.py": "def good():\n    return True\n",
+            "tests/test_good.py": "def test_good():\n    assert good()\n"})
+        # 这条分支自己的闸门是绿的（seed 的记录是真的），但合进主分支后仓库的
+        # 测试跑不过 —— 正是「本地绿 ≠ 合并后绿」，回归命令存在的理由。
+        push_branch(box, "auto/bad", {
+            "src/bad.py": "def bad(:\n    return False\n",
+            "tests/test_bad.py": "def test_bad():\n    assert bad()\n"})
+        box.git("fetch", "-q", "origin")
+        seed_verified_task(box, "t01-good", "good 的边界情况", "auto/good")
+        seed_verified_task(box, "t02-bad", "bad 的边界情况", "auto/bad")
+        box.gh_state({"prs": [
+            pr_row(base, 1, "auto/good", 3.0, ci=GREEN_CI),
+            pr_row(base, 2, "auto/bad", 1.0, ci=GREEN_CI),
+        ], "next": 3, "auth": True, "search": "ok", "calls": [],
+            "allow_merge": True})
+        sha0 = origin_sha(box, base)
+
+        rc, out = box.run("review", "--json")
+        res = json.loads(out) if rc == 0 else {}
+        check(res.get("merge_order") == [1, 2],
+              "审查阶段两条都够格 —— 回归红灯只有合完才看得见", res.get("merge_order"))
+
+        # 用人读的那一版跑合并：这次的输出既要如实交代「已经在主分支上」，
+        # 也必须把回滚说成用户的决定。结构化的那一面从 merge.json 读。
+        rc, out = box.run("merge", "--yes-i-will-merge")
+        check(rc == 1, "回归红 → 退出码非 0，不报成功", out[-900:])
+        check("regression_red" in out, "输出里写明这条的结果是回归红灯", out[-900:])
+        check("我不自动做" in out and "已经在主分支上" in out,
+              "散文版明确：回滚是用户的决定，引擎不自动做", out[-900:])
+        check("已回滚" not in out and "已修复" not in out,
+              "不谎称自己回滚了或修好了", out[-900:])
+        check("重跑 `review`" in out, "给出下一步，而不是留一个烂摊子", out[-900:])
+        mj = json.loads(read_text(os.path.join(box.alo, "merge.json")))
+        results = [(m["pr"], m.get("result")) for m in mj.get("merged", [])]
+        check(results == [(1, "merged"), (2, "regression_red")],
+              "#1 回归绿记 merged，#2 回归红记 regression_red —— 不混为一谈", results)
+        check((mj.get("stopped") or {}).get("stage") == "post-merge regression",
+              "停下的位置写明是「合并后回归」", mj.get("stopped"))
+        check((mj.get("stopped") or {}).get("merged_already"),
+              "结构化结果里也交代了 #2 已经在主分支上", mj.get("stopped"))
+        sha1 = origin_sha(box, base)
+        check(sha1 != sha0, "主分支确实前进了（不假装没合）", (sha0[:12], sha1[:12]))
+        check(is_ancestor(box, "origin/auto/bad", "origin/" + base),
+              "那条坏改动真的在主分支上 —— 报告不能把它说成没发生",
+              box.git("log", "--oneline", "-4", "origin/" + base)[1])
+        check(is_ancestor(box, "origin/auto/good", "origin/" + base),
+              "回归绿的那条也在主分支上，没有被一起否定",
+              box.git("log", "--oneline", "-4", "origin/" + base)[1])
+        second = (mj.get("merged") or [{}, {}])[-1]
+        check(second.get("regression_rc") == 1 and second.get("regression_tail"),
+              "回归命令的退出码和输出尾巴都留了证据", second)
+        check(any(e.get("kind") == "regression_red" for e in events_of(box)),
+              "regression_red 进了事件日志", events_of(box, "regression_red"))
+        ev = events_of(box, "regression_red")
+        check(ev and ev[0].get("pr") == 2 and ev[0].get("base_sha") == sha1,
+              "事件里写明了是哪条 PR、停在哪个 SHA", ev[:1])
+        check(len(events_of(box, "pr_merged")) == 2,
+              "两条合并各有一个 pr_merged 事件", events_of(box, "pr_merged"))
+        check(len(merge_calls(box)) == 2, "两次合并 == 两次 gh pr merge，红灯后不再往下试",
+              merge_calls(box))
+        done = {d.get("branch"): d for d in box.coll("done.json")}
+        check(done.get("auto/bad", {}).get("result") == "regression_red",
+              "done.json 里这条记的是 regression_red，不是成功", done.get("auto/bad"))
+        check(done.get("auto/good", {}).get("result") == "merged",
+              "回归绿的那条仍然是 merged", done.get("auto/good"))
+        check(box.state()["counters"]["jobs_today"] == 0,
+              "整条合并线零模型调用", box.state()["counters"])
+
+        # 没配回归命令时：合并照做（这条线是用户显式打开的），但结论只能是「待验证」
+        cfg = box.config()
+        cfg["merge_regression_cmd"] = ""
+        box.write_config(cfg)
+        push_branch(box, "auto/later", {
+            "src/later.py": "def later():\n    return 4\n",
+            "tests/test_later.py": "def test_later():\n    assert later() == 4\n"})
+        box.git("fetch", "-q", "origin")
+        seed_verified_task(box, "t04-later", "later 的边界情况", "auto/later")
+        st = box.gh()
+        st["prs"] = [p for p in st["prs"] if p["state"] == "OPEN"]
+        st["prs"].append(pr_row(base, 4, "auto/later", 0.4, ci=GREEN_CI))
+        st["next"] = 5
+        box.gh_state(st)
+        rc, out = box.run("review", "--json")
+        res = json.loads(out) if rc == 0 else {}
+        check(res.get("merge_order") == [4], "已合并的两条不再进队列，只剩 #4",
+              res.get("merge_order"))
+        rc, out = box.run("merge", "--yes-i-will-merge")
+        check(rc == 0, "没配回归命令也允许合并 —— 这条线是用户显式打开的", out[-700:])
+        check("已合并但回归未跑" in out and "不算成功完成" in out,
+              "但输出必须明说未验证、不算完成", out[-700:])
+        mj2 = json.loads(read_text(os.path.join(box.alo, "merge.json")))
+        check([m.get("result") for m in mj2.get("merged", [])] == ["pending_verification"],
+              "结构化结果标成 pending_verification，不四舍五入成 merged",
+              mj2.get("merged"))
+        check((mj2.get("merged") or [{}])[0].get("note"),
+              "并写明为什么是待验证", (mj2.get("merged") or [{}])[0].get("note"))
+        evs = [e for e in events_of(box, "pr_merged") if e.get("pr") == 4]
+        check(evs and evs[0].get("result") == "pending_verification",
+              "事件里也是待验证，日志和结论一致", evs[:1])
+    finally:
+        box.cleanup()
+
+
 def s_backup_queue():
     head("backup snapshots state on its own branch, never main")
     box = Box("backup")
@@ -1717,6 +2343,10 @@ SCENARIOS = [
     ("ledger", s_ledger_and_journal),
     ("events", s_event_timeline),
     ("redevents", s_redgate_timeline),
+    ("reviewqueue", s_review_queue),
+    ("mergegate", s_merge_refusal_ladder),
+    ("mergeserial", s_merge_serial),
+    ("mergered", s_merge_regression_red),
     ("backup", s_backup_queue),
     ("manual", s_dispatch_by_hand),
     ("protocol", s_protocol_text),

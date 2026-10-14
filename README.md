@@ -25,11 +25,13 @@ says *直接开发 myrepo* gets preflight → init → suggest → watch instead
 - **Is** the supervisor's own rulebook: `PROTOCOL.md` says 监工不写代码, and `round`
   re-injects it with its real sha256 plus a §十 state record rebuilt from git/gh, so a
   bot that lost its context resumes from files rather than from what it remembers saying.
-- **Is not** an autonomous merge bot. No auto-merge, no deploy, no migration, no
-  paid API, no outbound mail. It will refuse, and the refusal is in the log. In the
-  default `delivery.owner=worker` mode the *worker* opens its PR; the engine still never
-  issues `pr merge`/`pr close`/`pr review`, and a PR whose gate is red gets annotated
-  `pr_unverified` and left alone (§六).
+- **Is not** an autonomous merge bot. No deploy, no migration, no paid API, no outbound
+  mail. It will refuse, and the refusal is in the log. In the default
+  `delivery.owner=worker` mode the *worker* opens its PR, and a PR whose gate is red gets
+  annotated `pr_unverified` and left alone (§六). The engine never issues `pr close` or
+  `pr review`; it *can* issue `pr merge`, but only through the merge line below, which
+  ships off and needs a config switch plus a per-invocation confirmation — see
+  [Reviewing the queue, and the merge line](#reviewing-the-queue-and-the-merge-line-review-merge).
 - **Is not** a daemon. Nothing schedules itself: `install-cron.sh` prints the options
   and only writes a crontab with `--write`, and box cron may never fire on a sleeping
   cloud box — the bot's own scheduled task, or `watch` in a session you already have,
@@ -150,6 +152,10 @@ debug-only `AUTOLOOP_NO_LIMIT`).
 | `max_business_lines` | 400 | churn cap: one task may not rewrite half the repo |
 | `night_window` | 22:00-08:00 | night = `auto_apply` kinds only |
 | `gh_cooldown_min` / `gh_daily_rate_hits` | 15 / 3 | a 429 backs the loop off GitHub for the rest of the round; three hits a day disables remote features |
+| `review_threshold` / `review_batch_max` / `review_max_age_h` | 3 / 5 / 2 | 批量审查 (§PR-1): three pending PRs make a batch due, a batch reads at most five, and the oldest pending PR is reviewed after two hours rather than waiting for the batch to fill |
+| `merge_threshold` | 5 | 「PR 阈值 5」(§PR-5): below this many *eligible* PRs the merge line waits for the next round. `--now` skips the wait, never the per-PR checks |
+| `risk_low_max` / `risk_mid_max` | 20 / 45 | the 0-100 grade bands: ≤ 20 and otherwise green ⇒ `auto_merge_ok` (the only verdict merge acts on); ≤ 45 ⇒ 需加强审查; above ⇒ `hold_high_risk`, which waits for a human even when every check is green |
+| `merge_enabled` | **false** | PROTOCOL.md §八 keeps the merge decision with the user. Config switch *and* `--yes-i-will-merge`, both required, every time |
 
 Raise them by editing the file, which is a human act — not by asking the bot, and not
 with `AUTOLOOP_NO_LIMIT` inside a scheduled task.
@@ -165,8 +171,9 @@ real PR on the right branch is adopted into the slot instead of being duplicated
 
 What that does *not* relax: the gate still runs from the control copy, the red lines are
 re-checked on the pushed diff, and a PR whose gate is red is annotated `pr_unverified`
-and reported as 已建但未过监工闸门，勿合并 — the engine never merges, closes, or force-pushes
-over it (§六). Set `delivery.owner=supervisor` for the v1.0.0 behaviour: workers may not
+and reported as 已建但未过监工闸门，勿合并 — the engine never closes or force-pushes over it,
+and a red gate is precisely what stops the merge line's queue behind that PR (§六). Set
+`delivery.owner=supervisor` for the v1.0.0 behaviour: workers may not
 touch the remote at all, and the engine pushes + opens after green. Use it when the
 worker has no `gh` authorisation, or when an unverified diff must not become public.
 
@@ -194,6 +201,54 @@ autoloop.py queue                       # what is waiting
 autoloop.py approve <id> [<id>…] --note "why"
 autoloop.py reject <id> --note "no"
 ```
+
+### Reviewing the queue, and the merge line (`review`, `merge`)
+
+Both stages are **script-only**: no model call, no worker, `counters.jobs_today` does not
+move. A morning's worth of PRs is a queue problem, not a coding problem — and "the bot
+thought it was fine" is not a reason to merge anything.
+
+```bash
+autoloop.py review [--json] [--all] [--force] [--threshold N] [--batch N]
+autoloop.py merge --dry-run                  # what it would do — allowed while merge is off
+autoloop.py merge [--now] [--limit N] [--method merge|squash|rebase] [--json] --yes-i-will-merge
+```
+
+`review` asks gh once for the fields a decision actually needs (CI rollup, mergeability,
+draft state, churn) and grades each PR with a 0-100 `risk_score` computed from the diff:
+churn, how many top-level modules it touches, whether it carries a test at all, how many
+tries it took, whether a path matches the high-risk name list, minus a little for purely
+mechanical kinds. The verdict is `auto_merge_ok` / `needs_review` / `hold_high_risk` /
+`hold`, each with the blockers and notes that produced it, plus the order to merge in —
+oldest first, and a PR sharing a file with an earlier one waits behind it rather than
+racing it. All of it lands in `.autoloop/review.json`.
+
+`merge` is off by default and needs two independent switches to do anything:
+`caps.merge_enabled=true` in config **and** `--yes-i-will-merge` on the invocation
+(PROTOCOL.md §八: 不擅自合并 PR，所有 PR 合并决定交给我). With both thrown it re-reads each PR
+from gh *immediately* before acting — `review` may be ten minutes stale, and a stale
+conclusion is not a reason to touch the base branch — refuses anything that is not
+`auto_merge_ok` and green, merges serially in the reviewed order, fast-forwards its own
+checkout so the regression sees the merged tree, and runs `merge_regression_cmd` after each
+merge. `--admin` and `--force` are never passed: bypassing branch protection is not a
+feature, and the test suite fails a run that emits either.
+
+What it reports, and what it refuses to round up (§PR-6):
+
+| situation | recorded result |
+|---|---|
+| gate green, regression green | `merged` |
+| merged, regression red | `regression_red` — the queue stops *behind* it, the base SHA it stopped at is printed, and the rollback is **yours**. The engine does not revert and does not rewrite shared history |
+| merged, but no `merge_regression_cmd` (or the checkout could not be fast-forwarded) | `pending_verification` — reported as 待验证 with the reason, never as success |
+| PR already MERGED when re-read | `already_merged`, skipped. Not an error, so `--limit` can still make progress on the next tick |
+| anything else failing the re-read (CI red, conflict, draft, closed, base mismatch, forbidden path, secret line) | the queue stops at that PR; the ones behind it are neither skipped nor merged (§PR-4) |
+
+Exit code is 1 when the queue stopped or a regression was red, 0 otherwise, and
+`merge --json` prints parseable JSON on *every* path including refusals — a cron line that
+reads it can never mistake progress prose for a result. Each merge also writes `done.json`
+(with the base SHA before and after), flips the pool row to `status=merged` /
+`task_state=DONE`, and appends a `pr_merged` event, so `timeline` can answer "what landed,
+when, on which commit, and was it verified" without asking a model.
 
 ### Cadence: `watch`, `tick`, and the hourly report
 
@@ -231,7 +286,13 @@ delivers one, with the reason.
 | rule | mechanism | proven by (scenario) |
 |---|---|---|
 | worker cannot fake green | gate runs from the control copy; diff re-checked independently | `green`, `redlines` |
-| no auto-merge / no deploy | engine never merges; `fake_gh.py` refuses `pr merge`; `auto/` never `main` | `green`, `cap`, `backup`, `workerpr` |
+| no auto-merge / no deploy | merging is off by default and needs `caps.merge_enabled` **and** `--yes-i-will-merge`; no deploy, no migration; `--admin`/`--force` are never passed — and `fake_gh.py` refuses them even in a scenario that allows merge, so a bypass cannot be tested into existence; `auto/` never `main` | `green`, `cap`, `backup`, `workerpr`, `mergegate` |
+| a merge decision is made against *now* | `_pr_fresh` re-reads each PR from gh immediately before acting; a disagreement (CI went red, conflict, draft, closed, already merged) stops the queue at that PR and the ones behind it wait | `mergeserial`, `mergegate` |
+| merged ≠ verified | `merge_regression_cmd` runs after each merge, on a checkout fast-forwarded to it; red ⇒ `regression_red`, queue stopped, base SHA printed, **no auto-rollback**; unconfigured ⇒ `pending_verification`, never success | `mergered` |
+| the queue cannot lie about what is left | `remaining` is computed against the whole reviewed order, so `--limit` cannot hide work; an already-MERGED PR is recorded `already_merged` — not a failure, and not a second merge | `mergeserial` |
+| a machine-read result is machine-readable | `merge --json` emits parseable JSON on every path, refusals included (`{"refused": true, "reason": …, "merged": []}`) | `mergegate` |
+| a risk grade is evidence, not a vibe | 0-100 `risk_score` from churn / modules touched / tests present / tries / high-risk paths; ≤ `risk_low_max` with everything else green ⇒ `auto_merge_ok`, the only verdict the merge line will act on | `reviewqueue` |
+| a script-only stage stays script-only | `review` and `merge` make zero model calls — asserted, not promised, via `counters.jobs_today == 0` | `reviewqueue`, `mergeserial`, `mergered` |
 | the supervisor's chat log is not evidence | PR adoption re-reads `gh` by head branch; a self-reported PR that does not exist counts as zero | `workerpr`, `nomarker` |
 | a red PR is annotated, never destroyed | `pr_unverified` + 勿合并 in the patrol; no close, no force-push, the repair round updates the same PR | `badpr` (§六) |
 | tests are not negotiable | M/D/R on an existing test path is red; additions are fine | `redlines`, `unit` |
@@ -309,6 +370,20 @@ agent, `tests/bin/dsh` for the DeepSeekHarness CLI.
   `watch_interval_s: 60` sweep could be a few seconds late and `preflight`'s CLI probe
   dominated the suite's runtime. Nothing broke — the guards fire on 60/420/1800 s windows —
   but a cloud box that is *shared* wants `stall_s` and `job_timeout_s` reviewed, not trusted.
+- The post-merge regression runs in the supervisor's own checkout, fast-forward only. A
+  checkout that is dirty, on another branch, or diverged from `origin/<base>` is not moved —
+  the regression is skipped and the merge is recorded `pending_verification` with the reason.
+  A box where the supervisor checkout is also somebody's working copy therefore verifies
+  nothing; give the merge line its own clone.
+- `review` grades risk from the *shape* of a diff, not by reading it: churn, modules
+  touched, tests present, tries, high-risk path names. Twelve lines in a payment path can
+  score low if the name does not match the list, which is why `auto_merge_ok` also requires
+  a green local gate and green CI — and why enabling the merge line at all stays a human
+  decision rather than a default.
+- Merging serially costs one `gh pr view` per PR right before it is merged (§PR-3), on top
+  of the merge itself. That is deliberate (a stale conclusion must not touch the base
+  branch) but it is rate-limit-relevant on a big queue — which is what `merge_threshold`
+  and `--limit` are for.
 
 ## Not provable from a machine that is not the cloud box
 

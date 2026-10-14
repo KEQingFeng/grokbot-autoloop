@@ -20,7 +20,7 @@ instance resumes from `status` / `tick` with no chat history.
 Stdlib only. Subcommands:
   doctor init tick status plan dispatch reap verify prbody pr suggest report
   approve reject queue budget sync stop go halt resume recover backup ref
-  watch round preflight timeline
+  watch round preflight timeline review merge
 """
 
 import argparse
@@ -37,7 +37,7 @@ import sys
 import time
 from datetime import datetime
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 ALO_DIR = ".autoloop"
 
 DEFAULT_CAPS = {
@@ -59,6 +59,18 @@ DEFAULT_CAPS = {
     "finish_grace_s": 60,           # declared done -> session closed within a minute
     "stall_s": 420,                 # silent log + no commit -> the run is not coming back
     "watch_interval_s": 60,         # `watch` cadence; also the `next` hint for ticks
+    # PR 批量审查 (§PR-1). The instruction states both "累计 3 个待审 PR 时启动批量
+    # 审查" and "默认参数：PR 阈值 5"; they are two different knobs, so both are here
+    # rather than one silently overriding the other. `review_threshold` starts a
+    # batch, `merge_threshold` is how many reviewed PRs the merge line waits for.
+    "review_threshold": 3,
+    "review_batch_max": 5,
+    "review_max_age_h": 2,          # oldest pending PR -> review early, don't pad
+    "merge_threshold": 5,
+    # Risk bands, on the same 0-100 scale risk_score() already returns.
+    "risk_low_max": 20,             # <= this and everything else green -> may auto-merge
+    "risk_mid_max": 45,             # <= this -> extra review, never silent auto-merge
+    "merge_enabled": False,         # PROTOCOL §八 says the merge decision is the user's
 }
 
 # Red lines that are mechanically checkable. Anything here is refused by code,
@@ -405,6 +417,11 @@ class Ctx:
         caps = dict(DEFAULT_CAPS)
         caps.update(cfg.get("caps") or {})
         cfg["caps"] = caps
+        # Merge line (§PR-3). Top-level, not caps: one is a command like verify.*,
+        # the other a git strategy, and a cap is neither. Missing means "no
+        # post-merge regression" / "--merge", which is exactly what `merge` reports.
+        cfg.setdefault("merge_method", "merge")
+        cfg.setdefault("merge_regression_cmd", "")
         for key, val in (("max_parallel", "AUTOLOOP_MAX_PARALLEL"),
                          ("pr_max_per_day", "AUTOLOOP_PR_MAX_PER_DAY"),
                          ("nightly_max_jobs", "AUTOLOOP_NIGHTLY_MAX_JOBS"),
@@ -792,7 +809,11 @@ def has_origin(ctx):
 def repo_flag(ctx):
     """`--repo owner/name` when the recorded slug really is one; otherwise nothing,
     so gh infers it from the origin of the checkout it is run in. Passing a bare
-    directory name as --repo makes gh fail for the wrong reason."""
+    directory name as --repo makes gh fail for the wrong reason.
+
+    The result is either "" or "--repo <slug> " *with a trailing space*, so it belongs
+    where a prefix goes. Glued after a value it silently corrupts that value
+    (`pr view 12--repo o/n`), which is what the merge self-test caught."""
     slug = (ctx.state.get("repo") or "").strip()
     if re.match(r"^[^/\s]+/[^/\s]+$", slug):
         return "--repo %s " % shlex.quote(slug)
@@ -3726,6 +3747,695 @@ def cmd_watch(args):
             left -= 2
 
 
+# ------------------------------------------------------- PR review (script-only)
+
+# What §PR-n means. PROTOCOL.md (the file handed to the supervisor every round) has
+# eight sections, 一…八, and none of them is numbered "PR". The §PR-1…§PR-6 cited below
+# are the six clauses of the later 「PR 批量审查 + 受控合并」 instruction (2026-10-14) that
+# this section and `cmd_merge` implement. They are summarised here — not quoted, except
+# where the original wording is short enough to keep verbatim — so a reader can resolve
+# every citation without the original message:
+#   §PR-1  「累计 3 个待审 PR 时启动批量审查」, a batch caps at 5, and an old PR is
+#          reviewed early rather than waiting for the batch to fill
+#          (caps.review_threshold / review_batch_max / review_max_age_h).
+#   §PR-2  each PR gets its own verdict from evidence, and a missing signal is never
+#          read as a passing one (no CI ⇒ 'none', not 'green'; unparsable ⇒ report).
+#   §PR-3  「按任务依赖和风险决定顺序」, merge serially, re-read each PR immediately
+#          before acting on it, and 「每次合并后运行适当回归」.
+#   §PR-4  one PR that fails the gate stops the queue behind it — no skipping ahead,
+#          no merging on top of a state nobody verified.
+#   §PR-5  「默认参数：PR 阈值 5」 — the merge line waits for this many eligible PRs
+#          (caps.merge_threshold) unless a human passes --now.
+#   §PR-6  never round an unverified result up to success: merged-without-regression is
+#          待验证, regression-red is regression-red, and both are reported as such.
+# PROTOCOL.md §八 (「不擅自合并 PR」「所有 PR 合并决定交给我」) is *not* relaxed by any of
+# this: it is why `merge` needs caps.merge_enabled *and* --yes-i-will-merge, why
+# --admin/--force are never passed, and why a red regression is reported instead of
+# rolled back.
+
+# `pr_list` asks gh for six fields and is on the hot path of every tick. Review
+# needs CI status, mergeability and churn, which are expensive to fetch and useless
+# to a tick — so it gets its own query instead of widening the shared one (§二:
+# 禁止未经确认就修改公共接口).
+PR_REVIEW_FIELDS = ("number,headRefName,baseRefName,state,title,url,isDraft,mergeable,"
+                    "mergeStateStatus,createdAt,updatedAt,additions,deletions,"
+                    "changedFiles,labels,statusCheckRollup")
+
+
+def pr_review_list(ctx):
+    """PRs on auto/* branches, with the fields a review decision actually needs."""
+    cmd = ("pr list %s--state all --limit 100 --json %s"
+           % (repo_flag(ctx), PR_REVIEW_FIELDS))
+    rc, out, err = run(gh_bin() + " " + cmd, cwd=ctx.root, timeout=120, shell=True)
+    if rc != 0:
+        return None, (err or out)
+    try:
+        data = json.loads(out or "[]")
+    except json.JSONDecodeError:
+        return None, "unparsable gh output"
+    return [r for r in data if str(r.get("headRefName", "")).startswith("auto/")], ""
+
+
+def _iso_age_h(val):
+    """Hours since an ISO-8601 timestamp, or None when gh did not give one."""
+    if not val:
+        return None
+    try:
+        when = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        return None
+    return max(0.0, (time.time() - when.timestamp()) / 3600.0)
+
+
+def _ci_verdict(pr):
+    """(state, detail) from statusCheckRollup — green / red / pending / none.
+
+    'none' is not 'green'. A repo with no CI has no external opinion, and §PR-2
+    forbids treating the absence of a signal as a passing one."""
+    rollup = pr.get("statusCheckRollup")
+    if not isinstance(rollup, list) or not rollup:
+        return "none", "no CI contexts reported"
+    cells = [c for c in rollup if isinstance(c, dict)]
+    concl = [str(c.get("conclusion") or c.get("state") or "").upper() for c in cells]
+    names = [str(c.get("name") or c.get("context") or "?") for c in cells]
+    bad = [n for n, c in zip(names, concl) if c in ("FAILURE", "ERROR", "TIMED_OUT",
+                                                    "ACTION_REQUIRED", "CANCELLED")]
+    waiting = [n for n, c in zip(names, concl)
+               if c in ("", "PENDING", "IN_PROGRESS", "QUEUED", "REQUESTED")]
+    if bad:
+        return "red", "failing: %s" % ", ".join(bad[:5])
+    if waiting:
+        return "pending", "still running: %s" % ", ".join(waiting[:5])
+    if concl and all(c in ("SUCCESS", "NEUTRAL", "SKIPPED") for c in concl):
+        return "green", "%s context(s) passed" % len(concl)
+    return "red", "unrecognised conclusions: %s" % ", ".join(sorted(set(concl))[:5])
+
+
+def _branch_diff(ctx, branch):
+    """(rows, churn, added_text) for origin/base...origin/branch — offline, no model."""
+    base = ctx.origin_base
+    ref = "%s...origin/%s" % (base, branch)
+    rc, out, _ = git("diff --name-status %s" % ref, cwd=ctx.root)
+    rows = []
+    if rc == 0:
+        for line in (out or "").splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2:
+                rows.append((parts[0][0], parts[-1]))
+    _, stat, _ = git("diff --shortstat %s" % ref, cwd=ctx.root)
+    churn = 0
+    for word in ("insertion", "deletion"):
+        hit = re.search(r"(\d+) %s" % word, stat or "")
+        if hit:
+            churn += int(hit.group(1))
+    _, added, _ = git("diff -U0 %s" % ref, cwd=ctx.root)
+    text = [l[1:] for l in (added or "").splitlines()
+            if l.startswith("+") and not l.startswith("+++")]
+    return rows, churn, "\n".join(text)
+
+
+def _local_record(ctx, branch):
+    """What this box already knows about a branch: gate verdict, SHA, tries.
+
+    Read from done.json / the pools / events.jsonl — never from chat memory, and
+    never invented for a branch somebody else pushed."""
+    for row in ctx.coll("done.json"):
+        if row.get("branch") == branch:
+            return row
+    for name in ("queue.json", "candidates.json", "blocked.json"):
+        for row in ctx.coll(name):
+            if row.get("branch") == branch:
+                return row
+    evs = [e for e in read_jsonl(os.path.join(ctx.alo, "events.jsonl"))
+           if e.get("branch") == branch]
+    if not evs:
+        return {}
+    rec = {"branch": branch, "task": evs[0].get("task_id"),
+           "tries": max(0, len([e for e in evs if e.get("kind") == "job_dispatched"]) - 1)}
+    green = [e for e in evs if e.get("kind") == "gate_green"]
+    red = [e for e in evs if e.get("kind") == "gate_red"]
+    if green and (not red or green[-1].get("epoch", 0) >= red[-1].get("epoch", 0)):
+        rec["verify"] = "green"
+        rec["verified_sha"] = green[-1].get("sha")
+    elif red:
+        rec["verify"] = "red"
+        rec["red_reasons"] = red[-1].get("red")
+    return rec
+
+
+def review_order(rows):
+    """Serial merge order: dependencies first, then oldest. High-risk and held PRs
+    are never inside the automatic sequence (§PR-3「按任务依赖和风险决定顺序」)."""
+    auto = [r for r in rows if r["verdict"] == "auto_merge_ok"]
+    by_num = {r["pr"]: r for r in rows}
+    ordered, placed = [], set()
+
+    def place(row, depth=0):
+        if row["pr"] in placed or depth > len(rows) + 1:
+            return
+        for dep in row.get("blocked_by") or []:
+            other = by_num.get(dep)
+            if other and other["verdict"] == "auto_merge_ok":
+                place(other, depth + 1)
+        if row["pr"] not in placed:
+            ordered.append(row)
+            placed.add(row["pr"])
+
+    for row in sorted(auto, key=lambda r: (-r["age_h"], r["pr"])):
+        place(row)
+    return [r["pr"] for r in ordered]
+
+
+VERDICT_LABEL = {"auto_merge_ok": "可自动合并", "needs_review": "需加强审查",
+                 "hold": "暂停（未通过必要验证）",
+                 "hold_high_risk": "暂停（高风险，等待授权）"}
+
+
+def cmd_review(args):
+    """待审 PR 队列 + 脚本级风险分级。Zero model calls, by design."""
+    ctx = Ctx(args.repo)
+    ctx.need_init()
+    pol = read_policy(ctx)
+    with Lock(ctx) as lk:
+        if lk is None:
+            die("locked")
+        threshold = (args.threshold if args.threshold is not None
+                     else ctx.cap("review_threshold"))
+        batch_max = args.batch if args.batch is not None else ctx.cap("review_batch_max")
+        max_age_h = ctx.cap("review_max_age_h")
+        prs, err = pr_review_list(ctx)
+        if prs is None:
+            # §PR-2: report the gap instead of guessing. No PR list, no review —
+            # and definitely not "everything looks fine".
+            write_json(os.path.join(ctx.alo, "review.json"),
+                       {"at": stamp(), "error": (err or "")[:400], "rows": []})
+            ctx.event("review", "review_unavailable", error=(err or "")[:400])
+            ctx.save()
+            log("cannot review: `gh pr list` unavailable — %s" % (err or "")[:200])
+            log("先修好它（`gh auth login` / 网络）再 `review`；没有 PR 列表就没有审查结论，"
+                "不会假装通过。")
+            return 1
+        fetch(ctx)
+        pending = [p for p in prs if str(p.get("state") or "").upper() == "OPEN"]
+        pending.sort(key=lambda p: p.get("createdAt") or "")
+        batch = list(pending) if args.all else pending[:batch_max]
+        # An urgent PR is never left behind because the batch is full (§PR-1
+        # 「不足阈值时，不得为了凑数量而延迟紧急修复」).
+        have = {p.get("number") for p in batch}
+        for p in pending:
+            num = p.get("number")
+            if num in have:
+                continue
+            age = _iso_age_h(p.get("createdAt")) or 0.0
+            ci, _ = _ci_verdict(p)
+            if (age > max_age_h or ci == "red"
+                    or "CONFLICT" in str(p.get("mergeable") or "").upper()):
+                batch.append(p)
+        # One pass over the whole pending set, so "who else touches this file" is
+        # answered against reality rather than against whichever five PRs fit.
+        seen_files, diffs = {}, {}
+        for p in pending:
+            rows, churn, added = _branch_diff(ctx, p.get("headRefName"))
+            diffs[p.get("number")] = (rows, churn, added)
+            for _, path in rows:
+                seen_files.setdefault(path, p.get("number"))
+        rows_out = []
+        for p in batch:
+            rows, churn, added = diffs.get(p.get("number")) or _branch_diff(
+                ctx, p.get("headRefName"))
+            rows_out.append(_review_pr(ctx, p, pol, rows, churn, added, seen_files))
+        order = review_order(rows_out)
+        oldest = max((r["age_h"] for r in rows_out), default=0.0)
+        holds = [r for r in rows_out if r["verdict"].startswith("hold")]
+        why_trigger = []
+        if len(pending) >= threshold:
+            why_trigger.append("待审 %d ≥ 阈值 %d" % (len(pending), threshold))
+        if oldest > max_age_h:
+            why_trigger.append("最早等待 %.1fh > %sh" % (oldest, max_age_h))
+        if holds:
+            why_trigger.append("%d 条高风险/未通过验证需单独处理" % len(holds))
+        if args.force:
+            why_trigger.append("--force")
+        trigger = bool(why_trigger)
+        result = {"at": stamp(), "pending": len(pending), "reviewed": len(rows_out),
+                  "threshold": threshold, "batch_max": batch_max,
+                  "triggered": trigger, "trigger_reason": why_trigger,
+                  "merge_order": order, "rows": rows_out,
+                  "merge_enabled": bool(ctx.cap("merge_enabled")),
+                  "merge_threshold": ctx.cap("merge_threshold")}
+        write_json(os.path.join(ctx.alo, "review.json"), result)
+        for row in rows_out:
+            ctx.event("review", "pr_reviewed", task=row.get("task"), pr=row["pr"],
+                      branch=row["branch"], verdict=row["verdict"], risk=row["risk"],
+                      ci=row["ci"], churn=row["churn"], blockers=row["blockers"][:6],
+                      sha=row.get("verified_sha"))
+        ctx.save()
+        if args.json:
+            log(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
+        log("# 待审 PR 队列：%d 条（本次审查 %d 条，单批上限 %s）"
+            % (len(pending), len(rows_out), "全部" if args.all else batch_max))
+        log("- 批量审查%s：%s" % (
+            "已触发" if trigger else "未触发",
+            "；".join(why_trigger) or
+            "待审 %d < %d，最早 %.1fh ≤ %sh —— 不为凑数延迟；冲突/CI 红/超时仍会提前单独处理"
+            % (len(pending), threshold, oldest, max_age_h)))
+        rank = {"hold_high_risk": 0, "hold": 1, "needs_review": 2, "auto_merge_ok": 3}
+        for row in sorted(rows_out, key=lambda r: (rank[r["verdict"]], r["pr"])):
+            log("- PR #%s [%s] risk %s｜CI %s｜churn %s｜%s"
+                % (row["pr"], row["branch"], row["risk"], row["ci"], row["churn"],
+                   VERDICT_LABEL[row["verdict"]]))
+            for b in row["blockers"]:
+                log("    ✗ %s" % b)
+            for n in row["notes"]:
+                log("    · %s" % n)
+            if row["blocked_by"]:
+                log("    ⇠ 与 PR %s 改同一文件，必须排在其后"
+                    % ", ".join("#%s" % b for b in row["blocked_by"]))
+        if order:
+            log("- 串行合并顺序（按依赖与风险，不按编号）：%s"
+                % " → ".join("#%s" % n for n in order))
+        if not ctx.cap("merge_enabled"):
+            log("- merge 未启用（merge_enabled=false）：结论只写进 .autoloop/review.json，"
+                "不会动主分支。PROTOCOL §八「合并决定交给我」仍是默认值。")
+        else:
+            log("- merge 已启用：先 `merge --dry-run` 看它打算做什么，再决定。")
+        return 0
+
+
+def _review_pr(ctx, pr, pol, rows, churn, added, seen_files):
+    """review_one_pr with the diff handed in, so a batch shares one git pass."""
+    rec = _local_record(ctx, pr.get("headRefName"))
+    score, why = risk_score(ctx, rec, rows, churn)
+    paths = [p for _, p in rows]
+    number = pr.get("number")
+    blockers, notes = [], []
+    forbidden = sorted({p for p in paths if is_forbidden(p, pol)})
+    if forbidden:
+        blockers.append("touches protected paths: %s" % ", ".join(forbidden[:5]))
+    secrets = [l for l in added.splitlines() if SECRET_LINE_RE.search(l)]
+    if secrets:
+        blockers.append("diff adds a credential-shaped line (%d)" % len(secrets))
+    if churn > ctx.cap("max_business_lines"):
+        blockers.append("churn %s exceeds max_business_lines %s"
+                        % (churn, ctx.cap("max_business_lines")))
+    mergeable = str(pr.get("mergeable") or "").upper()
+    mstate = str(pr.get("mergeStateStatus") or "").upper()
+    if "CONFLICT" in mergeable or "CONFLICT" in mstate:
+        blockers.append("merge conflict with %s" % ctx.base)
+    elif mergeable in ("", "UNKNOWN"):
+        notes.append("gh 尚未算出可合并性（mergeable=%s）"
+                     % (pr.get("mergeable") or "absent"))
+    ci, ci_detail = _ci_verdict(pr)
+    if ci == "red":
+        blockers.append("CI red — %s" % ci_detail)
+    elif ci == "pending":
+        blockers.append("CI still running — %s" % ci_detail)
+    elif ci == "none":
+        notes.append("这个仓库没有 CI —— 本地闸门是唯一的外部检查")
+    gate = rec.get("verify")
+    if gate == "green":
+        notes.append("本地闸门绿灯，测于 %s" % str(rec.get("verified_sha") or "?")[:12])
+    elif gate == "red":
+        blockers.append("本地闸门红灯：%s"
+                        % "; ".join(str(r)[:80]
+                                    for r in (rec.get("red_reasons") or [])[:2]))
+    else:
+        blockers.append("本机没有这条分支的闸门记录 —— 无法自证，不自动合并")
+    if str(pr.get("baseRefName") or "") and str(pr.get("baseRefName")) != ctx.base:
+        blockers.append("base 是 %s，不是 %s" % (pr.get("baseRefName"), ctx.base))
+    if pr.get("isDraft"):
+        blockers.append("仍是 draft")
+    shared = sorted({p for p in paths if p in seen_files
+                     and seen_files.get(p) not in (None, number)})
+    if blockers:
+        verdict = "hold"
+    elif score > ctx.cap("risk_mid_max"):
+        verdict = "hold_high_risk"
+    elif score > ctx.cap("risk_low_max"):
+        verdict = "needs_review"
+    else:
+        verdict = "auto_merge_ok"
+    return {
+        "pr": number, "branch": pr.get("headRefName"), "title": pr.get("title"),
+        "url": pr.get("url"), "task": rec.get("task"),
+        "age_h": round(_iso_age_h(pr.get("createdAt")) or 0.0, 2),
+        "created_at": pr.get("createdAt"),
+        "churn": churn, "files": len(paths), "paths": paths[:40],
+        "risk": score, "risk_reasons": why,
+        "ci": ci, "ci_detail": ci_detail,
+        "mergeable": pr.get("mergeable"), "merge_state": pr.get("mergeStateStatus"),
+        "local_gate": gate, "verified_sha": rec.get("verified_sha"),
+        "shared_files": shared,
+        "blocked_by": sorted({seen_files[p] for p in shared}),
+        "verdict": verdict, "blockers": blockers, "notes": notes,
+        "labels": [l.get("name") if isinstance(l, dict) else str(l)
+                   for l in (pr.get("labels") or [])],
+        "reviewed_at": stamp(),
+    }
+
+
+def _pr_fresh(ctx, number):
+    """Re-read one PR from gh right before acting on it.
+
+    §PR-3: the merge decision must be made against the state of the PR *now*, not
+    against a review that ran ten minutes ago. This is a paid call, which is exactly
+    why it happens once per merge attempt and never on a timer."""
+    cmd = ("pr view %s %s--json number,headRefName,baseRefName,state,isDraft,mergeable,"
+           "mergeStateStatus,statusCheckRollup,mergeCommit,url"
+           % (number, repo_flag(ctx)))
+    rc, out, err = run(gh_bin() + " " + cmd, cwd=ctx.root, timeout=90, shell=True)
+    if rc != 0:
+        return None, (err or out)
+    try:
+        return json.loads(out or "{}"), ""
+    except json.JSONDecodeError:
+        return None, "unparsable gh output"
+
+
+def _merge_gate(ctx, row, pr, pol):
+    """Final pre-merge check. Returns (ok, blockers) — and 'ok' is never inherited
+    from the earlier review, it is recomputed from what gh and git say right now."""
+    blockers = []
+    if str(pr.get("state") or "").upper() != "OPEN":
+        blockers.append("PR 状态是 %s，不是 OPEN" % pr.get("state"))
+    if pr.get("isDraft"):
+        blockers.append("仍是 draft")
+    mergeable = str(pr.get("mergeable") or "").upper()
+    mstate = str(pr.get("mergeStateStatus") or "").upper()
+    if "CONFLICT" in mergeable or "CONFLICT" in mstate:
+        blockers.append("与 %s 冲突" % ctx.base)
+    ci, detail = _ci_verdict(pr)
+    if ci != "green" and not (ci == "none" and row.get("local_gate") == "green"):
+        blockers.append("CI %s — %s" % (ci, detail))
+    if row.get("verdict") != "auto_merge_ok":
+        blockers.append("审查结论是 %s，不是 auto_merge_ok" % row.get("verdict"))
+    if int(row.get("risk") or 0) > ctx.cap("risk_low_max"):
+        blockers.append("风险 %s 超过自动合并上限 %s"
+                        % (row.get("risk"), ctx.cap("risk_low_max")))
+    base_now = str(pr.get("baseRefName") or "")
+    if base_now and base_now != ctx.base:
+        blockers.append("base 是 %s，不是 %s" % (base_now, ctx.base))
+    rows, churn, added = _branch_diff(ctx, row["branch"])
+    forbidden = sorted({p for _, p in rows if is_forbidden(p, pol)})
+    if forbidden:
+        blockers.append("diff 碰保护路径：%s" % ", ".join(forbidden[:5]))
+    if any(SECRET_LINE_RE.search(l) for l in added.splitlines()):
+        blockers.append("diff 含疑似凭证行")
+    return (not blockers), blockers
+
+
+def _merge_refusal(args, code, reason, lines):
+    """Say no — in prose, or in JSON when the caller asked for JSON.
+
+    A `--json` flag whose output cannot be parsed is worse than no flag: the cron
+    line that reads it would fall back to "command printed something, assume fine".
+    Every early exit of `merge` goes through here, so stdout stays machine-readable
+    on the refusals too, and `refused: true` is never mistaken for a merged PR."""
+    if getattr(args, "json", False):
+        log(json.dumps({"at": stamp(), "refused": True, "reason": reason,
+                        "detail": lines, "merged": [], "stopped": None,
+                        "dry_run": bool(getattr(args, "dry_run", False)),
+                        "exit": code}, ensure_ascii=False, indent=2))
+    else:
+        for line in lines:
+            log(line)
+    return code
+
+
+def cmd_merge(args):
+    """受控串行合并。默认关闭，且关闭时连 --dry-run 之外什么都不做。
+
+    PROTOCOL §八 写着「不擅自合并 PR」「所有 PR 合并决定交给我」，那是用户自己定的红线。
+    2026-10-14 的可靠性指令要求一条自动合并线，两者冲突时的处理方式是：把合并做成
+    显式双开关（配置 merge_enabled + 命令行 --yes-i-will-merge），默认仍然是不合并。
+    打开它的人要同时改配置和加参数，不可能被一次 tick 顺手触发。"""
+    ctx = Ctx(args.repo)
+    ctx.need_init()
+    pol = read_policy(ctx)
+
+    def say(msg):
+        # progress prose and --json are mutually exclusive: one stdout, one format
+        if not args.json:
+            log(msg)
+
+    enabled = bool(ctx.cap("merge_enabled"))
+    if not enabled and not args.dry_run:
+        return _merge_refusal(args, 3, "merge_disabled", [
+            "merge 未启用（caps.merge_enabled=false）。",
+            "PROTOCOL §八：「不擅自合并 PR」「所有 PR 合并决定交给我」——这是默认值，"
+            "我不会替你打开它。",
+            "要启用：把 .autoloop/config.json 的 caps.merge_enabled 改成 true，"
+            "并且每次执行都带 --yes-i-will-merge。先看 `merge --dry-run`。"])
+    with Lock(ctx) as lk:
+        if lk is None:
+            die("locked")
+        review = read_json(os.path.join(ctx.alo, "review.json"), {}) or {}
+        rows = review.get("rows") or []
+        if not rows or review.get("error"):
+            ctx.event("merge", "merge_refused", reason="no_review")
+            ctx.save()
+            return _merge_refusal(args, 1, "no_review", [
+                "没有可用的审查结论（review.json %s）—— 先跑 `review`。"
+                % ("报错: %s" % review["error"][:120] if review.get("error") else "为空"),
+                "不会在没有逐条审查结论的情况下合并任何 PR。"])
+        by_num = {r["pr"]: r for r in rows}
+        order = review.get("merge_order") or []
+        eligible = [by_num[n] for n in order if n in by_num]
+        threshold = ctx.cap("merge_threshold")
+        if len(eligible) < threshold and not args.now:
+            ctx.event("merge", "merge_below_threshold", eligible=len(eligible),
+                      threshold=threshold)
+            ctx.save()
+            say("可自动合并的 PR 只有 %d 条，未到合并线阈值 %d —— 这一轮不合并，"
+                "开发槽继续产出新 PR。" % (len(eligible), threshold))
+            say("要立刻处理：`merge --now`（仍然逐条重验，不会跳过检查）。")
+            if args.json:
+                log(json.dumps({"at": stamp(), "refused": True,
+                                "reason": "below_threshold", "dry_run": False,
+                                "eligible": len(eligible), "threshold": threshold,
+                                "merge_order": order, "merged": [], "stopped": None},
+                               ensure_ascii=False, indent=2))
+            return 0
+        # `remaining` is computed against the whole reviewed order, not the truncated
+        # one: with --limit 1 out of three eligible PRs, "nothing left" would be a
+        # lie, and the next tick would believe it.
+        full_order = list(eligible)
+        if args.limit:
+            eligible = eligible[:args.limit]
+        method = args.method or ctx.cfg.get("merge_method", "merge")
+        if method not in ("merge", "squash", "rebase"):
+            die("merge method must be one of merge/squash/rebase, got %s" % method)
+        if args.dry_run:
+            say("# dry-run：打算按这个顺序逐条合并（不会执行任何写操作）")
+        elif not args.yes:
+            return _merge_refusal(args, 3, "needs_confirmation", [
+                "refused: 合并是不可逆的对外写操作，必须显式加 --yes-i-will-merge。",
+                "先 `merge --dry-run` 看清楚要动哪些 PR。"])
+        reg_cmd = ctx.cfg.get("merge_regression_cmd") or ""
+        merged, skipped, stopped = [], [], None
+        for row in eligible:
+            num = row["pr"]
+            pr, err = _pr_fresh(ctx, num)
+            if pr is None:
+                stopped = {"pr": num, "stage": "re-read", "blockers": [str(err)[:300]]}
+                break
+            if str(pr.get("state") or "").upper() == "MERGED":
+                # Already on the base branch — a previous `merge --limit N`, a human,
+                # or a re-run of this same review. That is not a gate failure: it is
+                # work that finished after the review was written. Stopping the queue
+                # here would make `--limit` unable to ever make progress across ticks,
+                # and calling it a failure would be a lie in the other direction.
+                commit = pr.get("mergeCommit")
+                skipped.append({"pr": num, "branch": row["branch"],
+                                "result": "already_merged",
+                                "merge_commit": (commit or {}).get("oid")
+                                if isinstance(commit, dict) else None})
+                ctx.event("merge", "pr_already_merged", task=row.get("task"), pr=num,
+                          branch=row["branch"])
+                say("- #%s [%s] 已经合并过了 —— 跳过，不重复合并" % (num, row["branch"]))
+                continue
+            ok, blockers = _merge_gate(ctx, row, pr, pol)
+            if not ok:
+                # §PR-4: one bad PR stops the queue behind it. Continuing would mean
+                # merging on top of a state nobody verified.
+                stopped = {"pr": num, "stage": "pre-merge", "blockers": blockers}
+                break
+            sha_before = _origin_base_sha(ctx)
+            if args.dry_run:
+                say("- #%s [%s] risk %s：会执行 `gh pr merge %s --%s`（无 --admin、无 --force、"
+                    "不删分支），然后重验 %s"
+                    % (num, row["branch"], row["risk"], num, method,
+                       reg_cmd or "（未配置回归命令）"))
+                merged.append({"pr": num, "branch": row["branch"], "dry_run": True})
+                continue
+            cmd = "%s pr merge %s %s--%s" % (gh_bin(), num, repo_flag(ctx), method)
+            rc, out, merr = run(cmd, cwd=ctx.root, timeout=180, shell=True)
+            if rc != 0:
+                stopped = {"pr": num, "stage": "gh pr merge",
+                           "blockers": ["rc=%s: %s" % (rc, (merr or out)[:400])]}
+                ctx.event("merge", "merge_failed", task=row.get("task"), pr=num,
+                          branch=row["branch"], rc=rc, error=(merr or out)[:600],
+                          method=method)
+                break
+            fetch(ctx)
+            sha_after = _origin_base_sha(ctx)
+            merge_commit = ((pr.get("mergeCommit") or {}).get("oid")
+                            if isinstance(pr.get("mergeCommit"), dict) else None)
+            rec_out = {"pr": num, "branch": row["branch"], "task": row.get("task"),
+                       "method": method, "base_before": sha_before,
+                       "base_after": sha_after, "merge_commit": merge_commit,
+                       "risk": row.get("risk"), "verified_sha": row.get("verified_sha")}
+            # §PR-3「每次合并后运行适当回归」. The regression has to see the merged
+            # tree, and without a configured command — or without a checkout that is
+            # actually at the merge — the honest result is 待验证, not 成功 (§PR-6).
+            sync_ok, sync_why = (True, "") if not reg_cmd else _sync_local_base(ctx)
+            red = False
+            if reg_cmd and sync_ok:
+                rrc, rout, rerr = run(reg_cmd, cwd=ctx.root, timeout=1800, shell=True)
+                rec_out["regression_rc"] = rrc
+                rec_out["regression_tail"] = ((rout or "") + (rerr or ""))[-800:]
+                red = rrc != 0
+                if red:
+                    rec_out["result"] = "regression_red"
+            else:
+                rec_out["result"] = "pending_verification"
+                rec_out["note"] = ("已合并但回归未跑（%s）—— 标记为待验证，不报成功"
+                                   % (sync_why or "merge_regression_cmd 未配置"))
+            rec_out.setdefault("result", "merged")
+            merged.append(rec_out)
+            # The regression-red PR is recorded exactly like a green one: it *is* on the
+            # base branch now. Leaving it out of done.json and the event log would make
+            # the ledger say "one merge" while GitHub and git both say two.
+            _record_merge(ctx, row, rec_out)
+            ctx.event("merge", "pr_merged", task=row.get("task"), pr=num,
+                      branch=row["branch"], sha=sha_after, merge_commit=merge_commit,
+                      method=method, result=rec_out["result"],
+                      risk=row.get("risk"))
+            say("- #%s 已合并（%s → %s）｜base %s → %s｜%s"
+                % (num, row["branch"], method, (sha_before or "?")[:12],
+                   (sha_after or "?")[:12], rec_out["result"]))
+            if red:
+                stopped = {"pr": num, "stage": "post-merge regression",
+                           "blockers": ["回归命令退出 %s" % rec_out["regression_rc"],
+                                        rec_out["regression_tail"][-300:]],
+                           "merged_already": sha_after}
+                ctx.event("merge", "regression_red", task=row.get("task"), pr=num,
+                          branch=row["branch"], rc=rec_out["regression_rc"],
+                          base_sha=sha_after,
+                          tail=rec_out["regression_tail"][-600:])
+                break
+        # `remaining` is everything the reviewed order still owes, minus what this run
+        # actually dealt with (merged *or* skipped as already merged). Computing it
+        # from the truncated --limit slice, or ignoring the skips, would tell the next
+        # tick "nothing left" while PRs are still open.
+        dealt = {m["pr"] for m in merged} | {s["pr"] for s in skipped}
+        result = {"at": stamp(), "dry_run": bool(args.dry_run), "method": method,
+                  "merged": merged, "skipped": skipped, "stopped": stopped,
+                  "remaining": ([] if args.dry_run else
+                                [r["pr"] for r in full_order if r["pr"] not in dealt])}
+        write_json(os.path.join(ctx.alo, "merge.json"), result)
+        if stopped:
+            ctx.event("merge", "merge_queue_stopped", pr=stopped["pr"],
+                      stage=stopped["stage"], blockers=stopped["blockers"][:6],
+                      merged_so_far=[m["pr"] for m in merged])
+            ctx.note("merge stopped at #%s (%s): %s"
+                     % (stopped["pr"], stopped["stage"],
+                        "; ".join(str(b)[:120] for b in stopped["blockers"][:2])))
+        ctx.save()
+        if args.json:
+            log(json.dumps(result, ensure_ascii=False, indent=2))
+            return 1 if stopped else 0
+        if stopped:
+            log("")
+            log("✗ 停在 PR #%s（%s）—— 后续 %d 条不再合并，现场已存 .autoloop/merge.json"
+                % (stopped["pr"], stopped["stage"], len(result["remaining"])))
+            for b in stopped["blockers"]:
+                log("    ✗ %s" % b)
+            log("  处理方式：定位到具体 PR/提交/测试，修好后重跑 `review` 再 `merge`。"
+                "不回滚别人已合并的东西，不重写共享历史。")
+            if stopped.get("merged_already"):
+                log("  注意：#%s 已经在主分支上（%s）。要不要回滚由你决定，我不自动做，"
+                    "也不重写共享历史。" % (stopped["pr"], stopped["merged_already"][:12]))
+            return 1
+        log("")
+        if not merged and not args.dry_run and skipped:
+            log("✓ 这一轮没有要合并的：%s 已经在主分支上（重读 gh 确认，不是照旧结论猜的）。"
+                % "、".join("#%s" % s["pr"] for s in skipped))
+            return 0
+        log("✓ %s %d 条（顺序：%s）"
+            % ("dry-run 检查通过" if args.dry_run else "已合并",
+               len(merged), " → ".join("#%s" % m["pr"] for m in merged) or "无"))
+        if skipped and merged:
+            log("  另有 %s 已经合并过，本轮跳过。"
+                % "、".join("#%s" % s["pr"] for s in skipped))
+        for m in merged:
+            if m.get("result") == "pending_verification":
+                log("⚠ #%s %s，不算成功完成。" % (m["pr"], m.get("note")))
+        return 0
+
+
+def _origin_base_sha(ctx):
+    _, out, _ = git("rev-parse %s" % ctx.origin_base, cwd=ctx.root)
+    return (out or "").strip() or None
+
+
+def _sync_local_base(ctx):
+    """Bring the supervisor's own checkout of <base> up to the merge just pushed.
+
+    `gh pr merge` happens on the server, so after the fetch the local branch is still
+    the pre-merge commit: running the regression there tests the old tree and then
+    reports a verdict about the new one — the exact kind of quiet lie §PR-6 forbids.
+    Fast-forward only, and only when the checkout is clean and on <base>. A dirty or
+    diverged tree belongs to whoever is using it, and this line never moves it.
+    Returns (ok, reason); the reason goes straight into the report."""
+    rc, dirty, err = git("status --porcelain", cwd=ctx.root)
+    if rc != 0:
+        return False, "读不到工作区状态：%s" % (err or dirty or "?")[:120]
+    # Test runs leave caches behind. Counting those as "someone is working here" would
+    # mean a repo whose own regression writes .pytest_cache/ can never be verified.
+    real = [ln for ln in (dirty or "").splitlines()
+            if ln.strip() and not is_run_noise(status_path(ln))]
+    if real:
+        return False, "本地工作区有未提交改动（%s），不动它" % status_path(real[0])
+    rc, cur, _ = git("rev-parse --abbrev-ref HEAD", cwd=ctx.root)
+    if rc != 0 or (cur or "").strip() != ctx.base:
+        return False, "本地检出的是 %s，不是 %s" % ((cur or "?").strip(), ctx.base)
+    rc, out, err = git("merge --ff-only %s" % ctx.origin_base, cwd=ctx.root)
+    if rc != 0:
+        return False, "本地 %s 快进不到 %s：%s" % (
+            ctx.base, ctx.origin_base, ((err or out) or "?")[:160])
+    return True, ""
+
+
+def _record_merge(ctx, row, out):
+    """§七: a merged PR lands in done.json with its SHA, and the pool row stops
+    being offered as work."""
+    done = ctx.coll("done.json")
+    if not any(d.get("branch") == row["branch"] and d.get("merged") for d in done):
+        done.append({"id": row.get("task"), "branch": row["branch"],
+                     "title": row.get("title"), "state": "MERGED", "pr": row["pr"],
+                     "merged": True, "merge_sha": out.get("base_after"),
+                     "merge_commit": out.get("merge_commit"),
+                     "result": out.get("result"), "at": stamp()})
+        ctx.set_coll("done.json", done)
+    queue, cands = load_tasks(ctx)
+    for pool, name in ((queue, "queue.json"), (cands, "candidates.json")):
+        hit = False
+        for r in pool:
+            if r.get("branch") == row["branch"] or r.get("id") == row.get("task"):
+                r["status"] = "merged"
+                r["task_state"] = "DONE"
+                r["merge_sha"] = out.get("base_after")
+                r["merged_at"] = stamp()
+                r["last_progress_at"] = now()
+                hit = True
+        if hit:
+            ctx.set_coll(name, pool)
+
+
 # ------------------------------------------------------------------- timeline
 
 # §六 asks the log to answer seven questions. Answering them needs a fixed notion
@@ -3987,6 +4697,25 @@ def build_parser():
     add("timeline", cmd_timeline, "rebuild a task's history from events.jsonl — "
                                   "answers §六's seven questions with no model call",
         (("task",), {"nargs": "?"}), (("--json",), {"action": "store_true"}))
+    add("review", cmd_review, "PR 待审队列 + 脚本级风险分级（零模型调用）",
+        (("--threshold",), {"type": int,
+                            "help": "待审达到几条才启动批量审查（默认 caps.review_threshold）"}),
+        (("--batch",), {"type": int,
+                        "help": "单批最多审查几条（默认 caps.review_batch_max）"}),
+        (("--all",), {"action": "store_true", "help": "忽略单批上限，审查全部待审 PR"}),
+        (("--force",), {"action": "store_true", "help": "无视阈值，立刻出审查结论"}),
+        (("--json",), {"action": "store_true"}))
+    add("merge", cmd_merge, "受控串行合并（默认关闭；PROTOCOL §八 的合并权仍在你手上）",
+        (("--dry-run",), {"action": "store_true",
+                          "help": "只打印打算做什么，不执行任何写操作"}),
+        (("--yes-i-will-merge",), {"action": "store_true", "dest": "yes",
+                                   "help": "确认要真的合并（与 caps.merge_enabled 双开关）"}),
+        (("--now",), {"action": "store_true",
+                      "help": "无视 merge_threshold，立刻处理已审查通过的 PR"}),
+        (("--limit",), {"type": int, "help": "本次最多合并几条"}),
+        (("--method",), {"choices": ["merge", "squash", "rebase"],
+                         "help": "默认 merge（保留提交与任务 ID 的关联）"}),
+        (("--json",), {"action": "store_true"}))
     add("sync", cmd_sync, "reconcile PR states (merged/closed → done.json)")
     add("backup", cmd_backup, "snapshot .autoloop/ (branch autoloop/state)",
         (("--push",), {"help": "remote url to push the snapshot branch to"}))

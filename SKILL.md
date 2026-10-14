@@ -2,7 +2,7 @@
 name: grokbot-autoloop
 description: Turn Grok Bot into a 7×24 development supervisor on its own cloud computer — one spoken instruction starts a loop where the bot only plans and judges, headless worker CLIs on that box write the code with their own keys and open their own PR, and everything stops at a branch plus a PR for the human to merge in the morning. Use when the user says 直接开发 xx 项目, 开发 xx 项目, 全天候开发, 自动开发, 开始循环, 挂个循环, 一直开发到早上, 明早看 PR, 监工, or asks to keep developing a repo unattended, or before any multi-hour coding job that would otherwise run inside the bot's own context. Also use to stop, resume, or review such a loop, and use it FIRST for 我要开发个项目 / GitHub 还没连上这类请求 — preflight tells the user exactly what is missing instead of the bot quietly changing their environment.
 metadata:
-  version: "1.1.0"
+  version: "1.2.0"
   supervisor: Grok Bot — plans, monitors, recovers, schedules; never types the diff (§一)
   workers: whatever headless agent CLI lives on that box (dsh / codex / claude / qoder / grok / aider)
   delivery: branch + PR only — the 开发 Agent opens its own PR, the human merges it (§四/§六)
@@ -231,10 +231,29 @@ autoloop.py round                # 轮前注入（协议 + §十 记录），新
 autoloop.py prbody A > /tmp/pr.md   # then fill the three judgement fields by hand
 autoloop.py pr A --body /tmp/pr.md  # supervisor-mode fallback: push + open, never merge
 autoloop.py sync                 # merged/closed upstream → done.json, so slots refill
+autoloop.py review               # per-PR verdicts + merge order (script-only, read-only)
+autoloop.py merge --dry-run      # what the merge line would do; allowed while merge is off
 autoloop.py budget               # counters against every cap
 ```
 
-Merge nothing yourself from within the loop. The user merges in the morning. PRs are
+`review` and `merge` make **no model call** — they are queue arithmetic over what gh and
+git already say. `review` grades each pending PR on a script-computed 0-100 risk score and
+writes a per-PR verdict (`auto_merge_ok` / `needs_review` / `hold_high_risk` / `hold`) with
+its blockers into `.autoloop/review.json`, plus the order to merge in. Run it freely; it
+changes nothing.
+
+Merge nothing yourself from within the loop, and do not run `merge --yes-i-will-merge`
+unless the user turned the merge line on *and* told you to run it in this session.
+`caps.merge_enabled` ships false and PROTOCOL.md §八 says the merge decision is the user's,
+so the two switches (config + that flag) are the user's to throw, not yours to infer. When
+they are thrown, the engine still re-reads every PR from gh immediately before acting, stops
+the queue behind anything that is not green, never passes `--admin`/`--force`, and reports a
+red post-merge regression as `regression_red` with the base SHA — **it does not roll back**,
+because reverting shared history is another one of the user's decisions. Report
+`pending_verification` as 待验证, never as done. With the merge line off — the default — the
+user merges in the morning.
+
+PRs are
 labelled `auto-ready` (risk < 20 and churn < 50) or `auto-needs-review`, and an
 engine-opened body ends with the fixed line `PR created by the AutoLoop supervisor.
 Never merged automatically.` Under `delivery.owner=worker` the body is the agent's own
