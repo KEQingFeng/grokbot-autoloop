@@ -45,14 +45,14 @@ says *直接开发 myrepo* gets preflight → init → suggest → watch instead
 |---|---|---|
 | `PROTOCOL.md` | 278 | the supervision protocol, verbatim: roles, loop cadence, delivery, red lines, the two hourly report templates, the state record |
 | `SKILL.md` | 285 | the supervisor-side policy: trigger keywords, preflight-first onboarding, tick contract, red lines |
-| `scripts/autoloop.py` | 3574 | the engine: 27 subcommands, state machine, gate, red lines, PR, `watch`/`round`/`preflight` |
+| `scripts/autoloop.py` | 5425 | the engine: 32 subcommands, state machine, gate, red lines, PR, `watch`/`round`/`preflight`, `watchdog`/`alerts`/`budget --json` |
 | `bootstrap.sh` | 138 | install the skill the way dsh reads it, probe `env.manifest`, then preflight + init + the next commands |
 | `env.manifest` | 23 | TAB-separated tool list (required / sched / pr / optional / worker) |
 | `install-cron.sh` | 138 | prints the three wake-up drivers, `--write` to install box cron, verifies |
-| `config.example.json` | 100 | every knob, with the reason each cap exists |
-| `tests/selftest.py` | 1637 | 36 scenarios / 430 assertions against throwaway real git repos |
+| `config.example.json` | 136 | every knob, with the reason each cap exists |
+| `tests/selftest.py` | 2740 | 46 scenarios / 684 assertions against throwaway real git repos |
 | `tests/fake_worker.py` | 172 | stand-in worker, 16 modes: `good`/`slow`/`deliver` plus 13 misbehaviours |
-| `tests/fake_gh.py` | 161 | `gh` stand-in; refuses `pr merge`, records every call, file-locked |
+| `tests/fake_gh.py` | 244 | `gh` stand-in; records every call, always refuses `--admin`/`--force`, refuses `pr merge` unless a scenario opts in, file-locked |
 | `tests/bin/dsh` | 90 | `dsh` stand-in, so the DeepSeekHarness adapter (stdin prompt, `--json` events, `--session-id` resume) is really exercised |
 
 ## Install on the cloud box
@@ -156,6 +156,11 @@ debug-only `AUTOLOOP_NO_LIMIT`).
 | `merge_threshold` | 5 | 「PR 阈值 5」(§PR-5): below this many *eligible* PRs the merge line waits for the next round. `--now` skips the wait, never the per-PR checks |
 | `risk_low_max` / `risk_mid_max` | 20 / 45 | the 0-100 grade bands: ≤ 20 and otherwise green ⇒ `auto_merge_ok` (the only verdict merge acts on); ≤ 45 ⇒ 需加强审查; above ⇒ `hold_high_risk`, which waits for a human even when every check is green |
 | `merge_enabled` | **false** | PROTOCOL.md §八 keeps the merge decision with the user. Config switch *and* `--yes-i-will-merge`, both required, every time |
+| `watchdog_stale_s` | 1800 | no `last_tick_at` for this long ⇒ `watchdog` calls the loop **dead** (critical, exit 4), not idle. Keep it ≥ 2× your tick cadence. A deliberately stopped loop is reported as stopped, never as dead |
+| `no_progress_gate` | 3 | consecutive tasks that end blocked having delivered nothing ⇒ **hard stop** (`HALTED`, only `resume` closes it). Counts deliverables, not exited processes |
+| `idle_gate` | 6 | consecutive empty ticks ⇒ **soft stop** (`STOP`, only `go` closes it). Adding a task does *not* resume it — closing a breaker is a human decision |
+| `backoff_at` / `backoff_max_s` | 0.8 / 900 | at this fraction of a daily budget the loop slows down (parallel → 1, interval ×2) instead of running full speed into the ceiling; the backed-off interval never exceeds the ceiling. Backoff never *raises* a cap |
+| `alert_cooldown_min` | 30 | minutes during which a repeat of the same problem folds into the open alert as `count += 1` instead of opening a new one |
 
 Raise them by editing the file, which is a human act — not by asking the bot, and not
 with `AUTOLOOP_NO_LIMIT` inside a scheduled task.
@@ -262,8 +267,9 @@ Three pieces close it. `judge_running_job()` now classifies a *running* job as
 `waiting | done | stalled` from its own log and commits (`finish_grace_s` after an
 `AUTOLOOP_DONE` line or a commit + silence; `stall_s` after silence with no commits).
 `watch` runs that judgement every `watch_interval_s` = 60 s in the foreground of a session
-you already have, so detection latency is about a minute, and it exits 4 after 6 idle
-ticks instead of spinning till dawn. And a tick that dispatched work is not counted as
+you already have, so detection latency is about a minute, and it exits 4 once `idle_ticks`
+reaches `idle_gate` instead of spinning till dawn. And a tick that dispatched work is not
+counted as
 idle — `idle_ticks` only climbs while nothing is in flight, which is what makes the
 "stop ticking, go refill the pool" message arrive at the right time rather than after the
 sixth tick of a productive round.
@@ -280,6 +286,68 @@ counts and states, never what each agent is developing — §七 says the hourly
 not be a feature list, and a patrol that reads like a changelog is the one that gets
 ignored. The §五 floor (≥2 有效 PR per round) is printed as a shortfall when a round
 delivers one, with the reason.
+
+### Who watches the watcher: `watchdog`, breakers, backoff, `alerts`
+
+Three questions that fail separately, so they get three separate mechanisms rather than one
+`tick` that claims to cover all of them.
+
+**Is the loop still alive?** `tick` cannot answer that — a tick that never runs reports
+nothing — and `watch` cannot either, because it dies with the thing it watches. So
+`watchdog` is a command for a *different* scheduler (cron, launchd, your monitor's own
+probe): it reads state, disk and the workers' own log files, exits `0` healthy / `3` warn /
+`4` critical, and writes a heartbeat to `.autoloop/watchdog.json`. It never runs `git`,
+never calls `gh`, and never takes `loop.lock` — the `watchdog` scenario proves all three by
+holding the lock with a real `fcntl.flock`, by byte-comparing `fake_gh.py`'s recorded argv
+and `origin/main`'s SHA across a watchdog run, and by showing `tick` refusing to enter
+while `watchdog` still answers. `--act` is the only verb it has, and it may only stop a
+worker it can prove is silent; by default a stuck worker is *reported* with its slot and pid
+and left alive.
+
+```bash
+autoloop.py watchdog --json          # rc 0 / 3 / 4; safe to run from any monitor
+autoloop.py watchdog --act --json    # additionally: stop a provably silent worker
+autoloop.py alerts --json            # open alerts, folded, acks applied
+autoloop.py alerts --ack <id> --note "为什么可以不管"
+autoloop.py budget --json            # counters vs caps + the backoff plan the next tick uses
+```
+
+**Has it stopped delivering?** Two breakers, at two rungs, each writing a real flag file
+because a breaker that only logs is a suggestion:
+
+| breaker | trips on | writes | closed by |
+|---|---|---|---|
+| `idle` | `idle_gate` consecutive empty ticks | `STOP` | `go` |
+| `no_progress` | `no_progress_gate` consecutive tasks that ended blocked with nothing delivered | `HALTED` | `resume` |
+
+`state.json["breakers"]` records which one, when, and why, so the patrol report can say
+「熔断已断开（no_progress）」 instead of 「人工停止」 — blaming a human who never touched the
+box sends the operator looking for a person instead of a log line. The rungs are sequential,
+not simultaneous: a gate that is red for everything pushes `fails_consecutive` *and*
+`no_progress_streak` up together, so while maintenance mode is already handling that same
+broken gate the streak keeps counting but the hard stop stays shut
+(`no_progress_deferred`). Without that rule, maintenance mode is unreachable in exactly the
+situation it was written for. Neither breaker re-opens itself: adding a task does not resume
+an idle-tripped loop, because closing a breaker is a human decision.
+
+**How hard should it push with what is left?** `backoff_plan()` is a pure function of the
+counters and the caps, and it answers with `{parallel, interval_s, throttled, reasons}`: at
+`backoff_at` of a daily budget the loop drops to one concurrent job and doubles its
+interval, and an idle night stretches its cadence as `base × 2^idle_ticks` up to
+`backoff_max_s`. Maintenance mode or an open breaker takes parallel to `0`. It never raises
+a cap — slowing down buys back the budget that is left; raising the ceiling would just be a
+loophole around §四. `watch` follows the plan when `--interval` was not given, because an
+explicit `--interval` is a human setting a cadence and humans outrank heuristics.
+
+**One problem = one alert.** `alerts.jsonl` is append-only history and `alert_acks.json` is
+separate, so acknowledging a page never edits the record of what happened. Repeats inside
+`alert_cooldown_min` fold on *read* (`count += 1`, `first_seen_epoch` preserved) rather than
+being dropped on write, which is what keeps the file provable: two runs of a stale loop are
+two lines on disk and one open alert. An ack silences the *episode*, so a persistent problem
+cannot re-page every minute, and a recurrence after the cooldown opens a new one. Every
+record goes through `scrub_secrets` before it lands, and the `alerts` scenario asserts a
+token in `state.json["next"]` comes out as `<redacted:credential-pattern>` — an alerting
+channel that copies the secret it is alerting about is a second incident.
 
 ## The safety model, and how each rule is proven
 
@@ -302,7 +370,13 @@ delivers one, with the reason.
 | a finished worker does not squat in a slot | `AUTOLOOP_DONE` (or commits + silence) ⇒ session closed, gate run, delivery inside the same tick | `finish`, `nomarker` |
 | a silent worker is not waited on | `stall_s` ⇒ process group killed, reason recorded, repair round resumes the *same* agent session | `stall`, `dsh` |
 | a hung worker cannot burn the budget | timeout ⇒ kill process group ⇒ force red | `timeout` (also asserts a tick returns in <5 s while the worker sleeps 20 s) |
-| a spinning loop says so out loud | 6 idle ticks ⇒ `空转 6 轮` + `watch` exits 4; a tick with work in flight never counts as idle | `idlespin` |
+| a spinning loop says so out loud | `idle_gate` idle ticks ⇒ writes `STOP` (an open breaker, not a log line) + `watch` exits 4; a tick with work in flight never counts as idle; adding a task does **not** auto-resume | `idlespin` |
+| a loop that delivers nothing stops itself | `no_progress_gate` tasks ending blocked with nothing delivered ⇒ `HALTED` + a critical alert; a real PR resets the streak; `resume` clears file, record and streak | `noprog` |
+| escalation is a ladder, not a race | while maintenance mode is handling the same broken gate the hard stop stays shut and says so (`no_progress_deferred`), so maintenance remains reachable | `failgate`, `noprog` |
+| the watchdog is independent of the thing it watches | no `git`, no `gh`, no `loop.lock`, and `--act` may only stop a provably silent worker — proven by holding a real flock and byte-comparing gh's argv and `origin/main` across a run | `watchdog` |
+| a stopped loop is not a dead loop | `loop_stale` is suppressed when STOP/HALTED or a breaker explains the silence, so your own shutdown does not page you | `watchdog` |
+| one problem is one alert | repeats fold inside `alert_cooldown_min` on read (append-only history intact), an ack silences an episode, a post-cooldown recurrence re-opens, and secrets are scrubbed on the way in | `alerts` |
+| backoff slows down, it never raises a cap | `backoff_plan()` cuts parallel and doubles the interval near a budget, caps idle growth at `backoff_max_s`, and a spent cap still dispatches nothing | `backoff` |
 | nothing is judged on an empty gate | all-`[SKIP]` ⇒ red ⇒ blocked, never a PR | `emptygate` |
 | the night cannot overspend | jobs/turns/PR/disk caps ⇒ stop, report, do not lower quality | `jobcap`, `cap`, `size`, `failgate` |
 | the report is the protocol's, not prose | `report --patrol` fills the two §七 templates from real state and omits per-agent feature detail | `patrol`, `workerpr` |
@@ -317,15 +391,16 @@ Run it yourself (no network, no global state, throwaway repos in `$TMPDIR`):
 
 ```bash
 python3 -m py_compile scripts/autoloop.py
-python3 tests/selftest.py            # 36 scenarios; add --only <name> for one
+python3 tests/selftest.py            # 46 scenarios; add --only <name> for one
 ```
 
-Latest full run on this machine: **430 passed, 0 failed (99.4 s)** — Python 3.14.6,
+Latest full run on this machine: **684 passed, 0 failed (208.1 s)** — Python 3.14.6,
 git 2.50.1, macOS, load average ~4. The same suite took 1063 s at load average 213
 (`python3 -c pass` alone cost 3-9 s there), so the seconds are a property of the box, not
 a regression signal; the pass count is. The engine never touches the network in tests:
 `tests/fake_gh.py`
-stands in for `gh` (and always refuses `pr merge`), `tests/fake_worker.py` for the coding
+stands in for `gh` (it records every argv, refuses `--admin`/`--force` unconditionally, and
+only performs `pr merge` in a scenario that opts in), `tests/fake_worker.py` for the coding
 agent, `tests/bin/dsh` for the DeepSeekHarness CLI.
 
 ## Deviations from the source prompts, on purpose
@@ -334,10 +409,13 @@ agent, `tests/bin/dsh` for the DeepSeekHarness CLI.
   guarantee PyYAML, and stdlib-only was a hard requirement, so state lives in
   `*.json`. Same file names, same meaning.
 - **PR-only delivery, and in the default mode the worker opens it.** Neither prompt has a
-  merge path and this build has none: `fake_gh.py` exists partly to prove `pr merge` is
-  never issued, and `workerpr` asserts the forbidden verb count is zero even when two
-  agents deliver two PRs in one round. §四 puts branching, committing, pushing and the PR
-  on the 开发 Agent; `delivery.owner=supervisor` keeps the older split where no worker may
+  merge path; this build grew one later (the 「PR 批量审查 + 受控合并」 instruction, §PR-1…§PR-6)
+  and it ships **off**. `workerpr` still asserts the forbidden verb count is zero on the
+  default path, where two agents deliver two PRs in one round and nothing merges;
+  `mergegate` and `mergeserial` exercise the opt-in line, and `fake_gh.py` refuses
+  `--admin`/`--force` even there, so a bypass cannot be tested into existence. §四 puts
+  branching, committing, pushing and the PR on the 开发 Agent;
+  `delivery.owner=supervisor` keeps the older split where no worker may
   touch the remote.
 - **Verification numbers, not billing numbers.** Counters are volumes; the money is on
   the worker CLIs' accounts.
@@ -384,6 +462,24 @@ agent, `tests/bin/dsh` for the DeepSeekHarness CLI.
   of the merge itself. That is deliberate (a stale conclusion must not touch the base
   branch) but it is rate-limit-relevant on a big queue — which is what `merge_threshold`
   and `--limit` are for.
+- `watchdog` is only as independent as the scheduler running it. If you schedule it from the
+  same cron line as `tick`, a box whose cron is dead loses both at once and nothing pages
+  you; the honest setup is a second scheduler, or a monitor that probes from outside the box.
+  Its `worker_stuck` finding inherits `stall_s`'s weakness (a legitimately slow step looks
+  like silence), and `--act` kills a process group it believes is silent — so `--act` belongs
+  on a schedule you have looked at, not on a guess.
+- Alerts fold on `dedupe_key`, which is derived from the finding kind (plus slot for
+  per-worker findings). Two *different* problems that produce the same kind therefore share
+  one open alert with a growing `count`; the detail field carries the latest one, and
+  `alerts.jsonl` keeps both lines. A monitoring setup that needs them separate has to read
+  the history file, not the folded view.
+- `alert_cooldown_min` is a wall-clock window measured against the previous record of the
+  same key, so a box whose clock jumps (NTP correction, snapshot restore) can fold or
+  re-open an episode early. Nothing here is safe against a clock that runs backwards; the
+  event log's `epoch` fields are the only way to audit that after the fact.
+- Backoff reacts to *daily* counters, so it resets at the day rollover. A loop that spends
+  its budget in the first two hours runs full speed until it does, then slows — it does not
+  plan the night in advance.
 
 ## Not provable from a machine that is not the cloud box
 

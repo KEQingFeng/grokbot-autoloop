@@ -438,6 +438,29 @@ def events_of(box, kind=None):
     return out
 
 
+def alerts_of(box):
+    """Every line of alerts.jsonl, in write order. Append-only, so this is history."""
+    path = os.path.join(box.alo, "alerts.jsonl")
+    if not os.path.exists(path):
+        return []
+    out = []
+    for line in read_text(path).strip().splitlines():
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def open_alerts(box, *extra):
+    """What `alerts --json` reports as open right now (deduped, acks applied)."""
+    rc, out = box.run("alerts", "--json", *extra)
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return {"rc": rc, "raw": out[-400:], "open": None}
+
+
 def origin_sha(box, base):
     """What origin/<base> points at right now — fetched, never cached."""
     box.git("fetch", "-q", "origin")
@@ -2249,7 +2272,7 @@ def s_preflight_gaps():
 
 
 def s_watch_idle_exit():
-    head("空转修复④：连续 6 轮无事可做就停下汇报，watch 不会空转到天亮")
+    head("空转修复④：连续 6 轮无事可做就自己停下（软停），watch 不会空转到天亮")
     box = Box("idlespin")
     try:
         out = ""
@@ -2260,12 +2283,30 @@ def s_watch_idle_exit():
         check("空转 6 轮" in out, "the tick says more ticking will not help", out)
         check("别再 tick" in str(box.state().get("next")), "next action is not `tick`",
               box.state().get("next"))
+        # #12: 无进展熔断的循环档 —— 到 idle_gate 就不只是「说一句」，而是自己软停
+        stop = os.path.join(box.alo, "STOP")
+        check(os.path.exists(stop),
+              "空转到阈值自己写 STOP：熔断要真的断开，不能只在日志里劝", out[-300:])
+        check("idle" in (box.state().get("breakers") or {}),
+              "state 记着是哪一档熔断、什么时候断的", box.state().get("breakers"))
+        check(any(e.get("kind") == "idle_breaker" for e in events_of(box)),
+              "断开是事件，不只是文件", events_of(box)[-3:])
+        check(any(a.get("kind") == "idle_breaker" for a in alerts_of(box)),
+              "并且发了结构化告警", alerts_of(box))
+        check(read_text(stop).strip() != "", "STOP 里写了是谁写的、为什么", read_text(stop))
         rc, out = box.run("watch", "--interval", "5", env={"AUTOLOOP_WORKER_CMD": ""})
         check(rc == 4, "watch stops instead of burning the nightly budget", out)
-        check("连续空转" in out, "watch says why it stopped", out)
+        check("连续空转" in out or "熔断" in out, "watch says why it stopped", out)
         rc, out = box.run("report", "--patrol")
-        check("连续空转 7 轮" in out or "空转" in out, "the patrol reports the spin", out)
+        check("空转" in out, "the patrol reports the spin", out)
+        check("熔断" in out, "巡检说得出这是熔断停的，不是人工停的", out[:400])
         box.add_task("Something real", ["src/*"])
+        rc, out = box.tick(mode="good")
+        check("started" not in out,
+              "补了任务也不会自动复工 —— 熔断要人来合闸，否则它就不叫熔断", out[-300:])
+        rc, out = box.run("go", "--reason", "self-test")
+        check(not os.path.exists(stop) and box.state().get("breakers") == {},
+              "`go` 清 STOP 也清熔断记录", box.state().get("breakers"))
         rc, out = box.tick(mode="good")
         check("started" in out, "a real task dispatches again", out)
         check(box.state()["counters"]["idle_ticks"] == 0, "a productive tick resets the count",
@@ -2302,6 +2343,310 @@ def s_patrol_templates():
         rc, out = box.run("round")
         check("report --patrol" in out, "round tells the supervisor to use the templates",
               out)
+    finally:
+        box.cleanup()
+
+
+def s_watchdog_standalone():
+    head("#12：独立看门狗 —— 循环自己死了也要有人发现，且它不碰 git/gh、不抢锁")
+    box = Box("watchdog", caps={"watchdog_stale_s": 60, "stall_s": 1,
+                                "finish_grace_s": 1, "job_timeout_s": 600})
+    env = {"FAKE_WORKER_HANG": "120"}
+    try:
+        box.tick(mode="good")                      # a real heartbeat to compare against
+        rc, out = box.run("watchdog", "--json")
+        wj = json.loads(out)
+        check(rc == 0 and wj.get("healthy") is True,
+              "刚 tick 过的箱子：看门狗报健康，退出码 0（cron 拿它当探针）", out[-400:])
+        check(wj.get("critical") == [] and wj.get("warn") == [],
+              "健康就是没有 warn/critical，不是「大部分还行」", wj)
+        hb = json.loads(read_text(os.path.join(box.alo, "watchdog.json")))
+        check(hb.get("runs") == 1 and hb.get("last_run_epoch"),
+              "看门狗留自己的心跳文件 —— 否则没人知道看门狗死了", hb)
+
+        # --- the loop is dead: nobody has ticked for an hour -----------------
+        box.patch_state(last_tick_at=int(time.time()) - 3600)
+        rc, out = box.run("watchdog", "--json")
+        wj = json.loads(out)
+        check(rc == 4, "1 小时没 tick → 退出码 4（critical），监控不必解析文字", out[-300:])
+        check("loop_stale" in [f.get("kind") for f in wj.get("critical", [])],
+              "并且指名是循环心跳停了，不是笼统的「有问题」", wj.get("critical"))
+        check(any(a.get("kind") == "loop_stale" and a.get("severity") == "critical"
+                  for a in alerts_of(box)),
+              "同一条结论落进结构化告警，不只打印在没人看的 stdout", alerts_of(box))
+        rc, out = box.run("watchdog", "--json")
+        check(rc == 4 and json.loads(read_text(os.path.join(box.alo, "watchdog.json")))["runs"] == 3,
+              "重复跑不重复计数，心跳照常累加", out[-200:])
+
+        # --- a deliberately stopped loop is stopped, not dead ----------------
+        box.run("halt", "--reason", "self-test")
+        rc, out = box.run("watchdog", "--json")
+        kinds = [f.get("kind") for f in json.loads(out).get("critical", [])]
+        check("loop_stale" not in kinds,
+              "人工 HALTED 不算循环猝死 —— 否则每次你自己停机都会收到假告警", kinds)
+        box.run("resume")
+
+        # --- it must work while the loop holds the lock ----------------------
+        box.patch_state(last_tick_at=int(time.time()))
+        import fcntl
+        lk = open(os.path.join(box.alo, "loop.lock.l"), "a+")
+        fcntl.flock(lk.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            turns_before = box.state()["counters"]["turns_today"]
+            rc_tick, out_tick = box.run("tick", "--quiet")
+            # rc is 0 on purpose (see the `lock` scenario: a cron overlap is not an
+            # error), so the precondition has to be proved by "it did nothing".
+            check("loop.lock" in out_tick and rc_tick == 0
+                  and box.state()["counters"]["turns_today"] == turns_before,
+                  "前提成立：锁被占住时 tick 真的进不来", out_tick[-200:])
+            rc, out = box.run("watchdog", "--json")
+            check(rc != 2 and isinstance(json.loads(out), dict),
+                  "看门狗不抢锁：循环卡死在锁里时它照样能报", out[-300:])
+        finally:
+            fcntl.flock(lk.fileno(), fcntl.LOCK_UN)
+            lk.close()
+
+        # --- a stuck worker: reported by default, stopped only with --act ----
+        box.add_task("Spin in place", ["src/*"])
+        rc, out = box.tick(mode="silent", env=env, wait=False)
+        jid = box.state()["slots"]["A"]["job"]
+        pid = int(json.loads(read_text(os.path.join(box.alo, "jobs", jid + ".json")))["pid"])
+        time.sleep(2.5)
+        gh_calls = list(box.gh()["calls"])
+        base_before = origin_sha(box, "main")
+        rc, out = box.run("watchdog", "--json")
+        wj = json.loads(out)
+        stuck = [f for f in wj.get("critical", []) if f.get("kind") == "worker_stuck"]
+        check(bool(stuck), "静默卡死的 worker 被看见（哪怕这一轮根本没有 tick）",
+              wj.get("critical"))
+        check(stuck and stuck[0].get("slot") == "A" and stuck[0].get("pid") == pid,
+              "告警里带着是哪个 slot、哪个 pid —— 不然人还得自己去翻 state", stuck)
+        check(box.pid_alive(pid), "默认只报告，不动别人的进程", pid)
+        rc, out = box.run("watchdog", "--act", "--json")
+        check(not box.pid_alive(pid), "--act 才真的停掉卡死的进程组", pid)
+        check(any(e.get("kind") == "watchdog_stopped_job" for e in events_of(box)),
+              "动手就留事件，不静默改状态", events_of(box)[-3:])
+        check(box.gh()["calls"] == gh_calls,
+              "看门狗一次 gh 都没调：不烧配额，也不替我做任何仓库决定",
+              box.gh()["calls"][len(gh_calls):])
+        check(origin_sha(box, "main") == base_before and box.gh()["prs"] == [],
+              "git/GitHub 侧一个字都没动", (origin_sha(box, "main"), base_before))
+    finally:
+        box.cleanup()
+
+
+def s_no_progress_breaker():
+    head("#12：无进展熔断 —— 连续几个 job 什么都没交付就硬停，不靠人盯日志")
+    box = Box("noprog", owner="worker",
+              caps={"no_progress_gate": 2, "max_repair_rounds": 0})
+    try:
+        box.add_task("Always red", ["src/*"], accept=["test -f src/never_here.py"])
+        box.tick(mode="good")
+        box.tick(mode="good")
+        st = box.state()
+        check(len(box.coll("blocked.json")) == 1, "前提成立：第一个任务被判红并阻塞",
+              box.coll("blocked.json"))
+        check(st["counters"].get("no_progress_streak") == 1,
+              "一个什么都没交付的 job = 一次无进展（数的是交付物，不是进程死没死）",
+              st["counters"])
+        check(not os.path.exists(os.path.join(box.alo, "HALTED")),
+              "gate=2，一次还不熔断", st["counters"])
+
+        box.add_task("Delivers for real", ["src/*"])
+        box.tick(mode="good")
+        box.tick(mode="good")
+        st = box.state()
+        check(st["counters"].get("prs_valid_today") == 1,
+              "前提成立：这一轮真的交付了一个 PR", st["counters"])
+        check(st["counters"].get("no_progress_streak") == 0,
+              "有交付就把连续无进展清零 —— 熔断数的是「连续」", st["counters"])
+
+        for i in range(2):
+            box.add_task("Also always red %d" % i, ["src/*"],
+                         accept=["test -f src/still_never_%d.py" % i])
+            box.tick(mode="good")
+            box.tick(mode="good")
+        st = box.state()
+        halted = os.path.join(box.alo, "HALTED")
+        check(os.path.exists(halted),
+              "连续 2 个 job 零交付 → 熔断写硬停文件：只有 `resume` 能清", st["counters"])
+        check("no_progress" in (st.get("breakers") or {}),
+              "state 里记着是哪一档熔断打开的、什么时候开的", st.get("breakers"))
+        trip = [e for e in events_of(box) if e.get("kind") == "no_progress_breaker"]
+        check(len(trip) == 1, "熔断只发一次事件，不是每轮重复喊", len(trip))
+        check(trip and trip[0].get("streak") == 2 and trip[0].get("gate") == 2,
+              "事件带着连续次数与阈值", trip)
+        check(any(a.get("kind") == "no_progress_breaker" and a.get("severity") == "critical"
+                  for a in alerts_of(box)),
+              "并且发结构化 critical 告警", alerts_of(box))
+        rc, out = box.tick(mode="good")
+        check(rc == 0 and "no business work" in out, "熔断后 tick 不派活", out[-300:])
+        rc, out = box.run("report", "--patrol")
+        check("熔断" in out, "§七 巡检模板说得出是熔断停的，不是笼统「已暂停」", out[:400])
+        check(read_text(halted).strip() != "", "HALTED 文件里写了原因和时间", read_text(halted))
+
+        box.run("resume")
+        st = box.state()
+        check(not os.path.exists(halted) and st.get("breakers") == {}
+              and st["counters"].get("no_progress_streak") == 0,
+              "`resume` 同时清文件、清熔断记录、清零连续数", st.get("breakers"))
+        box.add_task("Works after resume", ["src/*"])
+        rc, out = box.tick(mode="good")
+        check("started" in out, "人决定继续之后，循环真的能继续", out[-300:])
+    finally:
+        box.cleanup()
+
+    # 阶梯：维护模式先接住，硬停不能在同一条证据上抢跑
+    box = Box("noprog2", owner="worker",
+              caps={"no_progress_gate": 1, "fail_gate": 1, "max_repair_rounds": 0})
+    try:
+        box.add_task("Red from the start", ["src/*"], accept=["test -f src/nope.py"])
+        box.tick(mode="good")
+        box.tick(mode="good")
+        st = box.state()
+        check(st.get("maintenance") is True, "前提成立：fail_gate 先进了维护模式", st["counters"])
+        check(int(st["counters"].get("no_progress_streak") or 0) >= 1,
+              "前提成立：零交付也照实计数", st["counters"])
+        check(not os.path.exists(os.path.join(box.alo, "HALTED")),
+              "维护模式已经在处理同一个坏闸门，硬停不能同一轮抢跑 —— "
+              "否则维护模式在它唯一被设计出来的场景里永远到不了",
+              st.get("breakers"))
+        check(st.get("no_progress_deferred") is True,
+              "推迟要写在 state 里，不是默默不计", st.get("no_progress_deferred"))
+        rc, out = box.run("watchdog", "--json")
+        wj = json.loads(out)
+        check(any(f.get("kind") == "no_progress_streak" and "推迟" in str(f.get("detail", ""))
+                  for f in wj.get("info", [])),
+              "看门狗说得出「已过阈值但被推迟」，而不是「还没到阈值」", wj.get("info"))
+        box.run("go", "--reason", "self-test ladder")
+        st = box.state()
+        check(st.get("no_progress_deferred") is False
+              and st["counters"].get("no_progress_streak") == 0,
+              "`go` 把推迟标记和连续数一起清掉，下一档从零开始数", st["counters"])
+    finally:
+        box.cleanup()
+
+
+def s_budget_backoff():
+    head("#12：预算退避 —— 额度快用完先降速，而不是一头撞到硬上限才停")
+    box = Box("backoff", caps={"nightly_max_jobs": 10, "watch_interval_s": 60,
+                               "backoff_at": 0.8, "backoff_max_s": 900,
+                               "max_turns_per_day": 36})
+    try:
+        rc, out = box.run("budget", "--json")
+        bj = json.loads(out)
+        bo = bj.get("backoff") or {}
+        check(rc == 0 and bo.get("throttled") is False and bo.get("parallel") == 2
+              and bo.get("interval_s") == 60,
+              "额度充足时按配置的并发和节奏跑，退避不无谓降速", bo)
+        rc, out = box.run("budget")
+        check("退避" in out, "文字版也说了当前节奏，不只是 JSON 里有", out[-300:])
+
+        st = box.state()
+        st["counters"]["jobs_today"] = 8            # 8/10 = 80% = backoff_at
+        box.write_state(st)
+        rc, out = box.run("budget", "--json")
+        bo = json.loads(out).get("backoff") or {}
+        check(bo.get("throttled") is True and bo.get("parallel") == 1,
+              "到 80% 先降到单并发：把剩余额度留给收尾，而不是并行撞墙", bo)
+        check(bo.get("interval_s") == 120, "节奏同时放慢一倍", bo)
+        check(any("jobs" in str(r) for r in bo.get("reasons") or []),
+              "退避说得出是哪项额度触发的", bo.get("reasons"))
+
+        box.add_task("Backoff one", ["src/one.py"])
+        box.add_task("Backoff two", ["src/two.py"])
+        rc, out = box.tick(mode="good", wait=False)
+        slots = box.state()["slots"]
+        check(bool(slots.get("A")) and not slots.get("B"),
+              "退避是真的生效在派发上：这一轮只占一个 slot",
+              {k: bool(v) for k, v in slots.items()})
+        box.kill_jobs()
+
+        # idle backoff is exponential, and it has a ceiling
+        box2 = Box("backoffidle", caps={"watch_interval_s": 60, "backoff_max_s": 900})
+        try:
+            seen = []
+            for _ in range(5):
+                box2.tick(mode="good", env={"AUTOLOOP_WORKER_CMD": ""})
+                rc, out = box2.run("budget", "--json")
+                seen.append(json.loads(out)["backoff"]["interval_s"])
+            check(seen == [120, 240, 480, 900, 900],
+                  "空转越多退得越远，但封顶在 backoff_max_s（%s）：%s"
+                  % (900, seen), seen)
+            check(all(v <= 900 for v in seen), "任何情况下都不超过上限", seen)
+        finally:
+            box2.cleanup()
+
+        # backoff slows down; it never raises a cap
+        st = box.state()
+        st["counters"]["jobs_today"] = 10
+        st["slots"] = {"A": None, "B": None}
+        box.write_state(st)
+        rc, out = box.tick(mode="good")
+        check("cap" in out and box.state()["slots"].get("A") is None,
+              "退避不等于放宽：到了硬上限照样一条都不派", out[-300:])
+    finally:
+        box.cleanup()
+
+
+def s_structured_alerts():
+    head("#12：结构化告警 —— 机器可读、冷却窗口内去重、可确认，且确认不改历史")
+    box = Box("alerts", caps={"watchdog_stale_s": 60, "alert_cooldown_min": 30})
+    try:
+        rc, out = box.run("alerts", "--json")
+        aj = json.loads(out)
+        check(rc == 0 and aj.get("open") == [], "干净的箱子没有告警，退出码 0", out[-200:])
+
+        box.patch_state(last_tick_at=int(time.time()) - 3600,
+                        next="resume with ghp_%s" % ("A" * 40))
+        box.run("watchdog")
+        box.run("watchdog")
+        raw = read_text(os.path.join(box.alo, "alerts.jsonl"))
+        aj = open_alerts(box)
+        check(len(aj["open"]) == 1,
+              "同一个问题在冷却窗口内只算一条开放告警（每 60s 重复一遍的告警没人看）",
+              aj["open"])
+        a = aj["open"][0]
+        check(a.get("count") == 2 and a.get("kind") == "loop_stale"
+              and a.get("severity") == "critical",
+              "去重不是丢弃：次数记在 count 上", a)
+        for field in ("ts", "alert_id", "title", "detail", "action",
+                      "dedupe_key", "first_seen_epoch", "epoch"):
+            check(bool(a.get(field) is not None), "告警字段 %s 在（人能读、脚本能判）" % field, a)
+        check("ghp_" not in json.dumps(a, ensure_ascii=False)
+              and "<redacted:credential-pattern>" in json.dumps(a, ensure_ascii=False),
+              "告警内容过脱敏：这文件正是会被贴进 bug 报告的那一个", a)
+        check(len(alerts_of(box)) == 2, "落盘仍是追加式两行，读的时候才折叠", alerts_of(box))
+
+        rc, out = box.run("alerts", "--severity", "warn", "--json")
+        check(json.loads(out).get("open") == [], "--severity 能筛（只要 critical 的监控用得上）",
+              out[-200:])
+        rc, out = box.run("alerts")
+        check("loop_stale" in out and "critical" in out,
+              "默认输出是给人看的文字，含 kind 与级别", out[-400:])
+
+        rc, out = box.run("alerts", "--ack", a["alert_id"], "--note", "已在处理")
+        check(rc == 0, "确认一条告警", out[-200:])
+        check(open_alerts(box)["open"] == [], "确认之后它不再算开放", open_alerts(box))
+        acks = json.loads(read_text(os.path.join(box.alo, "alert_acks.json")))
+        check(acks.get(a["alert_id"], {}).get("note") == "已在处理",
+              "确认记着谁在什么时候说了什么", acks)
+        check(read_text(os.path.join(box.alo, "alerts.jsonl")) == raw,
+              "确认只写 alert_acks.json，一个字节都没改告警历史", raw[-200:])
+        box.run("watchdog")
+        check(open_alerts(box)["open"] == [],
+              "问题还在、又报了一次：同一段告警不会因为重复触发就重新吵人",
+              open_alerts(box))
+
+        set_caps(box, alert_cooldown_min=0)
+        box.run("watchdog")
+        aj = open_alerts(box)
+        check(len(aj["open"]) == 1 and aj["open"][0]["count"] == 1,
+              "冷却窗口过了就是新的一段：确认过的事再犯，会重新开放", aj["open"])
+        rc, out = box.run("alerts", "--ack-all", "--note", "全部知道了")
+        check(rc == 0 and open_alerts(box)["open"] == [], "--ack-all 一次清完", out[-200:])
+        rc, out = box.run("alerts", "--ack", "no-such-id")
+        check(rc != 0, "确认一个不存在的 id 是错误，不是静默成功", out[-200:])
     finally:
         box.cleanup()
 
@@ -2359,6 +2704,10 @@ SCENARIOS = [
     ("preflight", s_preflight_gaps),
     ("idlespin", s_watch_idle_exit),
     ("patrol", s_patrol_templates),
+    ("watchdog", s_watchdog_standalone),
+    ("noprog", s_no_progress_breaker),
+    ("backoff", s_budget_backoff),
+    ("alerts", s_structured_alerts),
 ]
 
 

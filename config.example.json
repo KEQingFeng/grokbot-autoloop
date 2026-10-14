@@ -42,7 +42,13 @@
     "merge_threshold": 5,
     "risk_low_max": 20,
     "risk_mid_max": 45,
-    "merge_enabled": false
+    "merge_enabled": false,
+    "watchdog_stale_s": 1800,
+    "no_progress_gate": 3,
+    "idle_gate": 6,
+    "backoff_at": 0.8,
+    "backoff_max_s": 900,
+    "alert_cooldown_min": 30
   },
 
   "caps_notes": {
@@ -67,7 +73,13 @@
     "merge_threshold": "§PR-5「默认参数：PR 阈值 5」: how many PRs must be *eligible* (verdict auto_merge_ok and risk ≤ risk_low_max) before the merge line acts by itself. Below it `merge` waits and says so in the event log. `--now` overrides the wait, never the per-PR re-read.",
     "risk_low_max": "Ceiling on the 0-100 script-computed risk_score for 可自动合并. Green everywhere and ≤ this ⇒ verdict auto_merge_ok, which is the only verdict the merge line will act on.",
     "risk_mid_max": "≤ this ⇒ 需加强审查 (needs_review): reported with its reasons and its blockers, never silently auto-merged. Above it ⇒ hold_high_risk, which waits for a human even when every check is green.",
-    "merge_enabled": "Ships false. PROTOCOL.md §八 says 「不擅自合并 PR」「所有 PR 合并决定交给我」, so turning the merge line on takes this *and* --yes-i-will-merge on every invocation; neither alone merges anything. `merge --dry-run` still works while it is false, because it only reads."
+    "merge_enabled": "Ships false. PROTOCOL.md §八 says 「不擅自合并 PR」「所有 PR 合并决定交给我」, so turning the merge line on takes this *and* --yes-i-will-merge on every invocation; neither alone merges anything. `merge --dry-run` still works while it is false, because it only reads.",
+    "watchdog_stale_s": "No `last_tick_at` for this long ⇒ `watchdog` calls the loop dead (critical, exit 4), not idle. Set it to at least 2× your tick cadence, or a slow tick reads as a dead one. A loop that is deliberately stopped (STOP/HALTED or an open breaker) is reported as stopped and never as dead — otherwise every shutdown you cause yourself pages you.",
+    "no_progress_gate": "Consecutive tasks that end in blocked.json having delivered nothing ⇒ hard stop: writes HALTED, only `resume` closes it. This counts *deliverables*, not exited processes — a worker that finishes is not progress, which is the exact mistake v1.0.0 made. It is the rung *after* fail_gate: while maintenance mode is already handling the same broken gate the streak still counts but the breaker stays shut (`no_progress_deferred` in state.json), because two rungs firing on one piece of evidence would make maintenance mode unreachable in the only situation it exists for.",
+    "idle_gate": "Consecutive empty ticks ⇒ soft stop: writes STOP, only `go` closes it. The loop saying 「继续 tick 不会产出 PR」 and then ticking again is the loop arguing with itself, and a breaker that closes itself again is a suggestion, not a breaker. Adding a task does *not* resume it: closing a breaker is a human decision.",
+    "backoff_at": "Fraction of a daily budget (jobs / turns / PRs) at which the loop slows down instead of running full speed into the hard ceiling: parallel drops to 1 and the tick interval doubles. Backoff never raises a cap — it only spends what is left more slowly. 0 disables it.",
+    "backoff_max_s": "Ceiling on a backed-off tick interval, also the ceiling for the idle backoff (base × 2^idle_ticks). Without it an idle night would stretch its own cadence past the point where a finished worker is noticed.",
+    "alert_cooldown_min": "Minutes during which a repeat of the *same* problem (same dedupe_key) folds into the existing alert as `count += 1` instead of opening a new one. An ongoing problem is one open alert, not one per run — otherwise the alert file becomes the noise that made events.jsonl unusable for paging. Set 0 to record every run separately; `alerts --ack` silences an episode, and a recurrence after the cooldown re-opens it."
   },
 
   "delivery": {

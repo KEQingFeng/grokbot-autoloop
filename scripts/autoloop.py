@@ -37,7 +37,7 @@ import sys
 import time
 from datetime import datetime
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 ALO_DIR = ".autoloop"
 
 DEFAULT_CAPS = {
@@ -71,6 +71,16 @@ DEFAULT_CAPS = {
     "risk_low_max": 20,             # <= this and everything else green -> may auto-merge
     "risk_mid_max": 45,             # <= this -> extra review, never silent auto-merge
     "merge_enabled": False,         # PROTOCOL §八 says the merge decision is the user's
+    # 看门狗 / 熔断 / 退避 (#12). Three different questions, so three different
+    # knobs: is the loop itself still alive, has it stopped delivering, and how
+    # hard should it push with the budget that is left.
+    "watchdog_stale_s": 1800,       # no tick for this long -> the loop is dead, not idle
+    "no_progress_gate": 3,          # consecutive tasks that end blocked with nothing
+                                    # delivered -> hard stop (HALTED, needs `resume`)
+    "idle_gate": 6,                 # consecutive empty ticks -> soft stop (STOP, needs `go`)
+    "backoff_at": 0.8,              # fraction of a budget at which the loop slows down
+    "backoff_max_s": 900,           # ceiling on a backed-off tick interval
+    "alert_cooldown_min": 30,       # one ongoing problem = one open alert, not one per run
 }
 
 # Red lines that are mechanically checkable. Anything here is refused by code,
@@ -486,7 +496,7 @@ class Ctx:
         counters = st.setdefault("counters", {})
         for key in ("turns_today", "jobs_today", "pr_today", "fails_today",
                     "fails_consecutive", "gh_hits_today", "cands_added",
-                    "prs_valid_today", "idle_ticks"):
+                    "prs_valid_today", "idle_ticks", "no_progress_streak"):
             counters.setdefault(key, 0)
         st.setdefault("pending_pr", [])
         st.setdefault("notes", [])
@@ -494,6 +504,15 @@ class Ctx:
         st.setdefault("gh_cooldown_until", 0)
         st.setdefault("day", today())
         st.setdefault("turn", 0)
+        # Which breakers are open, and since when. A flag file alone cannot say
+        # whether *I* stopped the loop or a human did, and the patrol report must
+        # not call a tripped breaker 「人工停止」.
+        st.setdefault("breakers", {})
+        # Set when the no-progress streak passed its gate but maintenance mode was
+        # already handling the same broken gate, so the harder breaker stayed shut.
+        # Kept in state (not recomputed) because the patrol report has to be able to
+        # say 「熔断被推迟」 without re-deriving why.
+        st.setdefault("no_progress_deferred", False)
         return st
 
     def ensure_state(self):
@@ -507,10 +526,11 @@ class Ctx:
                              "pr_today": 0, "fails_today": 0,
                              "fails_consecutive": 0, "gh_hits_today": 0,
                              "cands_added": 0, "prs_valid_today": 0,
-                             "idle_ticks": 0},
+                             "idle_ticks": 0, "no_progress_streak": 0},
                 "slots": {s: None for s in SLOTS},
                 "pending_pr": [], "gh_cooldown_until": 0,
-                "idle_reason": None, "maintenance": False,
+                "idle_reason": None, "maintenance": False, "breakers": {},
+                "no_progress_deferred": False,
                 "last_tick_at": 0, "last_report_at": 0,
                 "ref": None, "notes": [],
             }
@@ -597,6 +617,59 @@ class Ctx:
     def _next_event_id(self):
         self._event_seq = getattr(self, "_event_seq", 0) + 1
         return "%d-%d-%d" % (time.time_ns() // 1000, os.getpid(), self._event_seq)
+
+    def alert(self, severity, kind, title, detail="", action="", dedupe=None, **fields):
+        """Append one structured alert to `alerts.jsonl` and return the record.
+
+        `events.jsonl` answers "what happened, in order" and is far too noisy to
+        page anybody from. This file answers the only question an unattended box
+        actually asks at 3 a.m.: *is anything open that needs a human*. So each
+        record carries a severity, a title a person can read, the next action, and
+        a dedupe key — and the same ongoing problem appends a `repeat` line with
+        `count += 1` instead of a fresh alert, because an alert that fires every
+        minute is an alert the operator learns to ignore.
+
+        Append-only: acknowledging writes to `alert_acks.json`, never back into
+        here, so the file stays a true history of what was reported.
+        """
+        key = dedupe or kind
+        cooldown = int(self.cap("alert_cooldown_min")) * 60
+        prev = None
+        for rec in alert_records(self):
+            if rec.get("dedupe_key") == key:
+                prev = rec                      # file order is chronological
+        epoch = now()
+        rec = {"ts": stamp(), "epoch": epoch, "alert_id": self._next_alert_id(),
+               "severity": severity, "kind": kind, "title": title,
+               "detail": detail, "action": action, "dedupe_key": key,
+               "engine": VERSION}
+        if prev and cooldown > 0 and epoch - int(prev.get("epoch") or 0) < cooldown:
+            rec.update({"repeat": True, "count": int(prev.get("count") or 1) + 1,
+                        "first_seen_epoch": prev.get("first_seen_epoch") or prev.get("epoch")})
+        else:
+            # The cooldown has lapsed (or this is the first one): a new episode.
+            # That is what lets an acknowledged problem come back later — the ack
+            # silences the episode, not the condition forever.
+            rec.update({"repeat": False, "count": 1, "first_seen_epoch": epoch})
+        for name, val in fields.items():
+            rec[name] = val
+        rec = scrub_secrets(rec)
+        try:
+            append_jsonl(os.path.join(self.alo, "alerts.jsonl"), rec)
+        except OSError as exc:
+            # The alert channel failing is itself the thing worth shouting about,
+            # and it must not take the caller down with it.
+            self.note("alerts.jsonl write failed: %s" % exc)
+            try:
+                self.save()
+            except OSError:
+                pass
+            return None
+        return rec
+
+    def _next_alert_id(self):
+        self._alert_seq = getattr(self, "_alert_seq", 0) + 1
+        return "a%d-%d-%d" % (time.time_ns() // 1000, os.getpid(), self._alert_seq)
 
     def journal(self, text):
         os.makedirs(self.log_dir, exist_ok=True)
@@ -884,6 +957,10 @@ def adopt_worker_pr(ctx, rec, slot, pol, lines, verified):
     c = ctx.state["counters"]
     c["pr_today"] = c.get("pr_today", 0) + 1
     c["prs_valid_today"] = c.get("prs_valid_today", 0) + (1 if verified and not wrong_base else 0)
+    if verified and not wrong_base:
+        # A PR that exists but never passed the gate is not progress — counting it
+        # would let a loop that only ships unverified diffs keep the breaker closed.
+        _credit_progress(ctx, "worker_pr")
     ctx.state["slots"][slot] = None
     queue, cands = load_tasks(ctx)
     for pool in (queue, cands):
@@ -1997,8 +2074,18 @@ def cmd_tick(args):
         for flag, why in (("STOP", "STOP file present"), ("HALTED", "HALTED file present")):
             if os.path.exists(os.path.join(ctx.alo, flag)):
                 st["idle_reason"] = "stopped"
-                st["next"] = "remove .autoloop/%s when you want work to resume" % flag
-                lines.append("- %s → no business work this tick (%s)" % (flag, why))
+                # Who wrote it changes what the operator should do: a flag the engine
+                # wrote itself means a breaker is open, and calling that 「人工停止」
+                # would send somebody hunting for a person who never touched the box.
+                mine = [k for k, v in (st.get("breakers") or {}).items()
+                        if v.get("flag") == flag]
+                st["next"] = ("%s 是 autoloop 自己写的熔断（%s）：先处理原因，再 `%s` 合闸"
+                              % (flag, "、".join(mine), BREAKERS[mine[0]]["reset"])
+                              if mine else
+                              "remove .autoloop/%s when you want work to resume" % flag)
+                lines.append("- %s → no business work this tick (%s%s)"
+                             % (flag, why, "；autoloop 熔断：" + "、".join(mine) if mine
+                                else ""))
                 _finish(ctx, lines, "stopped", args.quiet)
                 return 0
         if os.environ.get("AUTOLOOP_HARD_STOP"):
@@ -2058,17 +2145,42 @@ def cmd_tick(args):
             _advance(ctx, rec, slot, pol, lines)
 
         # 6. fill empty slots
+        # 预算退避 (#12). The cap answers "how much may this loop spend", the
+        # backoff answers "how hard should it push right now". Keeping them apart
+        # matters: slowing down when the budget is nearly gone buys back the
+        # remaining budget, whereas a backoff that raised the cap would just be a
+        # loophole around §四's nightly ceiling.
+        plan = backoff_plan(ctx)
         if c["jobs_today"] < ctx.cap("nightly_max_jobs") and not st.get("maintenance"):
-            for slot in SLOTS:
-                if st["slots"].get(slot):
-                    continue
-                task, label, why = pick_task(ctx, pol, mode)
-                if not task:
-                    st["idle_reason"] = "no-work"
-                    lines.append("- slot %s: no eligible task (%s)" % (slot, why or "pool empty"))
-                    continue
-                st["idle_reason"] = None
-                start_task(ctx, task, label, slot, mode, lines)
+            if plan["throttled"]:
+                lines.append("- 预算退避：并发 %s/%s、节奏 %ss（%s）"
+                             % (plan["parallel"], plan["max_parallel"], plan["interval_s"],
+                                "；".join(plan["reasons"])))
+            if plan["parallel"] <= 0:
+                st["idle_reason"] = st.get("idle_reason") or "backoff"
+                lines.append("- backoff: parallel is 0 (%s) → no dispatch this tick"
+                             % ("；".join(plan["reasons"]) or "throttled"))
+            else:
+                running = sum(1 for s in SLOTS if st["slots"].get(s))
+                for slot in SLOTS:
+                    if running >= plan["parallel"]:
+                        # Deliberately *not* setting idle_reason here: the loop is
+                        # not out of work, it is deliberately keeping a slot empty.
+                        # Calling that "no eligible task" would be the report lying.
+                        lines.append("- backoff: holding at %s concurrent job(s) → slot %s "
+                                     "left empty on purpose" % (plan["parallel"], slot))
+                        break
+                    if st["slots"].get(slot):
+                        continue
+                    task, label, why = pick_task(ctx, pol, mode)
+                    if not task:
+                        st["idle_reason"] = "no-work"
+                        lines.append("- slot %s: no eligible task (%s)"
+                                     % (slot, why or "pool empty"))
+                        continue
+                    st["idle_reason"] = None
+                    running += 1
+                    start_task(ctx, task, label, slot, mode, lines)
         elif st.get("maintenance"):
             maintenance_tick(ctx, pol, lines)
 
@@ -2112,12 +2224,18 @@ def _finish(ctx, lines, idle, quiet=False):
     busy = any((ctx.state["slots"].get(s) or {}).get("state") in ACTIVE_STATES
                for s in SLOTS)
     c["idle_ticks"] = c.get("idle_ticks", 0) + 1 if (idle and not busy) else 0
-    if c["idle_ticks"] == 6:
-        lines.append("- 空转 %s 轮（原因 %s）：继续 tick 不会产出 PR。先 `suggest` 补池子、"
-                     "`approve` 待审候选，或按 §七 异常模板汇报环境/额度问题。"
-                     % (c["idle_ticks"], idle))
-        ctx.state["next"] = "连续空转 %s 轮（%s）— 需要人工或 `suggest`/`approve`，别再 tick" \
-                            % (c["idle_ticks"], idle)
+    gate = int(ctx.cap("idle_gate"))
+    if gate and c["idle_ticks"] >= gate:
+        # 空转熔断 (#12). Saying "more ticking will not help" and then ticking again
+        # is the loop arguing with itself: every one of those turns is spent budget
+        # and a log line that looks alive. So at idle_gate it writes its own STOP
+        # and waits for a human — a breaker that closes itself again is not a
+        # breaker, it is a suggestion.
+        if not _trip_breaker(ctx, "idle", lines=lines, streak=c["idle_ticks"], gate=gate,
+                             reason="连续空转 %s 轮（原因 %s）：继续 tick 不会产出 PR"
+                                    % (c["idle_ticks"], idle)):
+            lines.append("- 空转 %s 轮（原因 %s）：熔断还开着，`go` 合闸之前不派活"
+                         % (c["idle_ticks"], idle))
     ctx.save()
     ctx.journal("\n".join(lines))
     ctx.ledger({"turn": ctx.state["turn"], "result": idle or "ok",
@@ -2304,6 +2422,35 @@ def _block(ctx, rec, reason):
     ctx.event("guard", "task_blocked", task=rec.get("task"), slot=rec.get("slot"),
               branch=rec.get("branch"), tries=rec.get("tries", 0),
               reason=reason[:600])
+    # 无进展熔断 (#12). A task that ends here burned a worktree, a gate run and
+    # possibly several repair rounds, and delivered nothing. Counting *those* —
+    # not red verifies (that is fail_gate) and not exited processes (that is not
+    # progress at all) — is what stops a box from chewing through the nightly
+    # budget on a broken gate or an impossible task while looking busy.
+    c = ctx.state["counters"]
+    c["no_progress_streak"] = int(c.get("no_progress_streak", 0) or 0) + 1
+    gate = int(ctx.cap("no_progress_gate"))
+    # 升级必须是阶梯，不能是同一条证据同时踩两档 (#12). A gate that is red for
+    # every task pushes fails_consecutive *and* no_progress_streak up together, and
+    # with the default caps both reach their gate in the same tick. fail_gate's
+    # answer is "degrade to housekeeping and tell the human"; no_progress's answer
+    # is "hard stop". If the hard stop is allowed to win that race, maintenance mode
+    # becomes unreachable in exactly the situation it was written for. So while the
+    # loop is already in maintenance — or is about to enter it this same tick — the
+    # streak is still counted (it is real information) but the breaker does not trip.
+    # `go`/`resume` clears the streak, so the next rung starts counting from zero
+    # after a human has looked at it.
+    deferred = bool(ctx.state.get("maintenance")) or \
+        int(c.get("fails_consecutive", 0) or 0) >= int(ctx.cap("fail_gate"))
+    ctx.state["no_progress_deferred"] = bool(deferred and gate
+                                             and c["no_progress_streak"] >= gate)
+    if gate and c["no_progress_streak"] >= gate and not deferred:
+        _trip_breaker(ctx, "no_progress",
+                      streak=c["no_progress_streak"], gate=gate,
+                      task=rec.get("task"), branch=rec.get("branch"),
+                      reason="连续 %s 个任务零交付（最后一条 %s：%s）"
+                             % (c["no_progress_streak"], rec.get("task"),
+                                str(reason)[:160]))
 
 
 def _advance(ctx, rec, slot, pol, lines):
@@ -3001,6 +3148,7 @@ def cmd_pr(args):
         # Without this the patrol template under-reports in delivery.owner=supervisor.
         ctx.state["counters"]["prs_valid_today"] = \
             ctx.state["counters"].get("prs_valid_today", 0) + 1
+        _credit_progress(ctx, "supervisor_pr")
         ctx.state["slots"][rec["slot"]] = None
         queue, cands = load_tasks(ctx)
         for pool in (queue, cands):
@@ -3211,12 +3359,30 @@ def cmd_budget(args):
     ctx = Ctx(args.repo)
     ctx.need_init()
     c = ctx.state.get("counters", {})
+    plan = backoff_plan(ctx)
     rows = [("turns today", c.get("turns_today", 0), ctx.cap("max_turns_per_day")),
             ("worker jobs today", c.get("jobs_today", 0), ctx.cap("nightly_max_jobs")),
             ("PRs today", c.get("pr_today", 0), ctx.cap("pr_max_per_day")),
             ("consecutive red", c.get("fails_consecutive", 0), ctx.cap("fail_gate")),
             ("gh rate hits today", c.get("gh_hits_today", 0), ctx.cap("gh_daily_rate_hits")),
             ("free disk MB", free_disk_mb(ctx.root), ctx.cap("min_free_disk_mb"))]
+    if getattr(args, "json", False):
+        # Machine-readable budget. `backoff` is what the next tick will actually
+        # do, not a restatement of the caps — an operator asking "why did it only
+        # fill one slot" needs the plan, not the ceiling.
+        print(json.dumps({
+            "budget": [{"counter": n, "now": v, "cap": cp} for n, v, cp in rows],
+            "backoff": plan,
+            "spent": {
+                "turns": int(c.get("turns_today", 0) or 0) >= int(ctx.cap("max_turns_per_day")),
+                "jobs": int(c.get("jobs_today", 0) or 0) >= int(ctx.cap("nightly_max_jobs")),
+                "prs": int(c.get("pr_today", 0) or 0) >= int(ctx.cap("pr_max_per_day")),
+            },
+            "hard_stop": bool(os.environ.get("AUTOLOOP_HARD_STOP")),
+        }, ensure_ascii=False, indent=2, sort_keys=True))
+        # Same exit-code contract as the text form: only the env kill switch is
+        # worth a non-zero here, a spent day budget is a normal end of night.
+        return 3 if os.environ.get("AUTOLOOP_HARD_STOP") else 0
     log("| counter | now | cap |")
     log("|---|---|---|")
     for name, val, cap in rows:
@@ -3225,6 +3391,12 @@ def cmd_budget(args):
     if stop:
         log("turn budget spent: tick will not dispatch until the day rolls over "
             "(or raise caps in .autoloop/config.json — that is a human edit)")
+    log("退避：并发 %s/%s、节奏 %ss、已花费 %s%%（%s）"
+        % (plan["parallel"], plan["max_parallel"], plan["interval_s"],
+           int(round(float(plan["backoff_at"]) * 100)),
+           "；".join(plan["reasons"]) or "未触发，按配置全速跑"))
+    if plan["throttled"]:
+        log("backoff engaged: the loop slows down, it does not raise any cap")
     if os.environ.get("AUTOLOOP_HARD_STOP"):
         log("AUTOLOOP_HARD_STOP is set: nothing will be dispatched tonight.")
         return 3
@@ -3253,12 +3425,23 @@ def cmd_go(args):
             removed.append(flag)
     ctx.state["maintenance"] = False
     ctx.state["counters"]["fails_consecutive"] = 0
+    # `go` is the one command that closes *every* breaker (#12). A human typing it
+    # is asserting "I have looked at why this stopped", so the streaks that tripped
+    # the breakers are reset too — otherwise the very next zero-delivery task would
+    # re-trip at 1 and the reset would be cosmetic.
+    closed = sorted((ctx.state.get("breakers") or {}).keys())
+    ctx.state["breakers"] = {}
+    ctx.state["counters"]["idle_ticks"] = 0
+    ctx.state["counters"]["no_progress_streak"] = 0
+    ctx.state["no_progress_deferred"] = False
     ctx.state["mode_forced"] = args.mode if args.mode in ("day", "night") else ctx.state.get("mode_forced")
     ctx.save()
-    ctx.event("guard", "operator_go", removed=removed,
+    ctx.event("guard", "operator_go", removed=removed, breakers_closed=closed,
+              reason=getattr(args, "reason", None) or None,
               mode_forced=ctx.state.get("mode_forced") or "auto")
-    log("removed %s; maintenance flag cleared; mode_forced=%s"
-        % (", ".join(removed) or "nothing", ctx.state.get("mode_forced") or "auto"))
+    log("removed %s; maintenance flag cleared; breakers closed: %s; mode_forced=%s"
+        % (", ".join(removed) or "nothing", ", ".join(closed) or "none",
+           ctx.state.get("mode_forced") or "auto"))
     return 0
 
 
@@ -3283,7 +3466,19 @@ def _resume_or_halt(args, halt):
                 os.remove(path)
         ctx.state["maintenance"] = False
         ctx.state["counters"]["fails_consecutive"] = 0
-        log("HALTED removed, maintenance cleared, loop may take business work again")
+        # `resume` only owns the HALTED half of the breaker set (#12). An idle
+        # breaker wrote STOP, and closing that is `go`'s job — letting `resume`
+        # clear both would mean either command silently closes the other's
+        # breaker, and then the patrol report could not say which one did.
+        brk = ctx.state.get("breakers") or {}
+        closed = sorted(k for k, v in brk.items() if v.get("flag") == "HALTED")
+        for k in closed:
+            brk.pop(k, None)
+        ctx.state["breakers"] = brk
+        ctx.state["counters"]["no_progress_streak"] = 0
+        ctx.state["no_progress_deferred"] = False
+        log("HALTED removed, maintenance cleared, breakers closed: %s, "
+            "loop may take business work again" % (", ".join(closed) or "none"))
     ctx.save()
     ctx.event("guard", "operator_halt" if halt else "operator_resume",
               reason=(args.reason or None) if halt else None)
@@ -3376,7 +3571,19 @@ def anomalies_of(ctx):
     out = []
     flags = [f for f in ("HALTED", "STOP") if os.path.exists(os.path.join(ctx.alo, f))]
     if flags:
-        out.append("%s 在场：派发已被人工停止，恢复要 `resume`/`go`" % "/".join(flags))
+        # Who stopped it is the whole message. A breaker the engine tripped itself
+        # needs the reason and the reset command; blaming a human who never touched
+        # the box sends the operator looking for a person instead of a log line.
+        brk = st.get("breakers") or {}
+        mine = [(k, v) for k, v in brk.items() if v.get("flag") in flags]
+        explained = set(v.get("flag") for _, v in mine)
+        for kind, rec in sorted(mine):
+            out.append("熔断已断开（%s）：写了 %s —— %s；恢复用 `%s`"
+                       % (kind, rec.get("flag"), str(rec.get("reason"))[:110],
+                          BREAKERS.get(kind, {}).get("reset", "go")))
+        rest = [f for f in flags if f not in explained]
+        if rest:
+            out.append("%s 在场：派发已被人工停止，恢复要 `resume`/`go`" % "/".join(rest))
     if st.get("maintenance"):
         out.append("维护模式（连续红 %s 次），只跑安全家务活" % c.get("fails_consecutive"))
     blocked = ctx.coll("blocked.json")
@@ -3401,8 +3608,9 @@ def anomalies_of(ctx):
         # an empty pool or a spent budget is §八's "可自动处理" territory — the answer
         # is `suggest` or the next day's reset, not an hourly alert the human ignores.
         out.append("循环停摆：%s" % st["idle_reason"])
-    if int(c.get("idle_ticks") or 0) >= 6:
-        out.append("连续空转 %s 轮，tick 本身已无法推进" % c["idle_ticks"])
+    if int(c.get("idle_ticks") or 0) >= int(ctx.cap("idle_gate")):
+        out.append("连续空转 %s 轮（阈值 %s），tick 本身已无法推进"
+                   % (c["idle_ticks"], ctx.cap("idle_gate")))
     return out
 
 
@@ -3424,7 +3632,7 @@ def patrol_text(ctx):
     recover = st.get("last_recovery") or "无"
     need_me = "否"
     if bad:
-        for kind in ("维护模式", "阻塞", "勿合并", "基分支", "人工停止",
+        for kind in ("维护模式", "阻塞", "勿合并", "基分支", "人工停止", "熔断",
                      "停摆：no-origin", "停摆：no-runner", "停摆：no-disk", "连续空转"):
             if any(kind in b for b in bad):
                 need_me = "是，见异常情况"
@@ -3465,6 +3673,461 @@ def patrol_text(ctx):
                     len([t for t in ctx.coll("candidates.json")
                          if t.get("status") not in ("done", "blocked")])))
     return "\n".join(lines)
+
+
+# --------------------------------------------- watchdog, breakers, alerts (#12)
+#
+# Three different questions, kept separate because they fail separately:
+#
+#   watchdog — is the loop itself still alive? `tick` cannot answer that (a tick
+#              that never runs reports nothing), and `watch` cannot either (it dies
+#              with the thing it watches). So this is a *separate* command for a
+#              *separate* scheduler: cron/launchd runs it, it reads state, disk and
+#              the workers' own log files, and it exits 0/3/4 so monitoring does not
+#              have to parse prose. It never runs git, never calls gh, and never
+#              takes loop.lock — a watchdog that queues behind a wedged loop is a
+#              watchdog that reports nothing. `--act` may do exactly one thing:
+#              stop a worker that is provably silent.
+#   breakers — is it still delivering? Two tiers above fail_gate→maintenance, both
+#              of which stop the loop and wait for a human: idle_gate writes STOP
+#              (soft, `go` closes it), no_progress_gate writes HALTED (hard,
+#              `resume` closes it). A breaker that has tripped is reported as a
+#              breaker — never as 「人工停止」, which would send the operator
+#              looking for a person who never touched it.
+#   backoff  — how hard should it push with the budget that is left? Slowing down
+#              *before* a cap is hit beats hitting it: a cap stops everything at
+#              once, including the slot that was two minutes from finishing.
+#
+# The reporting side is `alerts.jsonl` + `alerts`: structured, deduped, and
+# ackable without rewriting history.
+
+ALERT_SEVERITIES = ("info", "warn", "critical")
+SEVERITY_RANK = {"info": 0, "warn": 1, "critical": 2}
+
+BREAKERS = {
+    "idle": {"flag": "STOP", "reset": "go", "severity": "warn",
+             "event": "idle_breaker", "title": "循环连续空转，已自己软停",
+             "action": "先看 idle_reason：池子空就 `suggest`/`approve` 补任务，环境坏了先修环境，"
+                       "然后 `go` 合闸"},
+    "no_progress": {"flag": "HALTED", "reset": "resume", "severity": "critical",
+                    "event": "no_progress_breaker", "title": "连续任务零交付，已硬停",
+                    "action": "读 blocked.json 的原始失败与 evidence 文件：先判断是闸门坏了还是任务"
+                              "根本做不了，修完再 `resume` 合闸"},
+}
+
+
+def alert_records(ctx):
+    """Every alert ever written, oldest first. Append-only: this is the history."""
+    return read_jsonl(os.path.join(ctx.alo, "alerts.jsonl"))
+
+
+def alert_acks(ctx):
+    return read_json(os.path.join(ctx.alo, "alert_acks.json"), {}) or {}
+
+
+def open_alerts(ctx, severity=None):
+    """Alerts that still need a human, folded to one per dedupe key.
+
+    Folding happens on read, not on write: `alerts.jsonl` keeps every line (so the
+    count of times something fired is provable), and an episode is *open* unless an
+    ack covers that episode's `first_seen_epoch`. That is what lets an acknowledged
+    problem come back — once the cooldown lapses a new episode starts, and the old
+    ack no longer applies to it.
+    """
+    acked = {}
+    for ack in alert_acks(ctx).values():
+        key = ack.get("dedupe_key")
+        if key is None:
+            continue
+        acked[key] = max(acked.get(key, 0), int(ack.get("episode_first_seen") or 0))
+    latest = {}
+    for rec in alert_records(ctx):
+        if rec.get("dedupe_key"):
+            latest[rec["dedupe_key"]] = rec      # file order is chronological
+    out = []
+    for rec in latest.values():
+        if acked.get(rec["dedupe_key"], -1) >= int(rec.get("first_seen_epoch") or 0):
+            continue
+        if severity and rec.get("severity") != severity:
+            continue
+        out.append(rec)
+    out.sort(key=lambda r: (-SEVERITY_RANK.get(r.get("severity"), 0),
+                            -int(r.get("epoch") or 0)))
+    return out
+
+
+def ack_alerts(ctx, ids, note=""):
+    """Acknowledge by id. Returns (acked, unknown) — an unknown id is an error, not
+    a silent success, because a typo'd ack that "worked" leaves the real alert open."""
+    acks = alert_acks(ctx)
+    by_id = {}
+    for rec in alert_records(ctx):
+        if rec.get("alert_id"):
+            by_id[rec["alert_id"]] = rec
+    done, unknown = [], []
+    for aid in ids:
+        rec = by_id.get(aid)
+        if not rec:
+            unknown.append(aid)
+            continue
+        acks[aid] = {"dedupe_key": rec.get("dedupe_key"),
+                     "episode_first_seen": rec.get("first_seen_epoch"),
+                     "kind": rec.get("kind"), "severity": rec.get("severity"),
+                     "ts": stamp(), "epoch": now(), "note": note or ""}
+        done.append(aid)
+    if done:
+        write_json(os.path.join(ctx.alo, "alert_acks.json"), acks)
+        ctx.event("guard", "alert_acked", ids=done, note=(note or "")[:200])
+    return done, unknown
+
+
+def cmd_alerts(args):
+    ctx = Ctx(args.repo)
+    ctx.need_init()
+    if args.ack or args.ack_all:
+        ids = list(args.ack) if args.ack else [a["alert_id"] for a in open_alerts(ctx)]
+        if not ids:
+            log("没有开放告警可确认（`alerts --json` 看现状）")
+            return 0
+        done, unknown = ack_alerts(ctx, ids, "；".join(args.note) if args.note else "")
+        if unknown:
+            die("没有这些告警 id：%s" % ", ".join(str(u) for u in unknown))
+        log("已确认 %d 条 → 写进 alert_acks.json；alerts.jsonl 原样保留（追加式历史）"
+            % len(done))
+        return 0
+    rows = open_alerts(ctx, args.severity)
+    counts = dict((s, len([r for r in rows if r.get("severity") == s]))
+                  for s in ALERT_SEVERITIES)
+    if args.json:
+        log(json.dumps({"at": stamp(), "open": rows, "counts": counts,
+                        "history_lines": len(alert_records(ctx)),
+                        "acked": len(alert_acks(ctx)),
+                        "cooldown_min": ctx.cap("alert_cooldown_min")},
+                       ensure_ascii=False, indent=2))
+        return 0
+    if not rows:
+        log("没有开放告警（历史 %d 行，已确认 %d 条，冷却窗口 %s 分钟）"
+            % (len(alert_records(ctx)), len(alert_acks(ctx)), ctx.cap("alert_cooldown_min")))
+        return 0
+    log("开放告警 %d 条：critical %s｜warn %s｜info %s"
+        % (len(rows), counts["critical"], counts["warn"], counts["info"]))
+    for rec in rows:
+        log("- [%s] %s ×%s｜%s" % (rec.get("severity"), rec.get("kind"),
+                                   rec.get("count", 1), rec.get("title")))
+        if rec.get("detail"):
+            log("    %s" % str(rec["detail"])[:400])
+        if rec.get("action"):
+            log("    下一步：%s" % rec["action"])
+        log("    id %s｜首见 %s｜最近 %s" % (rec.get("alert_id"),
+                                            stamp(rec.get("first_seen_epoch")),
+                                            rec.get("ts")))
+    log("")
+    log("确认：`alerts --ack <id> --note \"为什么可以不管\"`，或 `alerts --ack-all`")
+    return 0
+
+
+def _trip_breaker(ctx, kind, lines=None, **info):
+    """Open a breaker once: flag file, state record, one event, one alert.
+
+    Idempotent — the second tick in a row that still satisfies the condition adds
+    a line to the log but does not re-write the flag or re-shout the alert."""
+    spec = BREAKERS[kind]
+    st = ctx.state
+    st.setdefault("breakers", {})
+    if kind in st["breakers"]:
+        return False
+    reason = str(info.pop("reason", "") or "")
+    write_text(os.path.join(ctx.alo, spec["flag"]),
+               "%s\nautoloop 自己写的熔断（%s）：%s\n只有 `%s` 能合闸；在那之前不派活。\n"
+               % (stamp(), kind, reason, spec["reset"]))
+    rec = {"tripped_at": stamp(), "tripped_epoch": now(), "flag": spec["flag"],
+           "reset": spec["reset"], "reason": reason}
+    rec.update(info)
+    st["breakers"][kind] = rec
+    st["next"] = "%s → 别再 tick：%s 熔断已断开，`%s` 合闸（%s）" \
+                 % (reason[:90] or kind, spec["flag"], spec["reset"], spec["action"])
+    ctx.event("guard", spec["event"], **dict((k, v) for k, v in rec.items()
+                                             if k != "reset"))
+    ctx.alert(spec["severity"], spec["event"], spec["title"], detail=reason,
+              action=spec["action"], **info)
+    if lines is not None:
+        lines.append("- 熔断 %s：%s → 写了 %s，`%s` 才能合闸"
+                     % (kind, reason, spec["flag"], spec["reset"]))
+    return True
+
+
+def _credit_progress(ctx, what="pr"):
+    """A deliverable actually landed, so the no-progress streak starts over.
+
+    Called only where a PR becomes real (adopted from the worker, or opened by the
+    supervisor) — not where a job merely exits, because "the process finished" is
+    precisely the signal v1.0.0 mistook for progress."""
+    c = ctx.state.setdefault("counters", {})
+    had = int(c.get("no_progress_streak", 0) or 0)
+    c["no_progress_streak"] = 0
+    ctx.state["no_progress_deferred"] = False
+    if had:
+        ctx.event("loop", "progress_credited", what=what, streak_reset_from=had)
+
+
+def backoff_plan(ctx):
+    """How hard to push right now: parallel slots, seconds between ticks, and why.
+
+    Pure — reads counters and caps, changes nothing — so `budget` can show it, a
+    tick can dispatch by it, and a test can assert it without sleeping.
+
+    Deliberately never raises anything: backoff is a slowdown, not a bigger budget.
+    The caps in step 3 of a tick still decide when work stops outright.
+    """
+    st = ctx.state
+    c = st.get("counters", {}) or {}
+    caps = ctx.cfg["caps"]
+    base = max(5, int(caps.get("watch_interval_s", 60)))
+    ceiling = max(base, int(caps.get("backoff_max_s", 900)))
+    full = max(0, int(caps.get("max_parallel", len(SLOTS))))
+    try:
+        at = float(caps.get("backoff_at", 0.8))
+    except (TypeError, ValueError):
+        at = 0.8
+    parallel, interval, reasons = full, base, []
+    budget = []
+    for label, used, cap in (("jobs", c.get("jobs_today", 0), caps.get("nightly_max_jobs")),
+                             ("turns", c.get("turns_today", 0), caps.get("max_turns_per_day")),
+                             ("prs", c.get("pr_today", 0), caps.get("pr_max_per_day"))):
+        cap = int(cap or 0)
+        if cap and float(used or 0) / cap >= at:
+            budget.append("%s %s/%s ≥ %d%%" % (label, used, cap, int(round(at * 100))))
+    if budget:
+        parallel = min(parallel, 1)
+        interval = max(interval, base * 2)
+        reasons += budget
+    idle = int(c.get("idle_ticks", 0) or 0)
+    if idle:
+        interval = max(interval, min(ceiling, base * (2 ** idle)))
+        reasons.append("空转 %s 轮 → 指数退避" % idle)
+    if st.get("maintenance") or (st.get("breakers") or {}):
+        parallel = 0
+        interval = ceiling
+        reasons.append("维护模式或熔断在场 → 不派活")
+    return {"parallel": max(0, min(parallel, full)),
+            "interval_s": max(base, min(interval, ceiling)),
+            "max_parallel": full, "base_interval_s": base, "backoff_at": at,
+            "throttled": parallel < full or interval > base,
+            "reasons": reasons}
+
+
+def watchdog_findings(ctx, act=False):
+    """What an outside observer can see without touching git or gh.
+
+    Returns (findings, acted). Every finding is a dict with severity/kind/title/
+    detail/action, so the same list can drive the exit code, the text report, the
+    JSON report and `alerts.jsonl` without four versions of the truth.
+    """
+    st = ctx.state or {}
+    c = st.get("counters", {}) or {}
+    findings = []
+    acted = []
+
+    def add(severity, kind, title, detail="", action="", **extra):
+        rec = {"severity": severity, "kind": kind, "title": title,
+               "detail": detail, "action": action}
+        rec.update(extra)
+        findings.append(rec)
+        return rec
+
+    halted = os.path.exists(os.path.join(ctx.alo, "HALTED"))
+    stopped = os.path.exists(os.path.join(ctx.alo, "STOP"))
+    breakers = st.get("breakers") or {}
+    if not st:
+        add("critical", "no_state", ".autoloop/state.json 读不到",
+            "循环从没跑完过一轮，或状态文件被删/写坏",
+            "跑 `doctor` 看环境，再 `init`/`recover`")
+    if breakers:
+        add("critical", "breaker_open",
+            "熔断在场：%s" % "、".join(sorted(breakers)),
+            "；".join("%s=%s" % (k, str(v.get("reason"))[:120])
+                     for k, v in sorted(breakers.items())),
+            "；".join("`%s` 合闸（%s）" % (v.get("reset"), k)
+                     for k, v in sorted(breakers.items())),
+            breakers=sorted(breakers))
+    elif halted:
+        add("warn", "halted", "HALTED 在场（人工硬停）",
+            "循环整夜不会派活，这是人写的停机，不是故障", "`resume` 恢复")
+    elif stopped:
+        add("warn", "stopped", "STOP 在场（人工软停）",
+            "tick 会拒绝业务工作", "`go` 恢复")
+    if st.get("maintenance") and not breakers:
+        add("warn", "maintenance", "维护模式（连续红 %s 次）" % c.get("fails_consecutive"),
+            "只跑文档/候选/状态修复，不派业务活", "修好闸门后 `go` 或 `resume`")
+
+    last = int(st.get("last_tick_at") or 0)
+    stale_for = int(now() - last) if last else None
+    cap_stale = int(ctx.cap("watchdog_stale_s"))
+    if not last:
+        add("warn", "never_ticked", "init 之后一次都没有 tick 过",
+            "state.json 里没有 last_tick_at：定时器没装，或每次 tick 都在起步阶段就退了",
+            "手动跑一次 `tick` 看它停在哪一行；再检查 cron/launchd")
+    elif stale_for > cap_stale and not (halted or stopped or breakers):
+        add("critical", "loop_stale",
+            "循环心跳停了 %ss（阈值 %ss）" % (stale_for, cap_stale),
+            "最后一次 tick 的下一步是：%s；idle_reason=%s。没人停机，那就是循环自己死了"
+            % (str(st.get("next") or "-")[:200], st.get("idle_reason")),
+            "重启 `watch`（或它的定时器）；先看 %s/log/%s.md 最后几行是卡在哪一步"
+            % (ALO_DIR, today()))
+    free = free_disk_mb(ctx.root)
+    if free < int(ctx.cap("min_free_disk_mb")):
+        add("critical", "disk_low", "磁盘余量 %s MB < %s MB"
+            % (free, ctx.cap("min_free_disk_mb")),
+            "共享云机上磁盘满会连带弄坏别人的构建，所以这是硬停级别",
+            "`worktree` 清理 + `backup` 之后再看；不要调低 min_free_disk_mb")
+
+    stall_cap = int(ctx.cap("stall_s"))
+    timeout_cap = int(ctx.cap("job_timeout_s"))
+    for slot in SLOTS:
+        rec = (st.get("slots") or {}).get(slot) or {}
+        if rec.get("state") not in ACTIVE_STATES or not rec.get("job"):
+            continue
+        meta = read_json(os.path.join(ctx.job_dir, rec["job"] + ".json")) or {}
+        pid = int(meta.get("pid") or 0)
+        if not pid or not pid_alive(pid):
+            # A job that already exited is the next tick's business (reap → verify),
+            # not an alarm — paging about it would be crying wolf every round.
+            continue
+        age = int(now() - float(meta.get("started") or now()))
+        log_path = meta.get("log") or ""
+        size, quiet = log_activity(meta)
+        quiet = int(quiet)
+        no_log = not os.path.exists(log_path)
+        if age >= stall_cap and (no_log or quiet >= stall_cap):
+            add("critical", "worker_stuck",
+                "slot %s 的 worker 还活着但静默 %ss" % (slot, quiet),
+                "进程在跑、日志不写、没有提交：多半是等一个没人答的审批，或在重试循环里打转。"
+                "这一轮没有 tick，所以循环自己不会来停它。",
+                "`watchdog --act` 停掉它的进程组（下一次 tick 会按 dead 处理并进入修复/阻塞）",
+                slot=slot, pid=pid, quiet_s=quiet, age_s=age, log_bytes=size,
+                job=rec.get("job"), task=rec.get("task"), branch=rec.get("branch"))
+            if act:
+                killed = stop_job(meta)
+                acted.append({"slot": slot, "pid": pid, "stopped": bool(killed),
+                              "kind": "worker_stuck", "task": rec.get("task")})
+                ctx.event("guard", "watchdog_stopped_job", task=rec.get("task"),
+                          slot=slot, op=rec.get("job"), job=rec.get("job"), pid=pid,
+                          quiet_s=quiet, age_s=age, killed=bool(killed),
+                          branch=rec.get("branch"))
+        elif age > timeout_cap:
+            add("critical", "worker_overdue",
+                "slot %s 的 worker 跑了 %ss，超过 job_timeout_s %ss"
+                % (slot, age, timeout_cap),
+                "还在写东西，所以 stall 闸门不判它；但按配置它早该被停下来了",
+                "`watchdog --act` 或等下一次 tick 的超时闸门；任务本身可能要拆小",
+                slot=slot, pid=pid, age_s=age, job=rec.get("job"),
+                task=rec.get("task"))
+            if act:
+                killed = stop_job(meta)
+                acted.append({"slot": slot, "pid": pid, "stopped": bool(killed),
+                              "kind": "worker_overdue", "task": rec.get("task")})
+                ctx.event("guard", "watchdog_stopped_job", task=rec.get("task"),
+                          slot=slot, op=rec.get("job"), job=rec.get("job"), pid=pid,
+                          age_s=age, killed=bool(killed), branch=rec.get("branch"))
+
+    pending = st.get("pending_pr") or []
+    if pending:
+        add("info", "pending_pr", "%s 个分支推了但还没开 PR" % len(pending),
+            "；".join(str(p.get("branch") or p)[:60] for p in pending[:3]),
+            "多半是当日 PR 额度用完了，第二天 `pr` 会补上；连续两天还在就是 gh 出问题")
+    if int(c.get("no_progress_streak", 0) or 0):
+        deferred = bool(st.get("no_progress_deferred"))
+        add("info", "no_progress_streak",
+            "连续 %s/%s 个任务零交付%s" % (c.get("no_progress_streak"),
+                                        ctx.cap("no_progress_gate"),
+                                        "（已过阈值，但维护模式先接住了，熔断被推迟）"
+                                        if deferred else ""),
+            "熔断被维护模式推迟，不是没到阈值" if deferred
+            else "还没到熔断阈值，但已经在往那个方向走",
+            "看 blocked.json 的 reason 是不是同一个根因；是的话现在就停手，别等熔断")
+    spent = [n for n, used, cap in
+             (("jobs", c.get("jobs_today", 0), ctx.cap("nightly_max_jobs")),
+              ("turns", c.get("turns_today", 0), ctx.cap("max_turns_per_day")),
+              ("prs", c.get("pr_today", 0), ctx.cap("pr_max_per_day")))
+             if int(cap or 0) and int(used or 0) >= int(cap)]
+    if spent:
+        add("info", "budget_spent", "额度已用完：%s" % "、".join(spent),
+            "这是设计好的停机，不是故障：不会为了继续跑而降低质量",
+            "等日切，或人工改 .autoloop/config.json 的 caps（那是人的决定）")
+    if st.get("idle_reason") in ("no-origin", "no-runner", "no-disk"):
+        add("warn", "loop_broken", "循环停摆：%s" % st["idle_reason"],
+            "环境级问题，tick 每次都会在起步阶段退出",
+            "`doctor` 按项修；修不好就别让它整夜空跑")
+    return findings, acted
+
+
+def cmd_watchdog(args):
+    """Outside observer: is the loop alive, is anything wedged, is the box OK.
+
+    Exit code is the contract for cron/launchd/monitoring — 0 healthy, 3 something
+    to look at, 4 something is wrong now. Text and JSON say the same thing; the
+    JSON is what a script should read.
+    """
+    ctx = Ctx(args.repo)
+    ctx.need_init()
+    findings, acted = watchdog_findings(ctx, act=bool(args.act))
+    findings = scrub_secrets(findings) or []
+    counts = dict((s, len([f for f in findings if f.get("severity") == s]))
+                  for s in ALERT_SEVERITIES)
+    for f in findings:
+        if f.get("severity") == "info":
+            continue
+        extra = dict((k, v) for k, v in f.items()
+                     if k not in ("severity", "kind", "title", "detail", "action"))
+        dedupe = "%s%s" % (f.get("kind"), (":" + str(f["slot"])) if f.get("slot") else "")
+        ctx.alert(f["severity"], f["kind"], f.get("title") or f["kind"],
+                  detail=f.get("detail", ""), action=f.get("action", ""),
+                  dedupe=dedupe, **extra)
+    hb_path = os.path.join(ctx.alo, "watchdog.json")
+    hb = read_json(hb_path, {}) or {}
+    hb.update({"runs": int(hb.get("runs") or 0) + 1, "last_run_epoch": now(),
+               "last_run_at": stamp(), "last_counts": counts,
+               "last_act": bool(args.act), "engine": VERSION,
+               "repo": ctx.remote_name()})
+    write_json(hb_path, hb)
+    rc = 4 if counts["critical"] else (3 if counts["warn"] else 0)
+    last = int((ctx.state or {}).get("last_tick_at") or 0)
+    if args.json:
+        log(json.dumps({"at": stamp(), "engine": VERSION, "repo": ctx.remote_name(),
+                        "healthy": not counts["critical"] and not counts["warn"],
+                        "exit": rc, "counts": counts,
+                        "critical": [f for f in findings if f["severity"] == "critical"],
+                        "warn": [f for f in findings if f["severity"] == "warn"],
+                        "info": [f for f in findings if f["severity"] == "info"],
+                        "acted": acted, "heartbeat": hb,
+                        "last_tick_at": last,
+                        "stale_s": int(now() - last) if last else None,
+                        "thresholds": {"watchdog_stale_s": ctx.cap("watchdog_stale_s"),
+                                       "stall_s": ctx.cap("stall_s"),
+                                       "job_timeout_s": ctx.cap("job_timeout_s")}},
+                       ensure_ascii=False, indent=2))
+        return rc
+    log("watchdog %s｜%s｜critical %s warn %s info %s｜退出码 %s"
+        % (stamp(), ctx.remote_name(), counts["critical"], counts["warn"],
+           counts["info"], rc))
+    for sev in ("critical", "warn", "info"):
+        for f in findings:
+            if f.get("severity") != sev:
+                continue
+            log("- [%s] %s：%s" % (sev, f.get("kind"), f.get("title")))
+            if f.get("detail"):
+                log("      %s" % str(f["detail"])[:300])
+            if f.get("action"):
+                log("      下一步：%s" % f["action"])
+    for a in acted:
+        log("- 已动手：停掉 slot %s 的 pid %s（%s）—— 事件已记，下一次 tick 按 dead 处理"
+            % (a.get("slot"), a.get("pid"), a.get("kind")))
+    if rc == 0:
+        log("- 循环心跳 %ss 前，磁盘 %s MB，没有卡住的 worker"
+            % (int(now() - last) if last else "-", free_disk_mb(ctx.root)))
+    log("- 告警写进 %s/alerts.jsonl（`alerts` 看开放项）；本命令没有调 git/gh，也没有改仓库"
+        % ALO_DIR)
+    return rc
 
 
 # ---------------------------------------------------- state record + injection
@@ -3733,14 +4396,23 @@ def cmd_watch(args):
                                 or os.path.exists(os.path.join(ctx.alo, "HALTED"))):
             log("watch: 检测到 STOP/HALTED，退出前台循环")
             return 0
-        if int(c.get("idle_ticks") or 0) >= 6 and not args.keep_spinning:
-            log("watch: 连续空转 %s 轮 —— 再 tick 也不会产出 PR。停在这里，"
-                 "按 §七 异常模板汇报（suggest/approve/修环境后再启动）。"
-                 % c["idle_ticks"])
+        if int(c.get("idle_ticks") or 0) >= int(ctx.cap("idle_gate")) and not args.keep_spinning:
+            log("watch: 连续空转 %s 轮（阈值 %s）—— 再 tick 也不会产出 PR。熔断已断开，"
+                 "停在这里，按 §七 异常模板汇报（suggest/approve/修环境后用 `go` 合闸再启动）。"
+                 % (c["idle_ticks"], ctx.cap("idle_gate")))
             return 4
         if deadline and now() >= deadline:
             log("watch: 到达 %s 分钟上限，退出（定时任务可再接棒 tick）" % args.minutes)
             return 0
+        # 预算退避 (#12): when --interval was not given, the *plan* sets the pace,
+        # so a loop that has nearly spent its budget slows itself down instead of
+        # burning the rest at full speed. An explicit --interval still wins — that
+        # is a human saying "I want this cadence", and humans outrank heuristics.
+        if not args.interval:
+            planned = int(backoff_plan(ctx)["interval_s"])
+            if planned != interval:
+                log("watch: 节奏 %ss → %ss（预算退避）" % (interval, planned))
+                interval = planned
         left = interval
         while left > 0:
             time.sleep(min(2, left))
@@ -4685,11 +5357,27 @@ def build_parser():
         sp.add_argument("id", nargs="+")
         sp.add_argument("--note", default="")
         sp.set_defaults(fn=fn)
-    add("budget", cmd_budget, "counters against caps")
+    add("budget", cmd_budget, "counters against caps + 预算退避计划",
+        (("--json",), {"action": "store_true",
+                       "help": "机器可读：counter/cap 对照 + backoff 计划（下一次 tick 真会用）"}))
+    add("watchdog", cmd_watchdog, "独立看门狗：只读状态判断循环是否还活着（另开调度器跑，"
+                                  "不抢 loop.lock、不碰 git/gh）",
+        (("--json",), {"action": "store_true", "help": "机器可读 findings，rc 0=正常 3=warn 4=critical"}),
+        (("--act",), {"action": "store_true",
+                      "help": "允许停掉一个能证明已静默的 worker（除此之外只读）"}))
+    add("alerts", cmd_alerts, "结构化告警：读/确认 alerts.jsonl（同一个问题折叠成一条）",
+        (("--json",), {"action": "store_true", "help": "机器可读的未确认告警列表"}),
+        (("--severity",), {"choices": sorted(ALERT_SEVERITIES),
+                            "help": "只看这一级及以上"}),
+        (("--ack",), {"action": "append", "metavar": "ALERT_ID",
+                      "help": "确认某个 alert_id（可重复）"}),
+        (("--ack-all",), {"action": "store_true", "help": "确认当前全部未确认告警"}),
+        (("--note",), {"action": "append", "help": "确认时附一句处理说明"}))
     add("stop", cmd_stop, "soft stop: ticks refuse business work",
         (("--reason",), {}), (("--hard",), {"action": "store_true"}))
-    add("go", cmd_go, "remove STOP/HALTED and clear maintenance mode",
-        (("--mode",), {"choices": ["day", "night"]}))
+    add("go", cmd_go, "remove STOP/HALTED, clear maintenance mode, close every breaker",
+        (("--mode",), {"choices": ["day", "night"]}),
+        (("--reason",), {"help": "为什么合闸（写进 events.jsonl，事后能查到是谁放行的）"}))
     add("halt", cmd_halt, "hard stop file (only `resume` clears it)",
         (("--reason",), {}))
     add("resume", cmd_resume, "clear HALTED + maintenance")

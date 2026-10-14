@@ -2,7 +2,7 @@
 name: grokbot-autoloop
 description: Turn Grok Bot into a 7×24 development supervisor on its own cloud computer — one spoken instruction starts a loop where the bot only plans and judges, headless worker CLIs on that box write the code with their own keys and open their own PR, and everything stops at a branch plus a PR for the human to merge in the morning. Use when the user says 直接开发 xx 项目, 开发 xx 项目, 全天候开发, 自动开发, 开始循环, 挂个循环, 一直开发到早上, 明早看 PR, 监工, or asks to keep developing a repo unattended, or before any multi-hour coding job that would otherwise run inside the bot's own context. Also use to stop, resume, or review such a loop, and use it FIRST for 我要开发个项目 / GitHub 还没连上这类请求 — preflight tells the user exactly what is missing instead of the bot quietly changing their environment.
 metadata:
-  version: "1.2.0"
+  version: "1.3.0"
   supervisor: Grok Bot — plans, monitors, recovers, schedules; never types the diff (§一)
   workers: whatever headless agent CLI lives on that box (dsh / codex / claude / qoder / grok / aider)
   delivery: branch + PR only — the 开发 Agent opens its own PR, the human merges it (§四/§六)
@@ -201,9 +201,46 @@ Stop / resume, in that order of severity:
 ```bash
 autoloop.py stop --reason "…"          # soft: ticks refuse business work
 autoloop.py halt --reason "…"          # hard: only `resume` clears it
-autoloop.py go                        # clear both + maintenance
+autoloop.py go --reason "…"            # clear both + maintenance + every open breaker
 AUTOLOOP_HARD_STOP=1 autoloop.py tick   # env kill switch, bites before any dispatch
 ```
+
+Two of those flags can also be written by the engine itself, and telling the two apart is
+the whole point of `state.json["breakers"]`:
+
+| breaker | trips on | writes | closed by |
+|---|---|---|---|
+| `idle` | `idle_gate` (6) consecutive empty ticks | `STOP` | `go` |
+| `no_progress` | `no_progress_gate` (3) consecutive tasks that ended blocked with nothing delivered | `HALTED` | `resume` |
+
+A breaker is a file plus a record, not a log line: the loop stops, `report --patrol` says
+「熔断已断开（kind）」 rather than 「人工停止」, and **adding a task does not resume it** —
+closing a breaker is a human decision, which is what makes it a breaker. The two rungs are
+sequential: while maintenance mode is already handling the same broken gate, the
+no-progress streak keeps counting but the hard stop stays shut (`no_progress_deferred`),
+so maintenance mode remains reachable in the one situation it exists for.
+
+Near a budget the loop slows down instead of running into the ceiling — `backoff_plan()`
+drops parallel to 1 and doubles the interval at `backoff_at` (0.8) of jobs/turns/PRs, and
+stretches an idle night as `base × 2^idle_ticks` up to `backoff_max_s` (900). It never
+raises a cap. `budget --json` prints the plan the next tick will actually use; `watch`
+follows it unless you passed `--interval` yourself, because an explicit cadence is a human
+decision and humans outrank heuristics.
+
+`watchdog` is the one command meant for a **different** scheduler (cron / launchd / your
+monitor's own probe), because `tick` cannot report that it never ran and `watch` dies with
+the thing it watches. It reads state, disk and the workers' own logs, exits `0` / `3` warn /
+`4` critical, and heartbeats to `.autoloop/watchdog.json`. It never runs `git`, never calls
+`gh`, and never takes `loop.lock`; `--act` is its only verb and it may only stop a worker it
+can prove is silent. A loop that is deliberately stopped is reported as stopped, never as
+dead — otherwise every shutdown you cause yourself pages you.
+
+Alerts land in `.autoloop/alerts.jsonl` (append-only) with acks kept separately in
+`alert_acks.json`, so acknowledging a page never rewrites history. Repeats of the same
+problem fold on *read* inside `alert_cooldown_min` (30) into one open alert with a growing
+`count`; an ack silences that episode and a later recurrence opens a new one. Every record
+is scrubbed through `SECRET_LINE_RE` on the way in. Read them with `alerts --json`, close
+them with `alerts --ack <id> --note "为什么可以不管"`.
 
 ## 6. Out of work, and never inventing it
 
@@ -233,7 +270,9 @@ autoloop.py pr A --body /tmp/pr.md  # supervisor-mode fallback: push + open, nev
 autoloop.py sync                 # merged/closed upstream → done.json, so slots refill
 autoloop.py review               # per-PR verdicts + merge order (script-only, read-only)
 autoloop.py merge --dry-run      # what the merge line would do; allowed while merge is off
-autoloop.py budget               # counters against every cap
+autoloop.py budget --json        # counters against every cap + the backoff plan
+autoloop.py alerts               # what is open, folded; --ack <id> --note "…" to close
+autoloop.py watchdog --json      # is the loop even alive (rc 0/3/4); from another scheduler
 ```
 
 `review` and `merge` make **no model call** — they are queue arithmetic over what gh and
@@ -274,8 +313,14 @@ reference repo trigger a dependency addition or a public-API change (both are
 All of it is files under `<repo>/.autoloop/` (git-excluded, `backup` snapshots them to
 branch `autoloop/state`): `state.json` `queue.json` `candidates.json` `blocked.json`
 `done.json` `policy.json` `config.json` `verify.sh` `boot.json` `preflight.json`
-`ledger.jsonl` `log/<day>.md` `history/<day>.json` `jobs/`, plus the `STOP` / `HALTED`
-marker files when a human has paused the loop.
+`review.json` `merge.json` `ledger.jsonl` `events.jsonl` `alerts.jsonl` `alert_acks.json`
+`watchdog.json` `log/<day>.md` `history/<day>.json` `jobs/`, plus the `STOP` / `HALTED`
+marker files — written by a human with `stop`/`halt`, or by the engine when a breaker
+trips, and `state.json["breakers"]` says which.
+
+`events.jsonl` is the audit trail `timeline` rebuilds a task from (§六's seven questions,
+no model call); `alerts.jsonl` is append-only and `alert_acks.json` is separate, so
+acknowledging an alert never edits the record of what happened.
 
 Lost context, box reboot, or a suspect state:
 
@@ -302,3 +347,14 @@ returns without changing anything.
   actually wakes the bot. Verify each once, by hand, before trusting a night.
 - If the box cannot be woken, this is not a daemon — it is a loop you start. Say that
   plainly instead of claiming 7×24 coverage.
+- `watchdog` is only as independent as the scheduler that runs it. Scheduled from the same
+  cron line as `tick`, a dead cron loses both at once and nothing pages you. Its
+  `worker_stuck` finding inherits `stall_s`'s weakness (a legitimately slow step looks
+  exactly like silence), so `--act` — which kills a process group — belongs on a schedule
+  you have actually looked at.
+- Alerts fold on the finding kind (plus slot for per-worker ones), so two *different*
+  problems of the same kind share one open alert with a growing `count`. The latest detail
+  is in the folded view; both lines are in `alerts.jsonl`.
+- Backoff reacts to *daily* counters and resets at the day rollover. It slows a loop that
+  has nearly spent its budget; it does not plan the night in advance, and it never raises a
+  cap.
