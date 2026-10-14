@@ -36,6 +36,13 @@ PROTOCOL = os.path.join(ROOT, "PROTOCOL.md")
 # the adapter contract the engine was written against; `dsh --help` must print both
 DSH_CMD = "dsh --profile headless --json < {prompt_file}"
 
+# Shadow the worker CLIs for *every* scenario, not just the dsh one. `preflight` and
+# `doctor` really run `dsh --profile headless --help` — that is the whole point of probing
+# instead of trusting a table — and on this box that call costs 8-56 s and reports a binary
+# the test does not control. With the stand-in first on PATH, the probe reads a help text
+# this file owns, and the suite stays a test rather than a benchmark of someone's Node CLI.
+os.environ["PATH"] = os.path.join(HERE, "bin") + os.pathsep + os.environ.get("PATH", "")
+
 PASS = []
 FAIL = []
 KEEP = []
@@ -1401,6 +1408,23 @@ def s_dsh_adapter():
         before, sep, after = line.partition(" < ")
         check(sep and "--session-id" in before and "<" not in after,
               "the resume flag is inserted before the stdin redirect", line[:240])
+
+        # A probe that dies is not evidence about the CLI's flags. On the box this ships
+        # from, `dsh --profile headless --help` cost 56 s cold and 8 s warm; the old 30 s
+        # timeout made `doctor` print 「本机版本缺 --json」 for a flag the help text does
+        # contain, and a supervisor that believes that turns --json off and loses its
+        # 空转 detection for an environment accident.
+        rc, out = box.run("preflight", env=dict(env, FAKE_DSH_HELP_FAIL="70"))
+        check("探测失败 rc=70" in out, "a probe that exits non-zero is named by its rc",
+              out[-500:])
+        check("这一步不是 GitHub 缺口" in out,
+              "an unproven probe tells you to run the probe by hand", out[-500:])
+        check("找不到 --json" not in out and "缺 --json" not in out,
+              "an unproven probe never claims the flags are absent", out[-500:])
+        rc, out = box.run("preflight",
+                          env=dict(env, FAKE_DSH_HELP="Usage: dsh --profile headless\n--json\n"))
+        check("找不到 --session-id" in out,
+              "a probe that really lacks one flag still names the right one", out[-500:])
     finally:
         box.cleanup()
 

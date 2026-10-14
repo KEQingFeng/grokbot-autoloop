@@ -42,16 +42,16 @@ says *直接开发 myrepo* gets preflight → init → suggest → watch instead
 | file | lines | what it does |
 |---|---|---|
 | `PROTOCOL.md` | 278 | the supervision protocol, verbatim: roles, loop cadence, delivery, red lines, the two hourly report templates, the state record |
-| `SKILL.md` | 279 | the supervisor-side policy: trigger keywords, preflight-first onboarding, tick contract, red lines |
-| `scripts/autoloop.py` | 3538 | the engine: 27 subcommands, state machine, gate, red lines, PR, `watch`/`round`/`preflight` |
+| `SKILL.md` | 285 | the supervisor-side policy: trigger keywords, preflight-first onboarding, tick contract, red lines |
+| `scripts/autoloop.py` | 3574 | the engine: 27 subcommands, state machine, gate, red lines, PR, `watch`/`round`/`preflight` |
 | `bootstrap.sh` | 138 | install the skill the way dsh reads it, probe `env.manifest`, then preflight + init + the next commands |
 | `env.manifest` | 23 | TAB-separated tool list (required / sched / pr / optional / worker) |
 | `install-cron.sh` | 138 | prints the three wake-up drivers, `--write` to install box cron, verifies |
 | `config.example.json` | 100 | every knob, with the reason each cap exists |
-| `tests/selftest.py` | 1613 | 36 scenarios / 426 assertions against throwaway real git repos |
+| `tests/selftest.py` | 1637 | 36 scenarios / 430 assertions against throwaway real git repos |
 | `tests/fake_worker.py` | 172 | stand-in worker, 16 modes: `good`/`slow`/`deliver` plus 13 misbehaviours |
 | `tests/fake_gh.py` | 161 | `gh` stand-in; refuses `pr merge`, records every call, file-locked |
-| `tests/bin/dsh` | 81 | `dsh` stand-in, so the DeepSeekHarness adapter (stdin prompt, `--json` events, `--session-id` resume) is really exercised |
+| `tests/bin/dsh` | 90 | `dsh` stand-in, so the DeepSeekHarness adapter (stdin prompt, `--json` events, `--session-id` resume) is really exercised |
 
 ## Install on the cloud box
 
@@ -112,6 +112,15 @@ argument is the *task text*, not a file path, so the prompt must arrive through 
 turn ended; and `--session-id <id>` continues that session — which is how §六 gets the
 *original* agent back to fix its own red gate. A wrong flag does not degrade: every agent
 job dies in exactly the same way, and the loop reports red.
+
+Measured on the box this ships from (dsh 0.2.0-rc.2, 2026-10-14): its own
+`--profile headless --help` lists `--json` and `--session-id` and says `-` reads stdin, so
+the shipped default is the CLI's documented shape rather than a guess. That probe is also
+why `preflight` can take a minute on a cold box — the call cost 56 s cold and 8-23 s warm
+here, so `dsh` is given a 120 s probe budget, and a probe that dies is reported as
+*unproven* (`探测失败 rc=…`, run it by hand) instead of being invented into "this version
+has no `--json`". A loop that silently drops `--json` loses its 空转 detection, so the
+distinction is the point.
 
 ## Configuration
 
@@ -238,6 +247,7 @@ delivers one, with the reason.
 | the report is the protocol's, not prose | `report --patrol` fills the two §七 templates from real state and omits per-agent feature detail | `patrol`, `workerpr` |
 | the protocol is injected, not remembered | `round` prints PROTOCOL.md's path + real sha256 + the §十 record rebuilt from git/gh | `protocol` |
 | an un-linked GitHub is a message, not a workaround | `preflight` names each gap with its command, exits 3, dispatches nothing, and writes nothing outside `.autoloop/` | `preflight` |
+| a probe that died is not a finding | `probe_worker_cli` reports rc≠0 as 未证实 with its rc and tells you to run it by hand; only a help text that truly omits a flag says 找不到 | `dsh` |
 | two supervisors, one box | `fcntl` lock; loser changes nothing | `lock` |
 | state survives a reset | worktrees rebuilt from branches, `recover` from git+gh truth, orphans reported | `recover`, `orphan` |
 | history is not lost | day rollover archives counters to `history/<day>.json`, `ledger.jsonl`, journal | `rollover`, `ledger` |
@@ -249,8 +259,11 @@ python3 -m py_compile scripts/autoloop.py
 python3 tests/selftest.py            # 36 scenarios; add --only <name> for one
 ```
 
-Latest full run on this machine: **426 passed, 0 failed (204.1 s)** — Python 3,
-git 2.50.1, macOS. The engine never touches the network in tests: `tests/fake_gh.py`
+Latest full run on this machine: **430 passed, 0 failed (99.4 s)** — Python 3.14.6,
+git 2.50.1, macOS, load average ~4. The same suite took 1063 s at load average 213
+(`python3 -c pass` alone cost 3-9 s there), so the seconds are a property of the box, not
+a regression signal; the pass count is. The engine never touches the network in tests:
+`tests/fake_gh.py`
 stands in for `gh` (and always refuses `pr merge`), `tests/fake_worker.py` for the coding
 agent, `tests/bin/dsh` for the DeepSeekHarness CLI.
 
@@ -291,6 +304,11 @@ agent, `tests/bin/dsh` for the DeepSeekHarness CLI.
   `.autoloop/**` being a forbidden path plus `git add -A` catching force-adds covers the
   accidental case; a box where the worker can edit `verify.sh` directly is outside the
   threat model.
+- The 空转 judges are wall-clock timers, so they assume a box that is not oversubscribed.
+  Measured here on 2026-10-14 with load average 213: `python3 -c pass` took 3-9 s, so a
+  `watch_interval_s: 60` sweep could be a few seconds late and `preflight`'s CLI probe
+  dominated the suite's runtime. Nothing broke — the guards fire on 60/420/1800 s windows —
+  but a cloud box that is *shared* wants `stall_s` and `job_timeout_s` reviewed, not trusted.
 
 ## Not provable from a machine that is not the cloud box
 

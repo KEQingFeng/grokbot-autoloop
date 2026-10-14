@@ -62,6 +62,12 @@ preflight reports a blocker at `level=pr`, `delivery.owner=supervisor` still del
 `auto/*` branches plus a printed PR body; say which half is unavailable instead of
 pretending.
 
+It is also the only place that pays for a real probe: `preflight` runs the worker CLI's
+own `--help` (dsh's cold start cost 56 s on this box, so it gets a 120 s budget). If that
+probe dies, preflight says 未证实 and tells *you* to run it — it never upgrades "I could not
+ask" into "this version has no `--json`", because a supervisor that believes the second one
+turns off `--json` and loses its 空转 detection over an accident of timing.
+
 Then arrange the wake-up (the loop does **not** run by itself — nothing here installs
 a daemon): either `watch` in the foreground of a session you are already in, or Grok
 Bot's own scheduled task running `tick` every 5–10 min.

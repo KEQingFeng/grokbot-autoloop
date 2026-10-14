@@ -76,7 +76,7 @@
       "claude -p < {prompt_file}",
       "qoder -p < {prompt_file}"
     ],
-    "note": "DeepSeekHarness 实测口径（@deepseek-ai/dsh 0.2.0-rc.2，本机 2026-10-14 读包内 README 核对）：headless 的任务来自位置参数，或省略/单独的 `-` 时来自 stdin —— 位置参数是「任务文本」不是文件路径，所以必须用 `< {prompt_file}` 而不是把路径当参数丢给它。`--json` 把输出换成按行事件（session → status/text/thinking/tool_call/tool_result → final），监工靠它认会话 id 和静默时长；不带 --json 时推理增量走 stderr，日志一样会长，空转检测照样有效。退出码：turn end=0，aborted/error=1。`--session-id <id>` 延续同一会话（未知 id 直接失败，不静默开新会话）；修复轮会自动带上它，让原 worker 改自己的 PR。其它 CLI 的 headless 写法不同，换 runner.cmd 前先 `dsh --profile headless --help` 亲自确认，别照抄本文件。"
+    "note": "DeepSeekHarness 实测口径（@deepseek-ai/dsh 0.2.0-rc.2，本机 2026-10-14 由 `dsh --profile headless --help` 原文核对：--json 与 --session-id 都在，`-` 读 stdin）：headless 的任务来自位置参数，或省略/单独的 `-` 时来自 stdin —— 位置参数是「任务文本」不是文件路径，所以必须用 `< {prompt_file}` 而不是把路径当参数丢给它。`--json` 把输出换成按行事件（session → status/text/thinking/tool_call/tool_result → final），监工靠它认会话 id 和静默时长；不带 --json 时推理增量走 stderr，日志一样会长，空转检测照样有效。退出码：turn end=0，aborted/error=1。`--session-id <id>` 延续同一会话（未知 id 直接失败，不静默开新会话）；修复轮会自动带上它，让原 worker 改自己的 PR。探测成本：这条 help 冷启动 56s、热时 8-23s，所以 dsh 的 probe 预算是 120s；探测失败只会报「未证实」，不会冒充「本机缺 --json」。其它 CLI 的 headless 写法不同，换 runner.cmd 前先亲自跑一次它的 --help，别照抄本文件。"
   },
 
   "reference_enabled": true,

@@ -134,6 +134,10 @@ DONE_MARKER = "AUTOLOOP_DONE"
 WORKER_CLIS = {
     "dsh": {
         "probe": "dsh --profile headless --help",
+        # Measured on the box this ships from: warm runs are 8-23 s, a cold Node start
+        # took 56 s. A short timeout used to print "本机版本缺 --json" for a flag that
+        # does exist, which is a fabricated diagnosis.
+        "probe_timeout_s": 120,
         "must_support": ("--json", "--session-id"),
         "cmd": "dsh --profile headless --json < {prompt_file}",
         "resume_flag": "--session-id {session_id}",
@@ -228,6 +232,32 @@ def gh_bin():
 
 def which(name):
     return shutil.which(name)
+
+
+def probe_worker_cli(name):
+    """Ask a worker CLI's own --help what it supports, and report honestly.
+
+    One function because `doctor` and `preflight` must not drift: the same flag list, the
+    same timeout, and the same three outcomes. A probe that dies (rc 124 = it was too slow,
+    rc 127 = not on PATH) is *not* evidence the flag is missing — claiming it is turns an
+    environment question into a fake finding about the CLI, and the loop would then drop
+    `--json` and lose its 空转 detection for no reason.
+    """
+    spec = WORKER_CLIS[name]
+    rc, out, err = run(spec["probe"], timeout=spec.get("probe_timeout_s", 30), shell=True)
+    blob = (out or "") + (err or "")
+    missing = [f for f in spec["must_support"] if f not in blob]
+    if rc == 124:
+        verdict = "探测超时（%ss），没有结论 —— 不是这个 CLI 缺 flag，是它启动慢" % (
+            spec.get("probe_timeout_s", 30))
+    elif rc != 0:
+        verdict = "探测失败 rc=%s: %s" % (rc, (err or out)[:160] or "无输出")
+    elif missing:
+        verdict = "有 --help，但里面找不到 %s" % ", ".join(missing)
+    else:
+        verdict = "probe: %s；缺 %s" % (spec["probe"], "无")
+    return {"rc": rc, "missing": missing, "probe": spec["probe"],
+            "unproven": rc != 0, "ok": rc == 0 and not missing, "verdict": verdict}
 
 
 def sha256_file(path):
@@ -1447,14 +1477,20 @@ def cmd_doctor(args):
         if name not in WORKER_CLIS:
             continue
         spec = WORKER_CLIS[name]
-        rc, out, err = run(spec["probe"], timeout=30, shell=True)
-        blob = (out or "") + (err or "")
-        missing = [f for f in spec["must_support"] if f not in blob]
+        p = probe_worker_cli(name)
         log("  - %s: `%s`%s" % (name, spec["cmd"],
-                                "" if rc == 0 else "  (probe failed: %s)" % spec["probe"]))
-        log("    %s%s" % (spec["note"],
-                          "" if not missing else "  ⚠ 本机版本缺 %s —— 别用 --json，"
-                                                 "空转检测只能靠日志静默" % ", ".join(missing)))
+                                "" if p["ok"] else "  (%s)" % p["verdict"]))
+        if p["ok"]:
+            log("    %s" % spec["note"])
+        elif p["unproven"]:
+            # Say what is unknown instead of guessing at what is missing.
+            log("    %s｜flag 支持情况未证实：这条 runner 派工会照 config 走，"
+                "先由你亲手跑一次 `%s` 确认可用 %s" % (
+                    p["verdict"], spec["probe"],
+                    ", ".join(spec["must_support"]) or "headless 写法"))
+        else:
+            log("    %s  ⚠ 本机版本缺 %s —— 别用 --json，"
+                "空转检测只能靠日志静默" % (spec["note"], ", ".join(p["missing"])))
     if root:
         dctx = Ctx(root)
         log("- delivery owner: %s（%s）"
@@ -3319,13 +3355,13 @@ def cmd_preflight(args):
     cli = runner_cli(ctx) if ctx else ""
     if cli and cli in WORKER_CLIS:
         spec = WORKER_CLIS[cli]
-        rc, out, err = run(spec["probe"], timeout=30, shell=True)
-        blob = (out or "") + (err or "")
-        missing = [f for f in spec["must_support"] if f not in blob]
-        add("%s headless 接口" % cli, rc == 0 and not missing,
-            "probe: %s；缺 %s" % (spec["probe"], ", ".join(missing) or "无"),
-            "本机 %s 版本可能不同：用 `AUTOLOOP_WORKER_CMD` 换成实测可用的一条，"
-            "README 的 runner 表有候选" % cli, level="warn")
+        p = probe_worker_cli(cli)
+        add("%s headless 接口" % cli, p["ok"], p["verdict"],
+            ("本机 %s 版本可能不同：用 `AUTOLOOP_WORKER_CMD` 换成实测可用的一条，"
+             "README 的 runner 表有候选" % cli) if not p["unproven"] else
+            ("由你亲手跑一次 `%s`（冷启动可能要一分钟）；确认能出 help 再回来重跑 preflight，"
+             "这一步不是 GitHub 缺口，循环可以先只出分支" % spec["probe"]),
+            level="warn")
         add("%s 已登录模型端点" % cli, bool(os.environ.get("DSH_HOME") or
             os.path.exists(os.path.expanduser("~/.dsh"))), "~/.dsh 存在"
             if os.path.exists(os.path.expanduser("~/.dsh")) else "未见 ~/.dsh",

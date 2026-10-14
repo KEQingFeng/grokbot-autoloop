@@ -48,7 +48,16 @@ def main(argv):
             pass
 
     if "--help" in argv or not argv:
-        sys.stdout.write(HELP)
+        # `preflight`/`doctor` read this text to decide what the box's CLI supports, so
+        # the scenario needs to be able to lie about it in two different ways: a probe
+        # that dies (the box is slow / the binary is broken) and a probe that answers
+        # with a version that really lacks a flag. Only the second one may be reported
+        # as "缺 --json" — see probe_worker_cli().
+        fail = os.environ.get("FAKE_DSH_HELP_FAIL")
+        if fail:
+            sys.stderr.write("stand-in dsh: help unavailable\n")
+            return int(fail)
+        sys.stdout.write(os.environ.get("FAKE_DSH_HELP", HELP))
         return 0
 
     # the event stream: `session` first, then the turn, then `final` — same shape
