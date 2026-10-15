@@ -76,8 +76,16 @@ class NightlyAutoMergeDriverTests(unittest.TestCase):
             return []
         return [l for l in self.store.read_text().splitlines() if l.strip()]
 
-    def cron_line(self, text):
-        lines = [l for l in text.splitlines() if l.strip().startswith("*/")]
+    def cron_lines(self, text, mark="autoloop-tick"):
+        """The driver line(s) carrying `mark` in the installer's output.
+
+        v1.6 split the driver into three schedules on purpose — an expensive tick, a
+        cheap 15-minute `light`, and an hourly silent report — so the tick line is no
+        longer the only crontab line. Filtering by mark keeps this assertion about the
+        line it claims to be about.
+        """
+        lines = [l for l in text.splitlines()
+                 if l.strip().startswith("*/") and mark in l]
         self.assertEqual(len(lines), 1, text)
         return lines[0].strip()
 
@@ -128,7 +136,7 @@ class NightlyAutoMergeDriverTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout)
             self.assertIn("合并线：关闭", proc.stdout)
             self.assertIn("init --auto-merge --merge-regression-cmd", proc.stdout)
-            line = self.cron_line(proc.stdout)
+            line = self.cron_lines(proc.stdout)
             self.assertIn("tick --quiet", line)
             self.assertNotIn("review", line)
             self.assertNotIn("--yes-i-will-merge", line)
@@ -147,7 +155,7 @@ class NightlyAutoMergeDriverTests(unittest.TestCase):
             self.assertIn("合并后回归：bash tests/run.sh", proc.stdout)
             self.assertIn("watch 只跑 tick", proc.stdout)
             self.assertIn("merge.out", proc.stdout)
-            line = self.cron_line(proc.stdout)
+            line = self.cron_lines(proc.stdout)
             self.assertIn("tick --quiet", line)
             self.assertIn("review --json", line)
             self.assertIn("merge --yes-i-will-merge --now --json", line)
@@ -205,22 +213,49 @@ class NightlyAutoMergeDriverTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout)
             self.assertIn("PASS", proc.stdout)
             lines = self.table_lines()
-            self.assertEqual(len(lines), 1, lines)
-            self.assertTrue(lines[0].startswith("*/15 * * * * "), lines[0])
+            # v1.6: three schedules — tick (+merge), the 15-minute light check, and the
+            # hourly silent report.
+            self.assertEqual(len(lines), 3, lines)
+            tick = next(l for l in lines if "autoloop-tick" in l)
+            self.assertTrue(tick.startswith("*/15 * * * * "), tick)
             for stage in ("tick --quiet", "review --json", "merge --yes-i-will-merge --now"):
-                self.assertIn(stage, lines[0], lines[0])
+                self.assertIn(stage, tick, tick)
         finally:
             box.cleanup()
 
-    def test_write_twice_leaves_one_line(self):
+    def test_write_installs_light_and_hourly_report_too(self):
+        box = Box("driverlight")
+        try:
+            proc = self.run_installer(box.repo, "--write", "--every", "10")
+            self.assertEqual(proc.returncode, 0, proc.stdout)
+            lines = self.table_lines()
+            self.assertEqual(len(lines), 3, lines)
+            light = next(l for l in lines if l.rstrip().endswith("# autoloop-light"))
+            report = next(l for l in lines if l.rstrip().endswith("# autoloop-report"))
+            # `light` keeps its own fixed 15-minute cadence: it is cheap, and its whole
+            # value is being there soon enough to catch a wedged worker before the
+            # budget is gone. `--every` belongs to the expensive tick only.
+            self.assertTrue(light.startswith("*/15 * * * * "), light)
+            self.assertNotIn("--quiet", light, "轻检测成功静默，不该有 --quiet")
+            # 成功静默：report 用 --if-needed，而不是每小时无条件刷一屏
+            self.assertTrue(report.startswith("0 * * * * "), report)
+            self.assertIn("report --if-needed", report)
+        finally:
+            box.cleanup()
+
+    def test_write_twice_leaves_one_of_each(self):
         box = Box("driveridem")
         try:
             self.enable(box)
             self.assertEqual(self.run_installer(box.repo, "--write").returncode, 0)
             proc = self.run_installer(box.repo, "--write")
             self.assertEqual(proc.returncode, 0, proc.stdout)
-            mine = [l for l in self.table_lines() if "autoloop-tick" in l]
-            self.assertEqual(len(mine), 1, self.table_lines())
+            lines = self.table_lines()
+            self.assertEqual(len(lines), 3, "重装必须幂等，否则每跑一次就多三条：%s" % lines)
+            # The trailing mark comment is what identifies a line as ours; the repo path
+            # appears in all three, so only the mark is a safe discriminator.
+            for mark in ("# autoloop-tick", "# autoloop-light", "# autoloop-report"):
+                self.assertEqual(len([l for l in lines if l.rstrip().endswith(mark)]), 1, lines)
         finally:
             box.cleanup()
 
@@ -245,9 +280,11 @@ class NightlyAutoMergeDriverTests(unittest.TestCase):
             proc = self.run_installer(box.repo, "--write")
             self.assertEqual(proc.returncode, 0, proc.stdout)
             self.assertIn("PASS", proc.stdout)
-            line = self.table_lines()[0]
-            self.assertIn("tick --quiet", line)
-            self.assertNotIn("--yes-i-will-merge", line, line)
+            lines = self.table_lines()
+            for l in lines:
+                self.assertNotIn("--yes-i-will-merge", l, l)
+            tick = next(l for l in lines if "autoloop-tick" in l)
+            self.assertIn("tick --quiet", tick)
         finally:
             box.cleanup()
 

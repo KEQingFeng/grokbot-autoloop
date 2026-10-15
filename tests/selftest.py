@@ -2779,6 +2779,212 @@ def _lines(path):
         return 0
 
 
+def s_light_checks():
+    head("#v1.6：15 分钟轻检测 —— 成功静默、失败恢复、连续三次异常终止任务")
+    box = Box("light", caps={"stall_s": 1, "finish_grace_s": 1, "job_timeout_s": 600,
+                             "progress_stale_s": 60, "anomaly_gate": 3})
+    try:
+        # --- healthy look: silent, rc 0, nothing printed ------------------------
+        rc, out = box.run("light", "--json")
+        lj = json.loads(out)
+        check(rc == 0 and lj.get("healthy") is True,
+              "没有 worker 在跑时：轻检测报健康、rc0", out[-300:])
+        check(lj.get("findings") == [], "健康就是空 findings，不是「大部分还行」", lj)
+        rc, out = box.run("light")
+        check(rc == 0 and out.strip() == "",
+              "成功静默：健康时它什么都不打印 —— bot 的额度不花在「一切正常」上", repr(out[:200]))
+        hb = json.loads(read_text(os.path.join(box.alo, "light.json")))
+        check(hb.get("runs") == 2, "轻检测留自己的心跳文件（runs 累加）", hb)
+
+        # --- a wedged worker: stopped (the recovery), streak 1 ------------------
+        box.add_task("Spin in place", ["src/*"])
+        env = {"FAKE_WORKER_HANG": "120"}
+        box.tick(mode="silent", env=env, wait=False)
+        jid = box.state()["slots"]["A"]["job"]
+        pid = int(json.loads(read_text(os.path.join(box.alo, "jobs", jid + ".json")))["pid"])
+        time.sleep(2.5)
+        rc, out = box.run("light", "--json")
+        lj = json.loads(out)
+        kinds = [f.get("kind") for f in lj.get("findings", [])]
+        check(rc == 4, "静默 worker → 轻检测 rc4（critical）", out[-300:])
+        check("worker_silent" in kinds, "并指名是「静默」而不是笼统的异常", kinds)
+        check(not box.pid_alive(pid), "恢复动作真的生效：进程被停掉，不再烧额度", pid)
+        acted = json.loads(read_text(os.path.join(box.alo, "light.json"))).get("findings", [])
+        check(any(a.get("kind") == "worker_silent" for a in acted),
+              "停 worker 这条恢复记进 light.json", acted)
+        check(any(a.get("kind", "").startswith("light_") for a in alerts_of(box)),
+              "同一件事落进结构化告警，不只打印在 stdout", alerts_of(box))
+        lrec = json.loads(read_text(os.path.join(box.alo, "light.json")))
+        key = (box.state()["slots"]["A"] or {}).get("branch")
+        streak = (lrec.get("slots") or {}).get(key) or {}
+        check(streak.get("streak") == 1, "连续异常计数按任务（branch）记，第一次=1", lrec["slots"])
+        check(streak.get("terminate") is not True,
+              "一次异常不终止 —— 单次异常常常只是 worker 在想事情", streak)
+
+        # --- streak 3: the task is terminated, not repaired ---------------------
+        # The worker is already stopped, so each further look sees a dead-but-active
+        # slot, which is still an anomaly: the streak keeps climbing.
+        for i in range(2):
+            box.run("light", "--json")
+        lrec = json.loads(read_text(os.path.join(box.alo, "light.json")))
+        streak = (lrec.get("slots") or {}).get(key) or {}
+        check(streak.get("streak") == 3,
+              "连续第三次异常：streak 达到 anomaly_gate(3)", streak)
+        check(streak.get("terminate") is True,
+              "并在 light.json 里记下终止请求（供 tick 执行）", streak)
+        check(any(a.get("kind") == "light_terminate" for a in alerts_of(box)),
+              "终止本身也是一条 critical 告警", alerts_of(box))
+        check(any("consecutive 3 anomalies" in str(a.get("title", ""))
+                  for a in alerts_of(box) if a.get("kind") == "light_terminate"),
+              "告警写明终止理由（连续异常 vs 恢复次数用尽）", alerts_of(box))
+
+        # --- the tick consumes the request: block, no repair round --------------
+        jobs_before = box.state()["counters"]["jobs_today"]
+        box.tick(mode="silent", env=env, wait=False)
+        blocked = box.coll("blocked.json")
+        check(any("轻检测连续 3 次异常" in str(b.get("reason", "")) for b in blocked),
+              "tick 把终止请求变成 blocked，并写清根因（不是干巴巴一句 blocked）", blocked)
+        rec = box.state()["slots"]["A"] or {}
+        check(rec.get("state") != "repairing",
+              "终止的任务不再拿一轮修复轮 —— 那就是它省下的额度", rec)
+        check(box.state()["counters"]["jobs_today"] == jobs_before,
+              "终止不新起 worker", box.state()["counters"]["jobs_today"])
+        lrec = json.loads(read_text(os.path.join(box.alo, "light.json")))
+        check(not any((v or {}).get("terminate")
+                      for v in (lrec.get("slots") or {}).values()),
+              "请求被消费掉（terminate 复位），不会每个 tick 都重新停一遍", lrec["slots"])
+        check(any(e.get("kind") == "light_terminate"
+                  for e in events_of(box)),
+              "终止写进 events.jsonl，事后能查到是谁、为什么", events_of(box)[-5:])
+    finally:
+        box.cleanup()
+
+
+def s_light_recovery_cap():
+    head("#v1.6：自动恢复次数用尽同样终止 —— 连续闸门拦不住「坏一次好一次」的漏额度")
+    # anomaly_gate is unreachably high on purpose, so the *consecutive* route can never
+    # fire and the only way to terminate is the recovery-count route. light_max_recoveries
+    # is 0: the first auto-stop already exceeds the allowance, which is the honest shape
+    # for "this repo's builds are so slow that any stall is probably not a stall".
+    box = Box("lightcap", caps={"stall_s": 1, "finish_grace_s": 1, "job_timeout_s": 600,
+                                "progress_stale_s": 60, "anomaly_gate": 99,
+                                "light_max_recoveries": 0})
+    try:
+        box.add_task("Flaky worker", ["src/*"])
+        env = {"FAKE_WORKER_HANG": "120"}
+        box.tick(mode="silent", env=env, wait=False)
+        time.sleep(2.5)             # let the log go quiet past stall_s before looking
+        box.run("light", "--json")           # stop 1 → recoveries 1 > cap 0
+        lrec = json.loads(read_text(os.path.join(box.alo, "light.json")))
+        key = (box.state()["slots"]["A"] or {}).get("branch")
+        row = lrec["slots"][key] or {}
+        check(row.get("terminate") is True,
+              "第一次自动恢复就超过上限 → 立刻终止（streak 到不了 99）", lrec["slots"])
+        check("auto-recovered" in str(row.get("terminate_reason") or ""),
+              "并写明是恢复次数用尽，不是连续异常 —— 两种原因事后要能分开", row)
+        box.tick(mode="silent", env=env, wait=False)
+        blocked = box.coll("blocked.json")
+        check(blocked and "轻检测" in str(blocked[-1].get("reason", "")),
+              "tick 把它变成 blocked 并带上根因", blocked)
+        rec = box.state()["slots"]["A"] or {}
+        check(rec.get("state") != "repairing",
+              "终止的任务不再拿一轮修复轮 —— 那就是它省下的额度", rec)
+    finally:
+        box.cleanup()
+
+
+def s_quiet_report():
+    head("#v1.6：成功静默 + 每小时汇报 —— 循环健康时 bot 不该为「一切正常」花额度")
+    box = Box("quietreport", caps={"report_hourly_s": 3600})
+    try:
+        # --- first look: nothing has been reported yet, so it speaks -------------
+        rc, out = box.run("report", "--if-needed", "--json")
+        rj = json.loads(out)
+        check(rc == 0 and rj.get("due") is True,
+              "从没汇报过 → 第一条一定给（否则开局就没人知道它跑起来了）", out[:300])
+        check(rj.get("reason") in ("hourly", "needs_human", "idle", "quiet_disabled"),
+              "并说明为什么说", rj.get("reason"))
+        check(rj.get("report"), "报告正文一起给出来，调用方不用再跑一次", bool(rj.get("report")))
+
+        # --- healthy loop right after: silent ------------------------------------
+        rc, out = box.run("report", "--if-needed")
+        check(rc == 0 and out.strip() == "",
+              "刚汇报过、一切正常 → 什么都不打印（这就是「成功无需汇报」）", repr(out[:200]))
+        rc, out = box.run("report", "--if-needed", "--json")
+        rj = json.loads(out)
+        check(rj.get("due") is False and rj.get("reason") == "fresh",
+              "未到每小时点 → due=false、reason=fresh", rj)
+
+        # --- something needs a human: it speaks immediately, not at the hour -----
+        box.run("halt", "--reason", "self-test")
+        rc, out = box.run("report", "--if-needed", "--json")
+        rj = json.loads(out)
+        check(rc == 0 and rj.get("due") is True,
+              "有异常 → 立刻出报告，不等每小时那一下", out[:300])
+        check(rj.get("reason") == "needs_human",
+              "理由是 needs_human —— 告警永远优先于节流", rj.get("reason"))
+        box.run("resume")
+
+        # --- the hourly heartbeat fires even when nothing happened ----------------
+        st = box.state()
+        st["last_quiet_report_at"] = int(time.time()) - 7200
+        box.write_state(st)
+        rc, out = box.run("report", "--if-needed", "--json")
+        rj = json.loads(out)
+        check(rc == 0 and rj.get("due") is True and rj.get("reason") == "hourly",
+              "到了每小时点 → 心跳报告照常出（间隔是 report_hourly_s）", rj)
+
+        # --- the interval is a cap, not a floor --------------------------------
+        cfg = box.config()
+        cfg["caps"]["report_quiet_on_success"] = False
+        box.write_config(cfg)
+        rc, out = box.run("report", "--if-needed", "--json")
+        rj = json.loads(out)
+        check(rj.get("reason") == "quiet_disabled",
+              "关掉成功静默就恢复每次汇报 —— 节流是可关的，不是黑箱", rj.get("reason"))
+    finally:
+        box.cleanup()
+
+
+def s_start_wizard():
+    head("#v1.6：start 向导 —— 丢给它插件+项目两个地址，只问几个问题就能开跑")
+    plugin = Box("startplugin")
+    project = Box("startproject")
+    try:
+        # A project that already has a gate would not be asked about one — so blank the
+        # gate to model the real case: a fresh clone whose test command nobody knows yet.
+        cfg = project.config()
+        cfg.setdefault("verify", {})["test"] = ""
+        cfg.setdefault("runner", {})["cmd"] = ""
+        project.write_config(cfg)
+        dest = os.path.join(project.dir, "onto")
+        rc, out = plugin.run("start", "--dir", dest,
+                             "--project", project.repo, "--json")
+        sj = json.loads(out)
+        check(rc == 0, "start 跑完 rc0", out[-400:])
+        check(isinstance(sj.get("questions"), list) and sj["questions"],
+              "它收集了一组需要人回答的问题", sj.get("questions"))
+        qtext = " ".join(sj["questions"])
+        check("测试命令" in qtext,
+              "问题里包含闸门测试命令 —— 这是唯一不能替用户猜的那一个", qtext)
+        check("worker" in qtext,
+              "以及用哪个 worker CLI 写码", qtext)
+        check(isinstance(sj.get("steps"), list) and sj["steps"],
+              "并报告了它已经做完了哪些机械步骤（bootstrap 等）", sj.get("steps"))
+        check(sj.get("repo") == project.repo, "指向目标仓库", sj.get("repo"))
+        check(os.path.isdir(os.path.join(project.repo, ".autoloop")),
+              "目标仓库真的被 bootstrap + init 过了", project.repo)
+        # idempotent: a second run must not wipe the config it wrote
+        cfg_before = project.config()
+        rc, out = plugin.run("start", "--dir", dest, "--project", project.repo, "--json")
+        check(rc == 0, "再跑一次同样 rc0（幂等）", out[-300:])
+        check(project.config().get("caps") == cfg_before.get("caps"),
+              "第二次不覆盖已有的 .autoloop 配置", project.config())
+    finally:
+        plugin.cleanup()
+        project.cleanup()
+
+
 SCENARIOS = [
     ("init", s_init_doctor),
     ("unit", s_unit_rules),
@@ -2827,6 +3033,10 @@ SCENARIOS = [
     ("noprog", s_no_progress_breaker),
     ("backoff", s_budget_backoff),
     ("alerts", s_structured_alerts),
+    ("light", s_light_checks),
+    ("lightcap", s_light_recovery_cap),
+    ("quietreport", s_quiet_report),
+    ("startwiz", s_start_wizard),
 ]
 
 

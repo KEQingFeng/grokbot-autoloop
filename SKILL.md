@@ -2,10 +2,12 @@
 name: grokbot-autoloop
 description: Turn Grok Bot into a 7×24 development supervisor on its own cloud computer — one spoken instruction starts a loop where the bot only plans and judges, headless worker CLIs on that box write the code with their own keys and open their own PR, and everything stops at a branch plus a PR for the human to merge in the morning. Use when the user says 直接开发 xx 项目, 开发 xx 项目, 全天候开发, 自动开发, 开始循环, 挂个循环, 一直开发到早上, 明早看 PR, 监工, or asks to keep developing a repo unattended, or before any multi-hour coding job that would otherwise run inside the bot's own context. Also use to stop, resume, or review such a loop, and use it FIRST for 我要开发个项目 / GitHub 还没连上这类请求 — preflight tells the user exactly what is missing instead of the bot quietly changing their environment.
 metadata:
-  version: "1.5.0"
+  version: "1.6.0"
   supervisor: Grok Bot — plans, monitors, recovers, schedules; never types the diff (§一)
   workers: PI or DeepSeek Harness (dsh) on GrokBot's cloud computer; other headless CLIs remain configurable
   delivery: branch + PR — the 开发 Agent opens its own PR and the human merges it (§四/§六); 夜间自己合 only via init --auto-merge plus a scheduled merge stage (§五)
+  quota: cheap 15-minute `light` checks (silent on success; three consecutive anomalies terminate a task) + a silent hourly report — supervision costs as little as possible (§1)
+  onboarding: `start --plugin-url … --repo-url …` does the setup and asks only what a human must answer (§1)
   protocol: PROTOCOL.md in this plugin is the prompt to inject before every round (§二)
   license: MIT
 ---
@@ -78,6 +80,24 @@ $ALO round                        # 轮前注入：协议路径 + §十 状态�
 $ALO watch --minutes 240          # or one `tick` per scheduled task
 ```
 
+**Fastest path: you were just handed two GitHub URLs.** If the user gives you the plugin
+repo and the project repo and says "set it up", do not do the six steps above by hand —
+`start` does the mechanical ones and leaves you only the questions that need a human:
+
+```bash
+python3 <plugin>/scripts/autoloop.py start \
+    --plugin-url <plugin GitHub URL> \
+    --repo-url   <project GitHub URL>   \
+    --dir ~/alo
+```
+
+It clones the plugin (if asked), clones the project, installs the skill, bootstraps, runs
+`init`, and then prints the *whole* question set in one block — the real test command, the
+worker CLI, whether the merge line is on, whether `origin` exists. Relay that block once,
+let the user answer, and then run the answers' commands. It is idempotent and never
+overwrites an existing `.autoloop/config.json`, so a retry is safe. This is the "丢两个
+地址就能用" entry; the manual path above is what you use when there is no URL.
+
 `bootstrap.sh` takes `--repo <path>` (or a bare positional path, or nothing = cwd), and
 knows only three things: copy the skill files into `~/.dsh/skills/grokbot-autoloop`,
 probe `env.manifest` with `[ok]`/`[缺]` lines, then run `preflight` and `init`. `--install`
@@ -101,18 +121,43 @@ probe dies, preflight says 未证实 and tells *you* to run it — it never upgr
 ask" into "this version has no `--json`", because a supervisor that believes the second one
 turns off `--json` and loses its 空转 detection over an accident of timing.
 
-Then arrange the wake-up (the loop does **not** run by itself — nothing here installs
-a daemon): either `watch` in the foreground of a session you are already in, or Grok
-Bot's own scheduled task running `tick` every 5–10 min.
+### Cadence: three schedules, three prices, do not merge them into one
+
+Your quota is the scarcest thing on this box, and the cheapest way to waste it is to answer
+"is everything fine?" six times an hour. So the loop keeps its two halves priced apart, and
+asks you to schedule them apart:
+
+| schedule | cadence | cost |
+|---|---|---|
+| `$ALO light` | every 15 min | stat + signal + a local log tail; no `git`, no `gh`, no lock |
+| `$ALO tick` | every 5–10 min | git fetch, `gh`, gates, dispatch — the expensive one |
+| `$ALO report --if-needed` | hourly | silent on success; speaks only when a human is needed or the heartbeat is due |
 
 ```bash
-$ALO watch --minutes 240              # 60s cadence, no daemon, exits when 空转 6 轮
+$ALO light                         # 15 分钟轻检测；健康时什么都不打印、退出码 0
+$ALO light --json                  # findings / acted / terminated，给脚本读
+$ALO report --if-needed            # 成功静默：正常→无输出，异常/到点→巡检正文
+$ALO watch --minutes 240           # 60s tick 节奏的前台循环
 bash <plugin>/install-cron.sh --repo <repo>          # prints all three drivers, writes nothing
 bash <plugin>/install-cron.sh --repo <repo> --write  # only if the user chose box cron
 ```
 
+**`light` is your quota guard, and it runs between ticks.** It answers one question — is the
+work in flight actually moving — and answers it in three rules: (1) a healthy look prints
+nothing, so "output exists" is a usable signal for "a human is needed"; (2) an anomaly
+*recovers* immediately, by stopping the silent or overdue worker, so the tokens stop
+burning; (3) `caps.anomaly_gate` (3) consecutive anomalies on one task terminates it — the
+worker is stopped and a terminate request is recorded, and the next `tick` writes the task
+to `blocked.json` **with the recorded root cause instead of spending another repair round
+on it**. That skipped repair round is the quota this rule exists to save.
+
+`light` never runs `git`, never calls `gh`, and never takes `loop.lock` — you can run it
+while a tick is wedged or the network is down. It never writes `state.json`; that file
+belongs to `tick`. If you find yourself about to run a full `tick` just to find out whether
+work is still alive, run `light` instead.
+
 If the user chose 夜间自己合 (§五), `$ALO init --auto-merge [--merge-regression-cmd '…']`
-happens *before* the driver is printed, and those same two `install-cron.sh` lines then carry
+happens *before* the driver is printed, and those same `install-cron.sh` lines then carry
 the `review` → `merge` stage — the driver is generated from `config.json`, there is no second
 installer for it. Without that instruction the driver is tick-only, and adding a merge command
 to it is not your call to make.
@@ -175,6 +220,18 @@ two §七 templates from real state — 定时巡检 (总体状态 / 开发循�
 detail, and a patrol that reads like a changelog is the one the user stops reading.
 Declaring "I will report every hour" in a prompt is not a schedule — say which driver
 (`watch`, a bot scheduled task, box cron) is actually running and that you verified it.
+
+Better still, let the engine decide whether there is anything to report: `report --if-needed`
+prints **nothing** and exits 0 while the loop is healthy, so your relay can be "if there is
+output, read it; otherwise I have nothing to say". It speaks immediately when
+`anomalies_of()` is non-empty — an alert always beats the throttle, and the hourly interval
+(`caps.report_hourly_s`) only ever delays *good news*. Passing `--json` gives you
+`{due, reason, age_s, report}` so you can log the decision without pasting the body.
+Set `caps.report_quiet_on_success=false` only if the user explicitly wants a report every
+cycle.
+
+`report --patrol` is the authoritative template; `report --if-needed` is the throttle in
+front of it. Run the second on a schedule and the first when it says `due=true`.
 
 Six consecutive ticks that accomplish nothing is a result, not a stall: the engine
 prints `空转 6 轮（原因 …）`, sets `下一步` to stop ticking, and `watch` exits 4. That is
@@ -376,10 +433,16 @@ All of it is files under `<repo>/.autoloop/` (git-excluded, `backup` snapshots t
 branch `autoloop/state`): `state.json` `queue.json` `candidates.json` `blocked.json`
 `done.json` `policy.json` `config.json` `verify.sh` `boot.json` `preflight.json`
 `review.json` `merge.json` `ledger.jsonl` `events.jsonl` `alerts.jsonl` `alert_acks.json`
-`watchdog.json` `log/<day>.md` `history/<day>.json` `jobs/`, plus the `STOP` / `HALTED`
-marker files — written by a human with `stop`/`halt`, or by the engine when a breaker
-trips, and `state.json["breakers"]` says which. On the 夜间自己合 tier the driver adds
-`merge.out` (its own raw JSON per round); the engine never creates it.
+`watchdog.json` `light.json` `log/<day>.md` `history/<day>.json` `jobs/`, plus the `STOP` /
+`HALTED` marker files — written by a human with `stop`/`halt`, or by the engine when a
+breaker trips, and `state.json["breakers"]` says which. On the 夜间自己合 tier the driver
+adds `merge.out` (its own raw JSON per round); the engine never creates it.
+
+`light.json` is the 15-minute check's own record: its run count, the per-task consecutive
+anomaly streak, and any terminate request awaiting the next tick. `light` writes **only**
+that file plus the append-only logs — never `state.json`, which belongs to `tick`. If you
+see `terminate: true` sitting there unconsumed, no tick has run since; the worker is
+already stopped, so nothing is burning, and the next `tick` writes the blocked entry.
 
 `events.jsonl` is the audit trail `timeline` rebuilds a task from (§六's seven questions,
 no model call); `alerts.jsonl` is append-only and `alert_acks.json` is separate, so
@@ -402,6 +465,19 @@ returns without changing anything.
 
 - The bot's own reasoning tokens still come from the bot's plan. What leaves that
   window is file reading, test watching, log paging, and the whole implementation.
+- `light` is a *liveness* check, not a quality one: it stops a worker that has gone quiet
+  and terminates a task that stops moving, but a worker that is busy and producing garbage
+  still passes it. The gate is what judges the diff; `light` only stops the bleeding.
+- `light`'s anomaly judgement inherits `stall_s`'s weakness — a legitimately slow step
+  (a 10-minute build) looks exactly like a worker waiting on a prompt. That is what
+  `anomaly_gate: 3` at 15-minute spacing is for (~45 minutes of no motion), and it is a
+  knob a repo with long builds should raise, by a human. `light --no-act` reports without
+  killing anything.
+- `light` does not write `state.json`, so its terminate request waits for the next `tick` to
+  become a `blocked.json` entry. The worker is stopped immediately (that is the saving), but
+  with no tick running the bookkeeping entry does not appear until one does.
+- Nothing here counts quota *saved*. The saving is in bot turns the supervisor does not have
+  to spend; the engine's own counters cover jobs, turns, PRs and `grok_calls_today`.
 - `lifecycle` only *reports* issue/PR mismatches from read-only gh data; it never
   closes, reopens, comments, or labels anything. Acting on a mismatch is the
   supervisor's (or the human's) explicit decision.

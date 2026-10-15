@@ -15,6 +15,15 @@ described the contract in prose, and 《DeepSeekHarness 持续自主开发监督
 shipped verbatim as [`PROTOCOL.md`](PROTOCOL.md). This repo is that contract as an
 engine you can run, with every rule in it provable by a test.
 
+Two things about how it spends the bot's own quota, because they shape every command
+here. Supervision is split by price: a cheap 15-minute `light` check that looks only at
+the workers already on disk, and the expensive `tick` that fetches git and calls `gh`.
+And the loop is **silent on success** — a healthy `light` prints nothing, and the hourly
+report says nothing until something needs a human. What it does *not* do is let a wedged
+task keep burning tokens: three consecutive bad looks at 15 minutes each and the task is
+stopped and blocked with its root cause, rather than fed another repair round.
+
+
 Trigger it out loud — the skill description carries the keywords 「直接开发 xx 项目」
 「全天候开发」「自动开发」「开始循环」「挂个循环」「明早看 PR」「监工」, so a user who
 says *直接开发 myrepo* gets preflight → init → suggest → watch instead of a tutorial.
@@ -48,15 +57,15 @@ says *直接开发 myrepo* gets preflight → init → suggest → watch instead
 | file | lines | what it does |
 |---|---|---|
 | `PROTOCOL.md` | 278 | the supervision protocol, verbatim: roles, loop cadence, delivery, red lines, the two hourly report templates, the state record |
-| `SKILL.md` | 436 | the supervisor-side policy: trigger keywords, preflight-first onboarding, tick contract, red lines |
-| `scripts/autoloop.py` | 5870 | the engine: 35 subcommands, state machine, gate, red lines, PR, `watch`/`round`/`preflight`, `watchdog`/`alerts`/`budget`, `lifecycle`/`metrics` |
+| `SKILL.md` | 512 | the supervisor-side policy: trigger keywords, one-instruction onboarding (including the `start` fast path), cadence table, tick contract, red lines, quota rules |
+| `scripts/autoloop.py` | 6445 | the engine: 37 subcommands, state machine, gate, red lines, PR, `watch`/`light`/`round`/`preflight`/`start`, `watchdog`/`alerts`/`budget`, `lifecycle`/`metrics` |
 | `bootstrap.sh` | 158 | install into the configured supervisor skill directory, probe `env.manifest`, then preflight + init |
 | `scripts/feedback.py` | 345 | local feedback classification, pending proposals, failure lessons and bounded intake rounds |
-| `tests/test_*.py` | — | 69 additional tests for portable bootstrap, the nightly merge driver, PI adapter, launch guards, feedback CLI, progress clock and reporting |
+| `tests/test_*.py` | — | 70 additional tests for portable bootstrap, the nightly merge driver, PI adapter, launch guards, feedback CLI, progress clock and reporting |
 | `env.manifest` | 23 | TAB-separated tool list (required / sched / pr / optional / worker) |
-| `install-cron.sh` | 207 | prints the three wake-up drivers — with the `review` → `merge` stage attached when the merge line is on — `--write` to install box cron, verifies |
-| `config.example.json` | 143 | every knob, with the reason each cap exists |
-| `tests/selftest.py` | 2859 | 47 scenarios / 721 assertions against throwaway real git repos |
+| `install-cron.sh` | 251 | prints the three wake-up drivers — the business `tick` (with the `review` → `merge` stage when the merge line is on), the 15-minute `light` check, and the hourly silent report — `--write` to install box cron, verifies |
+| `config.example.json` | 153 | every knob, with the reason each cap exists |
+| `tests/selftest.py` | 3069 | 51 scenarios / 763 assertions against throwaway real git repos |
 | `tests/fake_worker.py` | 172 | stand-in worker, 16 modes: `good`/`slow`/`deliver` plus 13 misbehaviours |
 | `tests/fake_gh.py` | 244 | `gh` stand-in; records every call, always refuses `--admin`/`--force`, refuses `pr merge` unless a scenario opts in, file-locked |
 | `tests/bin/dsh` | 90 | `dsh` stand-in, so the DeepSeekHarness adapter (stdin prompt, `--json` events, `--session-id` resume) is really exercised |
@@ -136,6 +145,29 @@ budgets; they do not create three workers or install a scheduler. New intake com
 use the engine lock. This is not evidence that a remote scheduler wakes successfully.
 
 ## Install on the cloud box
+
+### Fastest path: hand the bot two URLs (`start`)
+
+If what you want is 「开一个 bot，把插件 GitHub 和项目 GitHub 丢给它就能用」, that is one
+command. It clones the plugin (if you gave a URL), clones the project, installs the skill,
+bootstraps, runs `init`, and then prints the *whole* set of questions it still needs
+answered — in one block, so the bot relays them once instead of drip-feeding you questions
+across a dozen turns:
+
+```bash
+python3 scripts/autoloop.py start \
+    --plugin-url https://github.com/aritosi/grokbot-autoloop.git \
+    --repo-url   https://github.com/you/your-project.git \
+    --dir ~/alo
+```
+
+Everything mechanical is done for you; what is left is the handful of things only you can
+answer (the real test command, which worker CLI, whether the merge line is on, whether the
+repo has an `origin`). It is idempotent — a second run reuses the clones and never
+overwrites an existing `.autoloop/config.json`. Running it inside an existing checkout,
+`--project /path/to/repo` names the target and the engine uses the plugin you already have.
+
+### The manual path, step by step
 
 ```bash
 # 1. get the plugin onto the box (clone, scp, or drop it in the bot's skill directory)
@@ -245,6 +277,11 @@ debug-only `AUTOLOOP_NO_LIMIT`).
 | `same_error_gate` | 3 | the same normalized verification error this many times ⇒ `same_error` breaker (`HALTED`, only `resume` closes it). Signature normalizes digits and SHAs so line-number churn is not a new error |
 | `error_retry_base_s` | 60 | repair backoff base: try *n* waits `base × 2^(n−1)` seconds, capped at 900. Backoff slows retries; it never deletes worktrees or uncommitted work |
 | `report_interval_s` | 7200 | minimum interval for `report --outbox`. Reports are written locally to `report_outbox.jsonl` with `status=pending`; the sender calls `report --mark-sent <id>` after a successful delivery so a restart cannot send it twice |
+| `light_interval_s` | 900 | cadence `light` is *meant* to run at (15 min). It only stats files and signals — no `git`, no `gh`, no `loop.lock` — so this frequency is cheap. The business `tick` keeps its own, slower cadence; the two are not the same job |
+| `anomaly_gate` | 3 | consecutive `light` anomalies on one task (counted by branch, so a repair round cannot reset it) ⇒ **terminate the task**: stop the worker, record a terminate request, and the next tick writes it to `blocked.json` with the root cause *instead of* spending a repair round on it |
+| `light_max_recoveries` | 3 | how many times `light` may auto-recover (stop a worker) for one task. Used for reporting/audit; the terminate decision is the *consecutive* `anomaly_gate` |
+| `report_quiet_on_success` | **true** | 成功静默: `report --if-needed` prints nothing (rc 0) while the loop is healthy, so the bot's quota is not spent on 「一切正常」. Set false to report every time |
+| `report_hourly_s` | 3600 | heartbeat cadence for `report --if-needed`. An anomaly ignores it and reports immediately — the throttle never delays something a human must see |
 | `grok_daily_max` | 0 | supervisor-model escalations per day. Default **0** = local monitoring never calls a model. Raising it does not create an outbound channel by itself; it only caps how many escalation records a caller may generate |
 
 Raise them by editing the file, which is a human act — not by asking the bot, and not
@@ -393,7 +430,13 @@ green and why a `regression_red` gets no automatic revert — reverting shared h
 another one of their decisions. The protocol injected into a worker round is unchanged, and
 a worker never gains a merge verb.
 
-### Cadence: `watch`, `tick`, and the hourly report
+### Cadence: `tick`, `light`, `watch`, and the hourly report
+
+Supervision has two prices, and the loop keeps them apart. A `tick` is expensive: it fetches
+git, calls `gh`, reaps jobs, runs gates and dispatches. `light` is cheap: every 15 minutes it
+looks only at the workers already on this disk, with `os.stat`, `kill -0` and a tail read of
+a local log. Neither runs the other's job, and a driver that collapses them into one cron
+line spends the expensive half to answer a cheap question.
 
 The v1.0.0 loop asked "is the worker done?" only when the bot happened to run a `tick`,
 and asked it of the *process* — so an agent that had already written its code and gone
@@ -412,9 +455,33 @@ idle — `idle_ticks` only climbs while nothing is in flight, which is what make
 "stop ticking, go refill the pool" message arrive at the right time rather than after the
 sixth tick of a productive round.
 
+`light` is the fourth piece, and the one that runs *between* ticks (#v1.6). It never runs
+`git`, never calls `gh`, and never takes `loop.lock` — so it can run every 15 minutes on a
+box whose network is down or whose tick is wedged, and it cannot burn a rate limit. It writes
+its own `light.json` and the append-only logs, never `state.json` (only `tick` owns that). Its
+rules, in order of how much quota they save:
+
+- **成功静默.** A healthy look prints *nothing* and exits 0. A driver can therefore treat
+  "output exists" as "a human is needed" — the bot's quota is not spent on 「一切正常」 six
+  times an hour.
+- **失败则恢复并查因.** An anomaly is one bad look, and `light` acts on it immediately: a
+  silent or overdue worker is stopped (that is the recovery — the tokens stop burning), and
+  the reason is written to `light.json`, `events.jsonl` and `alerts.jsonl` rather than left
+  for the next tick to rediscover.
+- **连续超过三次异常则终止任务.** The streak is counted per task (by branch, so a repair
+  round cannot reset it). At `anomaly_gate` = 3 consecutive bad looks — about 45 minutes of
+  no forward motion at the 15-minute cadence — the task is terminated: the worker is stopped
+  and a terminate request is recorded. The next `tick` (which holds the lock) turns that into
+  a `blocked.json` entry **with the recorded root cause**, *before* `_advance` can hand the
+  dead worker a repair round. That skipped repair round is exactly the quota the rule saves.
+
 ```bash
+autoloop.py light                   # 15-minute cheap look; silent when healthy, rc 0/3/4
+autoloop.py light --json            # machine-readable findings, acted, terminated
+autoloop.py light --no-act          # observe only; never stop a process
 autoloop.py watch --minutes 240     # 60s cadence; no daemon, Ctrl-C stops it
 autoloop.py report --patrol         # §七's two templates, filled from real state
+autoloop.py report --if-needed      # 成功静默: speaks only when needed or hourly
 autoloop.py round                   # 轮前注入：协议路径 + sha256 + §十 状态记录
 ```
 
@@ -424,6 +491,14 @@ counts and states, never what each agent is developing — §七 says the hourly
 not be a feature list, and a patrol that reads like a changelog is the one that gets
 ignored. The §五 floor (≥2 有效 PR per round) is printed as a shortfall when a round
 delivers one, with the reason.
+
+`report --if-needed` is the throttle that makes 「成功则无需汇报，只需每小时汇报一次」 true
+without the bot having to decide for itself whether to speak. It prints nothing — and exits
+0 — unless `anomalies_of()` is non-empty (something needs a human: an alert wins over the
+throttle, always) or the `report_hourly_s` heartbeat is due. `--json` returns
+`{due, reason, age_s, report}`, so a driver can log the decision without printing the report
+body. Set `report_quiet_on_success=false` to go back to reporting every time.
+
 
 ### Who watches the watcher: `watchdog`, breakers, backoff, `alerts`
 
@@ -519,6 +594,11 @@ channel that copies the secret it is alerting about is a second incident.
 | escalation is a ladder, not a race | while maintenance mode is handling the same broken gate the hard stop stays shut and says so (`no_progress_deferred`), so maintenance remains reachable | `failgate`, `noprog` |
 | the watchdog is independent of the thing it watches | no `git`, no `gh`, no `loop.lock`, and `--act` may only stop a provably silent worker — proven by holding a real flock and byte-comparing gh's argv and `origin/main` across a run | `watchdog` |
 | a stopped loop is not a dead loop | `loop_stale` is suppressed when STOP/HALTED or a breaker explains the silence, so your own shutdown does not page you | `watchdog` |
+| cheap supervision does not need the expensive cycle | `light` runs between ticks, takes no `loop.lock`, runs no `git`, calls no `gh`, and writes only `light.json` + the append-only logs — never `state.json`; a healthy look prints nothing and exits 0 | `light` |
+| a wedged worker is stopped between ticks, not at the next one | `light` stops a silent or overdue worker immediately (that is the recovery), so the tokens stop burning up to a full interval sooner than a tick-only driver | `light` |
+| three bad looks terminate the task instead of feeding it repairs | the streak is per task (by branch, so a repair round cannot reset it); at `anomaly_gate` the next tick blocks the task with the recorded root cause *before* `_advance`, so no further repair round — and no more quota — is spent on it | `light` |
+| 成功则无需汇报 | `report --if-needed` prints nothing and exits 0 while healthy; it speaks when `anomalies_of()` is non-empty (an alert always beats the throttle) or at the `report_hourly_s` heartbeat | `quietreport` |
+| onboarding asks once, not drip-fed | `start` does the mechanical steps (clone, bootstrap, init) and prints the whole question set in one block; it is idempotent and never overwrites an existing `.autoloop/config.json` | `startwiz` |
 | a chatty worker is not a progressing worker | only a commit-count change or a gate-state change resets `last_real_progress_at`; after `progress_stale_s` it is treated as stalled and stops burning the slot | `test_supervision_progress` |
 | the same error is not retried forever | error signature normalizes digits/SHAs; the `same_error` breaker trips at `same_error_gate`, blocks the task and writes `HALTED`, preserving the worktree | `test_supervision_progress`, `failgate` |
 | an issue's remote state is reconciled, not trusted | `lifecycle` flags reopened, unverified-closed and unclaimed issues from read-only `gh` data; it never closes, comments, or reopens anything itself | `test_lifecycle_reporting` |
@@ -539,20 +619,20 @@ Run it yourself (no network, no global state, throwaway repos in `$TMPDIR`):
 
 ```bash
 python3 -m py_compile scripts/autoloop.py
-python3 tests/selftest.py             # 47 scenarios; add --only <name> for one
-python3 -m unittest discover -s tests  # 69 tests: portable bootstrap + the merge drivers
+python3 tests/selftest.py             # 51 scenarios; add --only <name> for one
+python3 -m unittest discover -s tests  # 70 tests: portable bootstrap + the merge drivers
 ```
 
 The `unittest` suite runs the real `install-cron.sh` against a `crontab` shim in `$TMPDIR`,
 so no version of this suite has ever touched the box's crontab — including the tests that
-install and remove a nightly entry.
+install and remove the three nightly entries.
 
-Latest full run on this machine: **721 passed, 0 failed (134 s)** and **69 tests, OK
-(46 s)** — Python 3.14.6,
-git 2.50.1, macOS, load average ~7. The *same* selftest took 391 s one hour earlier on the
-same box at load 16, and 1063 s at load average 213
-(`python3 -c pass` alone cost 3-9 s there), so the seconds are a property of the box, not
-a regression signal; the pass count is. The engine never touches the network in tests:
+Latest full run on this machine: **763 passed, 0 failed (173 s)** and **70 tests, OK
+(36 s)** — Python 3.14.6,
+git 2.50.1, macOS. The seconds are a property of the box, not a regression signal: the same
+selftest took 391 s one hour earlier on this box at load 16, and 1063 s at load average 213
+(`python3 -c pass` alone cost 3-9 s there), so the pass count is what matters. The engine
+never touches the network in tests:
 `tests/fake_gh.py`
 stands in for `gh` (it records every argv, refuses `--admin`/`--force` unconditionally, and
 only performs `pr merge` in a scenario that opts in), `tests/fake_worker.py` for the coding
@@ -588,6 +668,25 @@ agent, `tests/bin/dsh` for the DeepSeekHarness CLI.
   `caps.merge_enabled=true` the driver it prints and installs gains the `review` → `merge`
   stage; with it false — the shipped default — the driver is tick-only and the merge line
   stays wherever the user left it.
+- **Two cadences instead of one, and the cheap one is deliberately dumber.** The 「15 分钟
+  轻检测 / 失败恢复 / 连续三次终止」 requirement could have been met by making `tick`
+  cheaper, and it cannot be: a tick fetches git and calls `gh`, so it can never run every
+  15 minutes on a box that is also watching a quota. So `light` is a separate command that
+  answers only "is the work in flight moving", using local probes alone. `install-cron.sh`
+  therefore prints **three** drivers rather than one (business tick, `light`, hourly silent
+  report); collapsing them into one line is the one thing this design asks you not to do,
+  because it spends the expensive half to answer the cheap half's question.
+- **`light` never writes `state.json`.** It runs without `loop.lock`, and a lock-free writer
+  of the shared slot table is how two processes lose each other's work. So it records into
+  its own `light.json` and leaves a *terminate request*; the next `tick`, which owns the
+  lock, performs it — blocking the task with the recorded root cause before `_advance` can
+  hand the dead worker a repair round. The split costs one tick of latency and buys the
+  ability to run the check every 15 minutes.
+- **Success is silent, and that is the whole point of the throttle.** `report --if-needed`
+  prints nothing on a healthy loop. A supervisor that says 「一切正常」 every 15 minutes is a
+  supervisor that spends the reporting bot's quota on the most information-free message
+  possible. Anomalies ignore the throttle entirely: `anomalies_of()` non-empty ⇒ report
+  immediately, `report_hourly_s` only ever delays good news.
 
 ## Known limits
 
@@ -647,6 +746,26 @@ agent, `tests/bin/dsh` for the DeepSeekHarness CLI.
   Its `worker_stuck` finding inherits `stall_s`'s weakness (a legitimately slow step looks
   like silence), and `--act` kills a process group it believes is silent — so `--act` belongs
   on a schedule you have looked at, not on a guess.
+- `light` inherits `stall_s`'s weakness in full: a worker doing a legitimately slow step (a
+  10-minute build) looks exactly like one that is waiting on a nobody answers. Its answer is
+  `anomaly_gate` = 3 consecutive looks, which at 15 minutes is ~45 minutes — so a build that
+  legitimately takes an hour gets its task terminated and blocked. That is a human decision
+  about `light_interval_s` / `stall_s` / `anomaly_gate` for a repo with long builds, and the
+  `--no-act` flag exists so a first run can watch before it kills anything.
+- `light`'s terminate request is consumed by the next `tick`, so with no tick running at all
+  a terminated task keeps its slot record and its (already stopped) worker until one runs.
+  The saving — no further repair round, no more tokens — is real from the moment the worker is
+  stopped; what waits for the tick is only the bookkeeping entry in `blocked.json`.
+- Nothing was measured in quota saved. `light` costs a handful of `stat`/`kill -0` calls and
+  one tail read per active slot, and it replaces *bot turns* — the number of times a
+  reporting bot has to wake up and read a state file it does not have to read. That saving is
+  real and is the point, but this repo has no counter for it; the only budget counters here are
+  jobs, turns, PRs and `grok_calls_today`.
+- `start` clones and bootstraps, but it cannot answer what the engine cannot know: which test
+  command is real, which worker CLI that box has, whether you want the merge line on. Those
+  are collected as questions precisely because guessing them produces a loop that looks
+  healthy and verifies nothing. It also assumes a clone URL and a project URL; a repo that
+  needs submodules, LFS or a non-GitHub remote is outside what it prints.
 - Alerts fold on `dedupe_key`, which is derived from the finding kind (plus slot for
   per-worker findings). Two *different* problems that produce the same kind therefore share
   one open alert with a growing `count`; the detail field carries the latest one, and

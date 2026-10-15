@@ -51,6 +51,11 @@
     "same_error_gate": 3,
     "error_retry_base_s": 60,
     "report_interval_s": 7200,
+    "light_interval_s": 900,
+    "anomaly_gate": 3,
+    "light_max_recoveries": 3,
+    "report_quiet_on_success": true,
+    "report_hourly_s": 3600,
     "grok_daily_max": 0
   },
   "caps_notes": {
@@ -86,6 +91,11 @@
     "same_error_gate": "同一签名验收失败连续出现到这个次数就触发 same_error 熔断（HALTED，`resume` 合闸）；签名把数字与 SHA 归一化，行号抖动不算新错误",
     "error_retry_base_s": "修复轮退避基数：第 n 次修复前延迟 base×2^(n-1) 秒、封顶 900；退避只是慢，不丢未提交代码",
     "report_interval_s": "增量报告最小间隔（默认 7200 = 2 小时）。报告只落 report_outbox.jsonl，状态 pending；发送方成功投递后用 `report --mark-sent <id>` 标记，重启后不会重复发",
+    "light_interval_s": "轻检测 `light` 的建议节奏（默认 900 = 15 分钟）。它只 os.stat / kill -0 / 读日志尾部，不跑 git 不调 gh、不抢 loop.lock，所以可以跑到这个频率而不心疼；连续 caps.anomaly_gate 次异常会停掉 worker 并终止该任务，避免额度空耗。业务 tick 贵得多，保持自己的节奏，别为了省事把它们合成一条",
+    "anomaly_gate": "连续多少次轻检测异常才终止一个任务（默认 3，即 15 分钟节奏下约 45 分钟无前进）。一次异常常常只是 worker 在想事情；三次连续的，就是该收手了。判定按任务（branch）而不是按槽位记，否则修复轮会顺手把计数清零",
+    "light_max_recoveries": "单个任务被轻检测自动恢复（停 worker）的总次数上限（默认 3）。它是「连续」闸门的第二条通路：连续 3 次必然触发，但一个「坏一次、好一次、坏一次」的任务连续性永远不够、每次却都要停一次 worker —— 那同样在漏额度，所以每任务累计超上限也终止。设 0 = 不给这个任务任何自动恢复余地（第一次判死就直接终止任务）",
+    "report_quiet_on_success": "true（默认）= 成功静默：循环健康时 `report --if-needed` 什么都不打印，只在「有人需要处理」或到了每小时心跳点才输出。这是「成功则无需汇报，只需每小时汇报一次」这一条本身的开关；设 false 退回每次汇报",
+    "report_hourly_s": "心跳汇报间隔（默认 3600 = 每小时）。与上面的成功静默配合使用：间隔内且一切正常就闭嘴。异常不受它限制 —— anomalies_of() 非空时立刻出报告",
     "grok_daily_max": "升级给监工模型的每日最大请求数；默认 0 = 全程零模型调用。>0 时也只有 critical 告警且同题未问过才允许一次，并把次数记进 counters.grok_calls_today"
   },
   "delivery": {

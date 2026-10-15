@@ -29,6 +29,14 @@
 # the merge stage too — `review` then `merge --yes-i-will-merge --now`. Without that cap
 # the drivers only tick, because PROTOCOL §八 puts the merge decision with the user.
 # The loop never merges inside a tick: merging happens only through this explicit stage.
+#
+# 轻检测与省额度汇报 (#v1.6): the business tick is expensive, so it stays on its own
+# cadence. Alongside it the drivers carry two cheap stages — `light` every 15 minutes
+# (a local, no-git/no-gh look at the workers in flight; silent when healthy, and it
+# terminates a task after caps.anomaly_gate consecutive bad looks) and
+# `report --if-needed` hourly (成功静默: prints nothing unless something needs a human
+# or the heartbeat is due). Together they are what makes 「成功则无需汇报，只需每小时
+# 汇报一次」 true without the bot having to run the expensive cycle to find out.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -43,7 +51,7 @@ while [ $# -gt 0 ]; do
     --every)  EVERY="${2:-10}"; shift 2 ;;
     --write)  ACTION="write"; shift ;;
     --remove) ACTION="remove"; shift ;;
-    -h|--help) sed -n '1,31p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '1,39p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "unknown flag: $1 (try --help)" >&2; exit 2 ;;
   esac
 done
@@ -84,11 +92,22 @@ TICK_STAGE="$PY $ENGINE --repo $REPO tick --quiet >> $REPO/.autoloop/cron.out 2>
 # `;` not `&&`: a tick that found the lock held, or a review that had nothing to grade,
 # must not silently cancel the merge stage of the round it was scheduled after.
 MERGE_STAGE="$PY $ENGINE --repo $REPO review --json >> $REPO/.autoloop/merge.out 2>&1; $PY $ENGINE --repo $REPO merge --yes-i-will-merge --now --json >> $REPO/.autoloop/merge.out 2>&1"
+# 轻检测 (#v1.6): cheap and frequent, on its own line so it does not need the business
+# tick's cadence. It writes nothing to stdout when healthy, so light.out stays empty
+# until something is actually wrong — that is the point of running it every 15 minutes.
+LIGHT_MARK="# autoloop-light"
+LIGHT_LINE="*/15 * * * * cd $REPO && $PY $ENGINE --repo $REPO light >> $REPO/.autoloop/light.out 2>&1 $LIGHT_MARK"
+# 省额度汇报 (#v1.6): hourly, and silent unless a human is needed or the heartbeat is
+# due. Running it on a schedule means the bot relays whatever is in report.out instead
+# of deciding for itself whether to speak.
+REPORT_MARK="# autoloop-report"
+REPORT_LINE="0 * * * * cd $REPO && $PY $ENGINE --repo $REPO report --if-needed >> $REPO/.autoloop/report.out 2>&1 $REPORT_MARK"
 if [ -n "$MERGE_ON" ]; then
   LINE="*/$EVERY * * * * cd $REPO && $TICK_STAGE; $MERGE_STAGE $MARK"
 else
   LINE="*/$EVERY * * * * cd $REPO && $TICK_STAGE $MARK"
 fi
+LINES="$(printf '%s\n%s\n%s\n' "$LINE" "$LIGHT_LINE" "$REPORT_LINE")"
 
 echo "== AutoLoop wake-up — repo $REPO, every ${EVERY} min"
 if [ -n "$MERGE_ON" ]; then
@@ -104,16 +123,31 @@ else
 fi
 echo ""
 echo "Option 1 (preferred for a reporting bot): Grok Bot native scheduled task"
-echo "  Create a scheduled/recurring task in the bot itself with this prompt text —"
-echo "  the bot wakes, runs one tick, and the tick returns immediately because the"
-echo "  workers it launched are detached processes, not children of its turn:"
+echo "  Three schedules, three prices. Do not collapse them into one: a light check that"
+echo "  costs nothing every 15 minutes, and a tick that costs a fetch + gh every few"
+echo "  minutes, are not the same job."
+echo ""
+echo "  a) 轻检测，每 15 分钟（最便宜，也是真正在省额度的那个）:"
+echo ""
+echo "    cd $REPO && python3 $ENGINE --repo $REPO light"
+echo ""
+echo "     健康时它什么都不打印 —— 所以 bot 可以直接把「有输出」当成「需要你处理」。"
+echo "     连续 caps.anomaly_gate(默认 3) 次异常它会停掉 worker 并终止任务，避免额度空耗。"
+echo ""
+echo "  b) 业务 tick，每 5-10 分钟（贵的那趟）:"
 echo ""
 echo "    cd $REPO && python3 $ENGINE --repo $REPO tick"
-echo "    (no --quiet here: the report on stdout is what you read and relay — one footer line."
-echo "    if it reports cap/halt/maintenance, say so; otherwise keep it to that one line.)"
+echo ""
+echo "  c) 汇报，每小时（成功静默）:"
+echo ""
+echo "    cd $REPO && python3 $ENGINE --repo $REPO report --if-needed"
+echo ""
+echo "     一切正常时它只打印到点的那一行心跳，有异常立刻出完整巡检；把它的输出原样转给用户即可。"
+echo "     (no --quiet here: the report on stdout is what you read and relay — one footer line."
+echo "     if it reports cap/halt/maintenance, say so; otherwise keep it to that one line.)"
 if [ -n "$MERGE_ON" ]; then
   echo ""
-  echo "    合并线已开，同一个周期里再按顺序跑这两条（review 只读、merge 只合 auto_merge_ok 的）："
+  echo "    合并线已开，在 b) 之后按顺序再跑这两条（review 只读、merge 只合 auto_merge_ok 的）："
   echo "    cd $REPO && python3 $ENGINE --repo $REPO review --json"
   echo "    cd $REPO && python3 $ENGINE --repo $REPO merge --yes-i-will-merge --now --json"
   echo "    单批上限是 caps.review_batch_max（默认 5）：review 每轮最多给这么多条 PR 出结论，"
@@ -142,10 +176,19 @@ if [ -n "$MERGE_ON" ]; then
   echo "  合并仍然要 Option 1 或 3 那条低频调度来跑。"
 fi
 echo ""
+echo "  轻检测（light，每 15 分钟）与每小时汇报（report --if-needed）不在这条前台循环里："
+echo "  watch 只跑 tick。要那两层就按 Option 1 或 3 单独调度 —— 它们很便宜、成功静默，"
+echo "  不配也不会坏，只是少了「15 分钟内发现卡死」和「每小时一次心跳」这两层。"
+echo ""
 echo "Option 3: box crontab"
 echo "  $LINE"
-echo "  --quiet is deliberate here: the full report goes to $REPO/.autoloop/log/<day>.md"
+echo "  $LIGHT_LINE"
+echo "  $REPORT_LINE"
+echo "  --quiet is deliberate on the tick: the full report goes to $REPO/.autoloop/log/<day>.md"
 echo "  anyway, and cron.out then only holds errors worth reading."
+echo "  轻检测每 15 分钟一次，健康时什么都不打印（light.out 空着就说明一切正常）；"
+echo "  report --if-needed 每小时一次，同样成功静默 —— 两者合起来才是「成功则无需汇报，"
+echo "  每小时汇报一次」：bot 不用为了知道好不好而去跑那趟昂贵的 tick。"
 if [ -n "$MERGE_ON" ]; then
   echo "  合并两条的输出在 $REPO/.autoloop/merge.out —— 那是能被读回、被 grep 的 JSON，"
   echo "  不是终端上滚过去的散文。合并结论同时写进 .autoloop/merge.json 和 events.jsonl。"
@@ -168,7 +211,8 @@ fi
 echo ""
 
 CUR="$(crontab -l 2>/dev/null || true)"
-CLEAN="$(printf '%s\n' "$CUR" | grep -v -e "$MARK" -e 'autoloop.py .*tick' || true)"
+CLEAN="$(printf '%s\n' "$CUR" | grep -v -e "$MARK" -e "$LIGHT_MARK" -e "$REPORT_MARK" \
+  -e 'autoloop.py .*tick' -e 'autoloop.py .*light' -e 'autoloop.py .*report' || true)"
 
 case "$ACTION" in
   remove)
@@ -188,11 +232,11 @@ case "$ACTION" in
     ;;
 esac
 
-if printf '%s\n' "$CLEAN" "$LINE" | sed '/^$/d' | crontab - 2>/dev/null; then
+if printf '%s\n' "$CLEAN" "$LINES" | sed '/^$/d' | crontab - 2>/dev/null; then
   BACK="$(crontab -l 2>/dev/null || true)"
   if printf '%s' "$BACK" | grep -q "$MARK"; then
     echo "PASS: crontab now contains the tick line (verified by reading it back):"
-    printf '%s\n' "$BACK" | grep "$MARK"
+    printf '%s\n' "$BACK" | grep -e "$MARK" -e "$LIGHT_MARK" -e "$REPORT_MARK"
   else
     echo "FAIL: crontab command returned 0 but the line is not readable back."
   fi

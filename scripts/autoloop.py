@@ -18,9 +18,9 @@ All recoverable state lives in `.autoloop/` on the box, so any fresh agent
 instance resumes from `status` / `tick` with no chat history.
 
 Stdlib only. Subcommands:
-  doctor init tick status plan dispatch reap verify prbody pr suggest report
+  doctor init start tick status plan dispatch reap verify prbody pr suggest report
   approve reject queue budget sync stop go halt resume recover backup ref
-  watch round preflight timeline review merge
+  watch light round preflight timeline review merge watchdog alerts metrics lifecycle
 """
 
 import argparse
@@ -37,7 +37,7 @@ import sys
 import time
 from datetime import datetime
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 ALO_DIR = ".autoloop"
 
 DEFAULT_CAPS = {
@@ -85,6 +85,19 @@ DEFAULT_CAPS = {
     "backoff_max_s": 900,           # ceiling on a backed-off tick interval
     "alert_cooldown_min": 30,       # one ongoing problem = one open alert, not one per run
     "report_interval_s": 7200,      # delta report cadence; local generation only
+    # 轻检测 (#v1.6). The cheap, frequent half of supervision: `light` looks at the
+    # workers it can already see on disk and costs nothing, so it runs every 15 minutes
+    # between the hourly reports. Three knobs, three questions: how often to look, how
+    # many *consecutive* bad looks mean the task is not going to recover, and how many
+    # automatic recoveries one task gets before that.
+    "light_interval_s": 900,        # 15 minutes: cheap liveness/progress look, no model
+    "anomaly_gate": 3,              # 3 consecutive anomalies -> terminate the task
+    "light_max_recoveries": 3,      # per-task auto-recoveries before giving up
+    # 汇报节流 (#v1.6). A supervisor that reports every cycle spends the bot's quota on
+    # "nothing happened". So the default is: silence when everything is fine, and one
+    # report an hour — plus an immediate report the moment something needs a human.
+    "report_quiet_on_success": True,  # a healthy loop prints nothing between reports
+    "report_hourly_s": 3600,        # heartbeat report cadence when the loop is healthy
     # `same_error_gate` / `error_retry_base_s` / `progress_stale_s` are already above;
     # a dict literal silently keeps the last duplicate, so re-listing them here would
     # look like a fifth tuning knob and actually be two places to change.
@@ -531,6 +544,7 @@ class Ctx:
         st.setdefault("failure_signatures", {})
         st.setdefault("issue_state", {})
         st.setdefault("last_report_digest", "")
+        st.setdefault("last_quiet_report_at", 0)
         st.setdefault("grok_calls_today", 0)
         # Set when the no-progress streak passed its gate but maintenance mode was
         # already handling the same broken gate, so the harder breaker stayed shut.
@@ -555,6 +569,7 @@ class Ctx:
                 "slots": {s: None for s in SLOTS},
                 "pending_pr": [], "gh_cooldown_until": 0,
                 "failure_signatures": {}, "issue_state": {}, "last_report_digest": "",
+                "last_quiet_report_at": 0,
                 "grok_calls_today": 0,
                 "idle_reason": None, "maintenance": False, "breakers": {},
                 "no_progress_deferred": False, "same_error_deferred": False,
@@ -2292,7 +2307,10 @@ def cmd_tick(args):
         sync_prs(ctx, lines)
         recover_slots(ctx, lines)
 
-        # 5. reap running jobs → verify
+        # 5. reap running jobs → verify. Before that, honour any terminate request the
+        # lock-free `light` check recorded: a task it has already given up on must not
+        # get one more repair round out of this tick.
+        consume_light_terminations(ctx, lines)
         for slot in SLOTS:
             rec = st["slots"].get(slot)
             if not rec:
@@ -3027,7 +3045,59 @@ def cmd_status(args):
     return 0
 
 
+def report_gate(ctx):
+    """Should this cycle produce a report at all? (due, reason, age_s)
+
+    The supervisor's own quota is the scarcest thing on the box, and the most common
+    way to waste it is to say 「一切正常」 every few minutes. So the rule is inverted
+    from the naive one: a healthy loop is *silent*, and speaks only when (a) something
+    needs a human, or (b) the hourly heartbeat is due. That is 「成功则无需汇报，只需
+    每小时汇报一次」 expressed as one predicate both `report --if-needed` and any
+    driver can call.
+
+    Pure: reads state and caps, changes nothing, so it is safe to call from a tick, a
+    cron driver, or a test without side effects.
+    """
+    st = ctx.state or {}
+    c = st.get("counters", {}) or {}
+    interval = int(ctx.cap("report_hourly_s"))
+    last = int(st.get("last_quiet_report_at") or 0)
+    age = int(now() - last) if last else None
+    if anomalies_of(ctx):
+        return True, "needs_human", age
+    if not ctx.cap("report_quiet_on_success"):
+        return True, "quiet_disabled", age
+    if c.get("idle_ticks"):
+        return True, "idle", age
+    if last and age is not None and age < interval:
+        return False, "fresh", age
+    return True, "hourly", age
+
+
 def cmd_report(args):
+    if getattr(args, "if_needed", False):
+        ctx = Ctx(args.repo)
+        ctx.need_init()
+        ctx.state = read_json(ctx.state_path) or ctx.state
+        ctx.ensure_state()
+        due, reason, age = report_gate(ctx)
+        if not due:
+            if getattr(args, "json", False):
+                log(json.dumps({"due": False, "reason": reason, "age_s": age,
+                                "interval_s": ctx.cap("report_hourly_s")},
+                               ensure_ascii=False))
+            return 0
+        body = patrol_text(ctx) if getattr(args, "patrol", False) else report_text(ctx)
+        ctx.state["last_quiet_report_at"] = now()
+        ctx.save()
+        ctx.event("loop", "report_emitted", reason=reason, age_s=age)
+        if getattr(args, "json", False):
+            log(json.dumps({"due": True, "reason": reason, "age_s": age,
+                            "interval_s": ctx.cap("report_hourly_s"), "report": body},
+                           ensure_ascii=False, indent=2))
+            return 0
+        log(body)
+        return 0
     if getattr(args, "patrol", False):
         ctx = Ctx(args.repo)
         ctx.need_init()
@@ -4689,6 +4759,147 @@ def cmd_preflight(args):
     return 0 if not bad else 3
 
 
+# ------------------------------------------------------------ start wizard (#v1.6)
+#
+# 「开一 bot，把插件 GitHub 和项目 GitHub 直接丢给它，就直接能用」. The wizard is that
+# sentence as one command. It does the mechanical parts itself — clone the plugin,
+# clone the project, install the skill, bootstrap, init, preflight — and then asks the
+# *whole* set of questions it needs in one printed block, so the bot relays them once
+# and the user answers once. Nothing here is interactive on purpose: an onboarding that
+# blocks on stdin cannot be run by a bot that has no terminal.
+
+REPO_URL_RE = re.compile(r"^(?:https?://|git@)[^\s]+$")
+
+
+def repo_dir_name(url):
+    """`https://github.com/owner/name.git` and `git@github.com:owner/name.git` → `name`."""
+    tail = re.sub(r"\.git$", "", str(url or "").rstrip("/"))
+    tail = tail.rsplit("/", 1)[-1] if "/" in tail else tail.rsplit(":", 1)[-1]
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", tail) or "repo"
+
+
+def cmd_start(args):
+    """One-shot onboarding: two URLs in, a ready-to-run loop out.
+
+    Idempotent and non-destructive: an existing clone or `.autoloop/` is reused, never
+    overwritten. Everything that needs a human decision — which worker CLI, the real
+    test command, whether the merge line is on — is collected into one 「请回答」 block
+    printed at the end, because the bot should ask once, not drip-feed questions across
+    a dozen turns.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    plugin_dir = os.path.dirname(here)
+    base = os.path.abspath(os.path.expanduser(args.dir or os.getcwd()))
+    notes, questions = [], []
+    steps = []
+
+    plugin_url = getattr(args, "plugin_url", None)
+    repo_url = getattr(args, "repo_url", None)
+    if repo_url and not REPO_URL_RE.match(str(repo_url)):
+        # A bare path is a perfectly good "project repo" — treat it as one rather than
+        # rejecting the most common local case.
+        repo_url = None
+        if not getattr(args, "project", None):
+            args.project = getattr(args, "repo_url", None)
+
+    os.makedirs(base, exist_ok=True)
+
+    # 1. plugin: clone it if the caller handed us a URL, else use this checkout.
+    if plugin_url:
+        dest = os.path.join(base, repo_dir_name(plugin_url))
+        if os.path.isdir(os.path.join(dest, ".git")):
+            steps.append("- 插件仓库已存在，复用：%s" % dest)
+        else:
+            rc, out, err = run("git clone --depth 1 %s %s"
+                               % (shlex.quote(plugin_url), shlex.quote(dest)),
+                               cwd=base, timeout=300, shell=True)
+            if rc != 0:
+                log("clone 插件失败：%s" % ((err or out)[:300]))
+                return 2
+            steps.append("- 插件仓库已 clone：%s" % dest)
+        plugin_dir = dest
+
+    # 2. project: same rule. A local path is used as-is. `--project` is the explicit
+    #    name so it cannot collide with the global `--repo` (which names the plugin
+    #    checkout when the bot runs this engine from a skill directory).
+    target = getattr(args, "project", None) or args.repo
+    if repo_url and not target:
+        dest = os.path.join(base, repo_dir_name(repo_url))
+        if os.path.isdir(os.path.join(dest, ".git")):
+            steps.append("- 项目仓库已存在，复用：%s" % dest)
+        else:
+            rc, out, err = run("git clone %s %s"
+                               % (shlex.quote(repo_url), shlex.quote(dest)),
+                               cwd=base, timeout=600, shell=True)
+            if rc != 0:
+                log("clone 项目失败：%s" % ((err or out)[:300]))
+                return 2
+            steps.append("- 项目仓库已 clone：%s" % dest)
+        target = dest
+    if not target:
+        questions.append("项目仓库地址（GitHub URL 或本机路径）—— 循环要有一个真实仓库才动得起来")
+    root = Ctx._find_root(target) if target else None
+    if target and not root:
+        questions.append("项目仓库 %s 不是 git 仓库：git init 或换一个地址" % target)
+
+    # 3. install the skill + bootstrap + init, reusing bootstrap.sh so there is one
+    #    install path, not two that can drift.
+    boot = os.path.join(plugin_dir, "bootstrap.sh")
+    if root and os.path.exists(boot):
+        env = dict(os.environ)
+        env["AUTOLOOP_SKILLS_DIR"] = (getattr(args, "skills_dir", None)
+                                     or env.get("AUTOLOOP_SKILLS_DIR")
+                                     or env.get("DSH_SKILLS") or os.path.expanduser("~/.dsh/skills"))
+        if getattr(args, "test_cmd", None):
+            env["AUTOLOOP_TEST_CMD"] = args.test_cmd
+        rc, out, err = run("bash %s --repo %s" % (shlex.quote(boot), shlex.quote(root)),
+                           cwd=root, env=env, timeout=600, shell=True)
+        steps.append("- bootstrap %s（rc=%s）" % ("完成" if rc == 0 else "有缺口", rc))
+        if rc != 0:
+            notes.append("bootstrap 报了缺口 —— 上面 [缺]/[!!] 那几行就是需要你处理的项")
+    elif not os.path.exists(boot):
+        notes.append("找不到 bootstrap.sh（插件目录 %s 不完整）" % plugin_dir)
+
+    # 4. the questions only a human can answer. Everything else has a safe default.
+    if root:
+        ctx = Ctx(root)
+        det = (read_json(os.path.join(ctx.alo, "config.json"), {}) or {}).get("verify", {}) or {}
+        if not (det.get("test") or getattr(args, "test_cmd", None)):
+            questions.append("这个仓库真实的测试命令是什么（闸门；不填则每个 diff 永远是红的）")
+        if not (ctx.cfg.get("runner", {}) or {}).get("cmd"):
+            questions.append("用哪个 worker CLI 写码（如 `dsh --profile headless --json < {prompt_file}`）")
+        if not ctx.cap("merge_enabled"):
+            questions.append("产出停在分支+PR 等你早上合，还是 `init --auto-merge` 让夜里自己合？")
+        if not has_origin(ctx):
+            questions.append("origin 远端（循环以 branch+PR 交付，没有 origin 会停在起步）")
+
+    lines = ["# AutoLoop start %s" % stamp(), ""]
+    if steps:
+        lines += ["已完成："] + steps + [""]
+    if notes:
+        lines += ["注意："] + ["- " + n for n in notes] + [""]
+    if questions:
+        lines += ["请一次回答这几个问题（其余都有安全默认值）："]
+        lines += ["%d. %s" % (i + 1, q) for i, q in enumerate(questions)]
+    else:
+        lines.append("没有待回答问题 —— 直接进下一步。")
+    lines.append("")
+    lines.append("下一步（把这些命令交给 bot 跑，不需要你敲）：")
+    if root:
+        eng = os.path.join(plugin_dir, "scripts", "autoloop.py")
+        lines += [
+            "  python3 %s --repo %s suggest" % (eng, root),
+            "  python3 %s --repo %s watch --minutes 240   # 或定时任务：tick + light + report --if-needed" % (eng, root),
+        ]
+    if args.json:
+        log(json.dumps({"at": stamp(), "engine": VERSION, "plugin_dir": plugin_dir,
+                        "repo": root or target or "", "steps": steps, "notes": notes,
+                        "questions": questions}, ensure_ascii=False, indent=2))
+        return 0
+    log("\n".join(lines))
+    return 0
+
+
 def cmd_watch(args):
     """Foreground supervisor loop: ticks every `--interval` seconds so a worker that
     declares 完成 gets its session closed and delivered inside about a minute,
@@ -4744,6 +4955,344 @@ def cmd_watch(args):
         while left > 0:
             time.sleep(min(2, left))
             left -= 2
+
+
+# ----------------------------------------------------------- light checks (#v1.6)
+#
+# The cheap half of supervision. A tick is the full cycle: git fetch, gh, gate runs,
+# dispatch — expensive, and pointless to run every few minutes on a box that is only
+# waiting for a worker to type. `light` is the other half: every 15 minutes it looks
+# only at the workers already on this disk and answers one question — *is the work in
+# flight actually moving*. It runs between ticks, on its own schedule.
+#
+# Three rules make it safe to run so often:
+#   * it never runs git and never calls gh — only `os.stat`, `kill -0`, and a tail
+#     read of a log file that is already local, so it costs nothing and cannot hit a
+#     rate limit or a network that is down;
+#   * it never takes loop.lock — a health check that queues behind the wedged tick it
+#     is supposed to notice is not a health check (same reason `watchdog` skips it);
+#   * it writes its own file (`light.json`) and the append-only event/alert logs, never
+#     `state.json`. Only `tick` owns that file. A lock-free writer of shared state is
+#     how two processes quietly lose each other's writes.
+#
+# 成功静默: a healthy look prints nothing and exits 0. The bot's quota is spent on the
+# hourly report and on problems, not on 「一切正常」 six times an hour.
+#
+# 连续三次异常即终止: an anomaly is one bad look, and a single bad look is often a
+# worker that is merely thinking. But three *consecutive* bad looks at 15-minute
+# spacing means 45 minutes with no forward motion, and the honest answer is to stop
+# the task rather than let it chew the nightly budget. `light` stops the worker
+# immediately (that is the recovery — no more tokens burn) and records a terminate
+# request; the next tick blocks the task with the recorded root cause instead of
+# dispatching another repair round.
+
+LIGHT_FINDING_KINDS = ("worker_dead", "worker_silent", "worker_overdue", "progress_stale")
+
+
+def light_state(ctx):
+    """`light`'s own record: last run, per-task consecutive-anomaly streaks."""
+    rec = read_json(os.path.join(ctx.alo, "light.json"), {}) or {}
+    rec.setdefault("runs", 0)
+    rec.setdefault("slots", {})
+    rec.setdefault("findings", [])
+    return rec
+
+
+def light_streak_key(rec):
+    """A task is identified by its branch, not its slot: a repair round re-uses the
+    slot, and a streak that followed the slot would reset exactly when the loop is
+    about to try the same broken thing again."""
+    return rec.get("branch") or rec.get("task") or "-"
+
+
+def light_findings(ctx, act=True):
+    """Look at every active worker with the cheapest possible probes.
+
+    Returns (findings, acted). Every finding carries severity/kind/title/detail/action
+    plus slot/task/branch, so one list drives the exit code, the text, the JSON, the
+    alert and the terminate decision without four versions of the truth.
+    """
+    st = ctx.state or {}
+    findings, acted = [], []
+    stall_cap = int(ctx.cap("stall_s"))
+    timeout_cap = int(ctx.cap("job_timeout_s"))
+    stale_cap = int(ctx.cap("progress_stale_s"))
+
+    def add(severity, kind, slot, rec, title, detail, action, **extra):
+        row = {"severity": severity, "kind": kind, "slot": slot,
+               "task": rec.get("task"), "branch": rec.get("branch"),
+               "title": title, "detail": detail, "action": action}
+        row.update(extra)
+        findings.append(row)
+        return row
+
+    for slot in SLOTS:
+        rec = (st.get("slots") or {}).get(slot) or {}
+        if rec.get("state") not in ACTIVE_STATES or not rec.get("job"):
+            continue
+        meta = read_json(os.path.join(ctx.job_dir, rec["job"] + ".json")) or {}
+        pid = int(meta.get("pid") or 0)
+        alive = bool(pid) and pid_alive(pid)
+        has_exit = bool(meta.get("exit_file")) and os.path.exists(meta["exit_file"])
+        age = int(now() - float(meta.get("started") or now()))
+        size, quiet = log_activity(meta)
+        quiet = int(quiet)
+        ahead = rec.get("ahead") or 0
+
+        if not alive and not has_exit and age <= timeout_cap:
+            # Process gone, no exit code written: the run died without reporting. The
+            # next tick would catch this, but up to a full interval later — light
+            # catches it at 15 minutes and frees the slot sooner.
+            add("critical", "worker_dead", slot, rec,
+                "slot %s 的 worker 进程已消失且没写退出码" % slot,
+                "pid %s 不在，%s.exit 也不存在；它不会自己回来了" % (pid or "-", rec.get("job")),
+                "下一次 tick 会把它按 dead 处理并进入修复/阻塞；无需人工动作")
+            continue
+        if not alive:
+            continue      # exited (exit file present) or past timeout: the tick's job
+        if age > timeout_cap:
+            add("critical", "worker_overdue", slot, rec,
+                "slot %s 的 worker 跑了 %ss，超过 job_timeout_s %ss" % (slot, age, timeout_cap),
+                "还在写日志，所以 stall 闸门不判它，但按配置它早该被停下来了",
+                "light 已停掉它；下一次 tick 按超时进入修复或阻塞",
+                pid=pid, age_s=age, quiet_s=quiet)
+            if act:
+                killed = stop_job(meta)
+                acted.append({"slot": slot, "pid": pid, "stopped": bool(killed),
+                              "kind": "worker_overdue", "task": rec.get("task")})
+                ctx.event("light", "light_stopped_job", task=rec.get("task"), slot=slot,
+                          op=rec.get("job"), job=rec.get("job"), pid=pid, age_s=age,
+                          anomaly="worker_overdue", killed=bool(killed),
+                          branch=rec.get("branch"))
+            continue
+        if quiet >= stall_cap:
+            add("critical", "worker_silent", slot, rec,
+                "slot %s 的 worker 静默 %ss（阈值 %ss）" % (slot, quiet, stall_cap),
+                "进程还在、日志不写、没有提交：多半在等一个没人答的审批，或在重试里打转",
+                "light 已停掉它；下一次 tick 会停会话并按 stall 进入修复",
+                pid=pid, quiet_s=quiet, age_s=age, log_bytes=size)
+            if act:
+                killed = stop_job(meta)
+                acted.append({"slot": slot, "pid": pid, "stopped": bool(killed),
+                              "kind": "worker_silent", "task": rec.get("task")})
+                ctx.event("light", "light_stopped_job", task=rec.get("task"), slot=slot,
+                          op=rec.get("job"), job=rec.get("job"), pid=pid, quiet_s=quiet,
+                          anomaly="worker_silent", killed=bool(killed),
+                          branch=rec.get("branch"))
+            continue
+        # Still typing, so not dead — but is it *moving*? The recorded token only
+        # advances on a real commit or a gate-state change (progress_snapshot), so
+        # this catches a worker that logs steadily while its diff never grows.
+        last_real = int(rec.get("last_real_progress_at") or 0)
+        if last_real and now() - last_real >= stale_cap:
+            add("warn", "progress_stale", slot, rec,
+                "slot %s 已 %ss 没有真实进展（阈值 %ss）"
+                % (slot, int(now() - last_real), stale_cap),
+                "日志在写但没有新提交、闸门状态也没变；%s 个提交在分支上"
+                % ahead,
+                "不杀它（可能只是在长思考）：连续 %s 次都这样 light 会终止这个任务"
+                % ctx.cap("anomaly_gate"),
+                stale_s=int(now() - last_real), commits=ahead, quiet_s=quiet)
+    return findings, acted
+
+
+def light_terminations(ctx, lrec, findings):
+    """Fold this look's findings into per-task streaks and decide what to terminate.
+
+    A task's streak advances on any look that found *something* wrong with it and
+    resets to zero on a clean look. At `anomaly_gate` consecutive bad looks the task
+    is terminated: its worker is already stopped (recovery happened on each look), and
+    a terminate request is recorded for the next tick to block the task — with the
+    root cause, not a bare 「blocked」.
+
+    Second, independent route to the same place: `light_max_recoveries`. The streak
+    only counts *consecutive* bad looks, so a task that keeps failing with a good look
+    in between would never reach it while still costing a worker stop each time. That
+    is a quota drain too, so once a task has been auto-stopped more times than the cap
+    it is terminated regardless of the streak — the cap is a per-task total, not a
+    per-episode one.
+    """
+    gate = int(ctx.cap("anomaly_gate"))
+    max_rec = int(ctx.cap("light_max_recoveries"))
+    slots = lrec.setdefault("slots", {})
+    seen_keys = set()
+    terminated = []
+    for f in findings:
+        key = f.get("branch") or f.get("task") or "-"
+        seen_keys.add(key)
+        row = slots.setdefault(key, {"task": f.get("task"), "branch": f.get("branch"),
+                                     "streak": 0, "recoveries": 0,
+                                     "terminate": False})
+        row["task"] = f.get("task") or row.get("task")
+        row["branch"] = f.get("branch") or row.get("branch")
+        row["streak"] = int(row.get("streak") or 0) + 1
+        row["last_kind"] = f.get("kind")
+        row["last_finding"] = (f.get("title") or "")[:200]
+        row["last_detail"] = (f.get("detail") or "")[:400]
+        row["last_seen_at"] = stamp()
+        row["slot"] = f.get("slot")
+        if f.get("kind") in ("worker_silent", "worker_overdue"):
+            row["recoveries"] = int(row.get("recoveries") or 0) + 1
+        # 0 is a real cap ("never auto-recover this task"), not "unlimited" — which is
+        # what `if max_rec` would say, because bool(0) is False.
+        over_rec = max_rec >= 0 and row.get("recoveries", 0) > max_rec
+        if (gate and row["streak"] >= gate or over_rec) and not row.get("terminate"):
+            row["terminate"] = True
+            row["terminated_at"] = stamp()
+            row["terminate_reason"] = ("consecutive %s anomalies (gate %s)"
+                                       % (row.get("streak"), gate)
+                                       if not over_rec else
+                                       "auto-recovered %s times (cap %s) — the task keeps "
+                                       "coming back broken"
+                                       % (row.get("recoveries"), max_rec))
+            terminated.append(row)
+    # A look that found this task healthy clears its streak. Only tasks that were
+    # active this look are touched — an idle task's history is not erased by a look
+    # that never saw it.
+    for slot in SLOTS:
+        rec = (ctx.state.get("slots") or {}).get(slot) or {}
+        if rec.get("state") not in ACTIVE_STATES:
+            continue
+        key = light_streak_key(rec)
+        if key in seen_keys:
+            continue
+        if key in slots:
+            slots[key]["streak"] = 0
+    lrec["slots"] = slots
+    return terminated
+
+
+def consume_light_terminations(ctx, lines):
+    """Turn `light`'s terminate requests into blocks — once, inside the tick that owns
+    state.json.
+
+    `light` runs without the lock, so it cannot write the slot table; it only records
+    the request in `light.json`. Here, holding the lock, the tick performs it: stop the
+    worker if it is somehow still alive, then `_block` the task with light's recorded
+    root cause. Blocking *here*, before `_advance` reaches the slot, is the whole point
+    — otherwise the dead worker would look like an ordinary stall and the loop would
+    spend another repair round (and more quota) on a task light has already given up on.
+    """
+    path = os.path.join(ctx.alo, "light.json")
+    lrec = read_json(path, {}) or {}
+    lslots = lrec.get("slots") or {}
+    if not lslots:
+        return []
+    done = []
+    for slot in SLOTS:
+        rec = ctx.state["slots"].get(slot)
+        if not rec or rec.get("state") not in ACTIVE_STATES:
+            continue
+        row = lslots.get(light_streak_key(rec)) or {}
+        if not row.get("terminate"):
+            continue
+        meta = read_json(os.path.join(ctx.job_dir, rec["job"] + ".json")) if rec.get("job") else None
+        if meta:
+            stop_job(meta)
+        reason = ("轻检测连续 %s 次异常（%s）已终止任务：%s。worker 已停，不再派修复轮"
+                  % (row.get("streak"), row.get("last_kind"),
+                     str(row.get("last_detail") or row.get("last_finding") or "")[:300]))
+        _block(ctx, rec, reason)
+        lines.append("- slot %s: 轻检测终止 %s（连续 %s 次异常）→ blocked，跳过修复轮"
+                     % (slot, rec.get("task"), row.get("streak")))
+        row["terminate"] = False
+        row["consumed_at"] = stamp()
+        done.append({"slot": slot, "task": rec.get("task"), "streak": row.get("streak")})
+    if done:
+        write_json(path, lrec)
+    return done
+
+
+def cmd_light(args):
+    """15-minute cheap look at the workers in flight; silent when healthy.
+
+    Exit code is the contract: 0 healthy (and *nothing is printed*), 3 a warning worth
+    reading, 4 something wrong now. 成功则无需汇报 — a cron/bot driver can run this
+    every 15 minutes and only forward the output when there is output.
+    """
+    ctx = Ctx(args.repo)
+    ctx.need_init()
+    ctx.state = read_json(ctx.state_path) or ctx.state
+    ctx.ensure_state()
+    act = not getattr(args, "no_act", False)
+    findings, acted = light_findings(ctx, act=act)
+    findings = scrub_secrets(findings) or []
+    lrec = light_state(ctx)
+    terminated = light_terminations(ctx, lrec, findings)
+    lrec["runs"] = int(lrec.get("runs") or 0) + 1
+    lrec["last_run_epoch"] = now()
+    lrec["last_run_at"] = stamp()
+    lrec["interval_s"] = ctx.cap("light_interval_s")
+    lrec["anomaly_gate"] = ctx.cap("anomaly_gate")
+    lrec["last_counts"] = dict((s, len([f for f in findings if f.get("severity") == s]))
+                               for s in ALERT_SEVERITIES)
+    lrec["findings"] = [dict(f, at=stamp()) for f in findings][-20:]
+    write_json(os.path.join(ctx.alo, "light.json"), lrec)
+
+    counts = lrec["last_counts"]
+    rc = 4 if counts["critical"] else (3 if counts["warn"] else 0)
+
+    # Only findings that need a human become alerts; the loop already told itself
+    # everything else through events. Terminations are always critical.
+    for f in findings:
+        sev = f.get("severity")
+        if sev == "info":
+            continue
+        dedupe = "light:%s%s" % (f.get("kind"), (":" + str(f.get("slot"))) if f.get("slot") else "")
+        ctx.alert(sev, "light_" + str(f.get("kind")), f.get("title") or f.get("kind"),
+                  detail=f.get("detail", ""), action=f.get("action", ""), dedupe=dedupe,
+                  slot=f.get("slot"), task=f.get("task"), branch=f.get("branch"))
+    for row in terminated:
+        ctx.alert("critical", "light_terminate",
+                  "轻检测终止任务：%s（%s）" % (row.get("task"),
+                                          row.get("terminate_reason") or "异常"),
+                  detail="%s（最后异常：%s）" % (row.get("last_detail"), row.get("last_kind")),
+                  action="worker 已停；下一次 tick 会把该任务写进 blocked.json，"
+                         "换思路或人工处理后用 `go`/`resume` 放行",
+                  dedupe="light:terminate:%s" % (row.get("branch") or row.get("task")),
+                  task=row.get("task"), branch=row.get("branch"))
+        ctx.event("light", "light_terminate", task=row.get("task"),
+                  branch=row.get("branch"), slot=row.get("slot"),
+                  streak=row.get("streak"), gate=ctx.cap("anomaly_gate"),
+                  recoveries=row.get("recoveries"),
+                  reason=row.get("terminate_reason"),
+                  anomaly=row.get("last_kind"), detail=(row.get("last_detail") or "")[:400])
+
+    # The event stream records every look that found something (a clean look stays
+    # silent: one line per 15 minutes forever would bury the lines that matter).
+    if findings:
+        ctx.event("light", "light_findings", counts=counts,
+                  kinds=[f.get("kind") for f in findings],
+                  tasks=[f.get("task") for f in findings],
+                  terminated=[r.get("task") for r in terminated],
+                  acted=acted)
+
+    if args.json:
+        log(json.dumps({"at": stamp(), "engine": VERSION, "repo": ctx.remote_name(),
+                        "healthy": rc == 0, "exit": rc, "counts": counts,
+                        "findings": findings, "acted": acted,
+                        "terminated": terminated,
+                        "interval_s": ctx.cap("light_interval_s"),
+                        "anomaly_gate": ctx.cap("anomaly_gate"),
+                        "heartbeat": lrec}, ensure_ascii=False, indent=2))
+        return rc
+    if rc == 0:
+        # 成功静默. Nothing to say is the whole point; say nothing.
+        return 0
+    log("light %s｜%s｜critical %s warn %s｜退出码 %s"
+        % (stamp(), ctx.remote_name(), counts["critical"], counts["warn"], rc))
+    for f in findings:
+        log("- [%s] %s：%s" % (f.get("severity"), f.get("kind"), f.get("title")))
+        if f.get("detail"):
+            log("      %s" % str(f["detail"])[:300])
+        if f.get("action"):
+            log("      下一步：%s" % f["action"])
+    for a in acted:
+        log("- 已恢复：停掉 slot %s 的 pid %s（%s）" % (a.get("slot"), a.get("pid"), a.get("kind")))
+    for row in terminated:
+        log("- 终止任务：%s（连续 %s 次异常）—— 下一次 tick 写进 blocked.json"
+            % (row.get("task"), row.get("streak")))
+    return rc
 
 
 # ------------------------------------------------------- PR review (script-only)
@@ -5746,6 +6295,11 @@ def build_parser():
                             "help": "发送方成功投递后标记，防止重启后重复发送"}),
         (("--force",), {"action": "store_true",
                         "help": "无视 report_interval_s 立即生成报告"}),
+        (("--if-needed",), {"action": "store_true",
+                            "help": "成功静默：只有需要人处理或到每小时心跳点才输出，"
+                                    "否则什么都不打印并 rc0（省额度）"}),
+        (("--json",), {"action": "store_true",
+                       "help": "配合 --if-needed：机器可读的 due/reason/report"}),
         (("--patrol",), {"action": "store_true",
                          "help": "§七 的定时巡检/异常告警模板，用真实状态填好"}))
     add("watch", cmd_watch, "foreground loop: tick every 60s so a finished worker is "
@@ -5765,6 +6319,21 @@ def build_parser():
     add("preflight", cmd_preflight,
         "开循环前的只读体检：git 身份/ssh/gh auth/origin/worker CLI/技能安装，缺什么给什么命令",
         (("--json",), {"action": "store_true"}))
+    add("start", cmd_start,
+        "一次性启动向导：丢给它「插件 GitHub + 项目 GitHub」就装好并只问几个问题",
+        (("--plugin-url",), {"metavar": "URL",
+                             "help": "插件仓库地址（不给则用当前这份 checkout）"}),
+        (("--repo-url",), {"metavar": "URL",
+                           "help": "项目仓库地址（GitHub URL；本机路径用 --project）"}),
+        (("--project",), {"metavar": "PATH",
+                          "help": "目标项目仓库（本机路径）；与全局 --repo 分开，"
+                                  "因为 --repo 在云机上指的是插件 checkout"}),
+        (("--dir",), {"metavar": "DIR",
+                      "help": "clone 落地目录（默认当前目录）"}),
+        (("--skills-dir",), {"metavar": "DIR", "help": "技能安装目录"}),
+        (("--test-cmd",), {"metavar": "CMD", "help": "项目真实测试命令（闸门）"}),
+        (("--json",), {"action": "store_true",
+                       "help": "机器可读：steps/notes/questions"}))
     add("plan", cmd_plan, "print the task the scheduler would pick next")
     add("dispatch", cmd_dispatch, "start a specific task in a slot",
         (("task",), {"nargs": "?"}), (("--slot",), {}), (("--title",), {}),
@@ -5810,6 +6379,12 @@ def build_parser():
         (("--json",), {"action": "store_true", "help": "机器可读 findings，rc 0=正常 3=warn 4=critical"}),
         (("--act",), {"action": "store_true",
                       "help": "允许停掉一个能证明已静默的 worker（除此之外只读）"}))
+    add("light", cmd_light, "15 分钟一次的廉价轻检测：只看在跑的 worker，健康则静默 rc0；"
+                            "异常则停 worker 恢复并记根因，连续 caps.anomaly_gate 次即终止任务",
+        (("--json",), {"action": "store_true",
+                       "help": "机器可读 findings，rc 0=健康（无输出）3=warn 4=critical"}),
+        (("--no-act",), {"action": "store_true",
+                         "help": "只观察不停进程（默认会停掉已判死的 worker 作为恢复动作）"}))
     add("alerts", cmd_alerts, "结构化告警：读/确认 alerts.jsonl（同一个问题折叠成一条）",
         (("--json",), {"action": "store_true", "help": "机器可读的未确认告警列表"}),
         (("--severity",), {"choices": sorted(ALERT_SEVERITIES),
