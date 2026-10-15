@@ -99,10 +99,19 @@ FORBIDDEN_GLOBS = [
     "package.json", "pyproject.toml", "requirements*.txt", "go.mod", "Gemfile",
     "pom.xml", "build.gradle*", "Cargo.toml", "setup.py", "setup.cfg",
     "migrations/*", "**/migrations/*", "*migration*/*.sql",
-    ".github/workflows/*", ".github/*", "Dockerfile*", "docker-compose*",
+    ".github/workflows/*", ".github/*", "**/.github/*", "Dockerfile*", "docker-compose*",
     ".env*", "*.pem", "*.key", "*.p12", "*.jks", "*secret*", "*credential*",
     "id_rsa*", ".npmrc", ".pypirc", ".netrc",
-    ".autoloop/*", ".autoloop/**/*",
+    # The loop's own control directory is forbidden at any depth, not just at the
+    # root. A worker that creates `vendor/.autoloop/verify.sh` is smuggling in a
+    # second copy of the rules it is judged by (the §四 contract is that the gate
+    # runs from the control copy at the repo root), and a nested `.github/` is a
+    # CI config change wearing a path-scoped task's clothes. `.autoloop/*` only
+    # matches at the root, and `.autoloop/**/*` matches a file *inside* the
+    # directory but never the directory's own entry point, so both of these were
+    # reported clean by `redline_check` — proven by a committed diff, not a
+    # hypothetical. `migrations/` above already uses this `**/` form.
+    ".autoloop/*", ".autoloop/**/*", "**/.autoloop/*", "**/.autoloop/**/*",
 ]
 FORBIDDEN_GLOBS = sorted(set(FORBIDDEN_GLOBS))
 
