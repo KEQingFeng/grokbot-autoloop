@@ -4507,7 +4507,11 @@ def state_record(ctx):
         "插件技能安装及验证状态": {
             "protocol": protocol_path(ctx) or "MISSING",
             "protocol_sha256": (sha256_file(protocol_path(ctx)) if protocol_path(ctx) else "")[:12],
-            "verify.sh_sha256": sha256_file(os.path.join(ctx.alo, "verify.sh"))[:12],
+            # A missing gate script is a suspect state, not a crash: `sha256_file`
+            # returns None for a file that is not there, and `round` exists precisely
+            # to report a control directory we cannot fully trust.
+            "verify.sh_sha256": (sha256_file(os.path.join(ctx.alo, "verify.sh"))
+                                 or "missing")[:12],
             "preflight": read_json(os.path.join(ctx.alo, "preflight.json"), {}) or {},
         },
         "运行中的 Agent 和任务": {
