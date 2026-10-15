@@ -2448,6 +2448,24 @@ def next_action(ctx):
         return "approve or reject %d needs_approval candidates, then tick" % len(pend)
     if not ctx.coll("queue.json") and not ctx.coll("candidates.json"):
         return "pool empty: run `suggest`"
+    # A spent dispatch budget is a stop the engine has already decided on: step 6 of a
+    # tick leaves the slot empty and worker_launch_guard refuses the launch. Promising
+    # 「继续派发」 here is the one thing the footer must not do — the footer is the single
+    # line the supervisor relays (§三 of the skill) and `cap` is one of the words it
+    # escalates on, so the cap has to be visible in it. The turn counter is bumped at
+    # the top of every tick and the guard lets the tick that crosses the line finish
+    # (cap + counted_turn), hence `>` for turns and `>=` for jobs.
+    spent = []
+    counters = st.get("counters", {}) or {}
+    jobs_cap = int(ctx.cap("nightly_max_jobs") or 0)
+    turn_cap = int(ctx.cap("max_turns_per_day") or 0)
+    if int(counters.get("jobs_today", 0) or 0) >= jobs_cap:
+        spent.append("jobs %s/%s" % (counters.get("jobs_today", 0), jobs_cap))
+    if int(counters.get("turns_today", 0) or 0) > turn_cap:
+        spent.append("turns %s/%s" % (counters.get("turns_today", 0), turn_cap))
+    if spent:
+        return ("cap: %s spent — tick still reaps and verifies, but dispatches nothing "
+                "until the day rolls over (`budget --json`)" % "、".join(spent))
     if any((st["slots"].get(s) or {}).get("state") in ACTIVE_STATES for s in SLOTS):
         return "workers running; `watch` or tick again in %ss" % ctx.cap("watch_interval_s")
     got = int(st.get("counters", {}).get("prs_valid_today", 0))
@@ -2856,6 +2874,15 @@ def repair(ctx, rec, slot, pol, lines, failure):
     ctx.state["counters"]["jobs_today"] = ctx.state["counters"].get("jobs_today", 0) + 1
 
 
+# `worker_launch_guard` tokens that mean "a budget or a cadence stopped this tick",
+# not "this box has no worker". The turn cap is the one a tick can still hit (step 6
+# already skips dispatch when the job cap is spent), but the lookup is keyed by token
+# so no caller has to grep a message for the word "worker" to find out why.
+DISPATCH_REFUSAL_IDLE = {"max_turns_per_day": "cap-turns",
+                         "nightly_max_jobs": "cap-jobs",
+                         "parallel limit": "backoff"}
+
+
 def start_task(ctx, task, label, slot, mode, lines):
     tid = task.get("id") or new_task_id(ctx, task.get("title", ""))
     task["id"] = tid
@@ -2890,8 +2917,22 @@ def start_task(ctx, task, label, slot, mode, lines):
         lines.append("- slot %s: cannot dispatch (%s) — nothing pushed" % (slot, lerr))
         git("worktree remove --force %s" % shlex.quote(wt), cwd=ctx.root)
         git("branch -D %s" % shlex.quote(branch), cwd=ctx.root)
-        ctx.state["idle_reason"] = "no-runner" if "worker" in lerr else "dispatch-failed"
-        ctx.state["next"] = "configure runner.cmd, then tick"
+        # Why it refused decides what the operator has to do next, so it is classified
+        # by cause. `no-runner` is the word `init`, SKILL §3/§5, `report --patrol` and
+        # `watchdog` all escalate as an environment gap ("configure runner.cmd", "run
+        # `doctor`"), and it has to mean exactly that — no worker configured. A spent
+        # turn budget used to borrow it (`"worker" in lerr` matched the guard's own
+        # message), so the patrol printed 【异常告警｜循环停摆：no-runner】 and the
+        # watchdog raised `loop_broken` for a CLI that was installed and working, while
+        # the real cause (caps.max_turns_per_day) stayed out of the footer entirely.
+        if not runner_cmd(ctx):
+            ctx.state["idle_reason"] = "no-runner"
+            ctx.state["next"] = "configure runner.cmd, then tick"
+            return
+        why = worker_launch_guard(ctx, replacing_slot=slot,
+                                  counted_turn=getattr(ctx, "_counted_tick", False))
+        ctx.state["idle_reason"] = DISPATCH_REFUSAL_IDLE.get(why) or "dispatch-failed"
+        ctx.state["next"] = "cannot dispatch (%s) — nothing was started" % lerr[:120]
         return
     rec = {"slot": slot, "task": tid, "branch": branch, "title": task.get("title"),
            "paths": task.get("paths") or [], "kind": task.get("kind", "misc"),
