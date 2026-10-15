@@ -1066,15 +1066,15 @@ def changed_files(ctx, wt, base):
 
 def diff_stat(ctx, wt, base):
     rc, out, _ = git("diff --stat %s...HEAD" % base, cwd=wt)
-    lines = 0
-    hit = re.search(r"(\d+) insertions?.*?(\d+) deletions?", out or "")
-    if hit:
-        lines = int(hit.group(1)) + int(hit.group(2))
-    elif out:
-        tail = out.strip().splitlines()
-        if tail and not hit:
-            add = re.search(r"(\d+)\s+", tail[-1])
-            lines = int(add.group(1)) if add else 0
+    # Count insertions and deletions independently, from the summary line only.
+    # The old parser required both phrases on one line, so a pure-addition diff
+    # ("1 file changed, 500 insertions(+)") matched nothing and fell through to a
+    # fallback that read the leading *file count* as the churn: a 500-line
+    # single-file change counted as 1 line and slipped under max_business_lines,
+    # while the risk score that shares this number was understated too.
+    summary = (out or "").strip().splitlines()
+    lines = sum(int(n) for n in re.findall(
+        r"(\d+) (?:insertion|deletion)s?\(", summary[-1] if summary else ""))
     return out or "", lines
 
 
