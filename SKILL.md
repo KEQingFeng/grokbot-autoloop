@@ -2,7 +2,7 @@
 name: grokbot-autoloop
 description: Turn Grok Bot into a 7×24 development supervisor on its own cloud computer — one spoken instruction starts a loop where the bot only plans and judges, headless worker CLIs on that box write the code with their own keys and open their own PR, and everything stops at a branch plus a PR for the human to merge in the morning. Use when the user says 直接开发 xx 项目, 开发 xx 项目, 全天候开发, 自动开发, 开始循环, 挂个循环, 一直开发到早上, 明早看 PR, 监工, or asks to keep developing a repo unattended, or before any multi-hour coding job that would otherwise run inside the bot's own context. Also use to stop, resume, or review such a loop, and use it FIRST for 我要开发个项目 / GitHub 还没连上这类请求 — preflight tells the user exactly what is missing instead of the bot quietly changing their environment.
 metadata:
-  version: "1.3.0"
+  version: "1.4.0"
   supervisor: Grok Bot — plans, monitors, recovers, schedules; never types the diff (§一)
   workers: PI or DeepSeek Harness (dsh) on GrokBot's cloud computer; other headless CLIs remain configurable
   delivery: branch + PR only — the 开发 Agent opens its own PR, the human merges it (§四/§六)
@@ -306,6 +306,9 @@ autoloop.py merge --dry-run      # what the merge line would do; allowed while m
 autoloop.py budget --json        # counters against every cap + the backoff plan
 autoloop.py alerts               # what is open, folded; --ack <id> --note "…" to close
 autoloop.py watchdog --json      # is the loop even alive (rc 0/3/4); from another scheduler
+autoloop.py lifecycle --json     # read-only issue/PR reconciliation from gh (never closes/comments)
+autoloop.py metrics --json       # local load/quality/budget summary; no model call
+autoloop.py report --outbox      # durable pending report in report_outbox.jsonl; --mark-sent <id> after delivery
 ```
 
 `review` and `merge` make **no model call** — they are queue arithmetic over what gh and
@@ -372,6 +375,14 @@ returns without changing anything.
 
 - The bot's own reasoning tokens still come from the bot's plan. What leaves that
   window is file reading, test watching, log paging, and the whole implementation.
+- `lifecycle` only *reports* issue/PR mismatches from read-only gh data; it never
+  closes, reopens, comments, or labels anything. Acting on a mismatch is the
+  supervisor's (or the human's) explicit decision.
+- `report --outbox` writes a pending report locally; it has no sender. Whatever
+  delivers it must call `report --mark-sent <id>` itself, or a restart will not
+  know the delivery happened.
+- `grok_daily_max` caps escalation *records*; it does not create any model client.
+  The default 0 means the engine itself never asks a model anything.
 - `est_tokens` and the counters are volumes, not invoices. The real nightly spend is
   whatever the worker CLIs' own accounts report.
 - Three things cannot be proven from a machine that is not the cloud box: whether `gh`

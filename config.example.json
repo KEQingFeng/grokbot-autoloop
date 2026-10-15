@@ -9,9 +9,7 @@
     "a gate command that does not exist makes every task red, and a headless flag",
     "that does not exist makes every dispatch die. `doctor` probes both."
   ],
-
   "base_branch": "main",
-
   "merge_method": "merge",
   "merge_regression_cmd": "",
   "merge_notes": {
@@ -19,7 +17,6 @@
     "merge_regression_cmd": "Command run in the supervisor checkout *after each* merge (§PR-3「每次合并后运行适当回归」). Empty = no regression, and then the honest result is `pending_verification` — merged, reported as 待验证, never rounded up to success (§PR-6). Point it at something fast, e.g. \"bash tests/run.sh\" or \"python3 -m pytest -q\"; the full gate (.autoloop/verify.sh) also works but runs after every single merge.",
     "safety": "Both of these only matter once caps.merge_enabled is true. The merge line is off by default because PROTOCOL.md §八 says the merge decision is yours: turning it on takes caps.merge_enabled=true *and* --yes-i-will-merge on every invocation. --admin and --force are never passed, a PR that fails the re-read stops the queue behind it, and a red regression is reported (with the base SHA it stopped at) rather than rolled back — the rollback is your decision."
   },
-
   "caps": {
     "max_parallel": 2,
     "pr_max_per_day": 12,
@@ -48,9 +45,13 @@
     "idle_gate": 6,
     "backoff_at": 0.8,
     "backoff_max_s": 900,
-    "alert_cooldown_min": 30
+    "alert_cooldown_min": 30,
+    "progress_stale_s": 900,
+    "same_error_gate": 3,
+    "error_retry_base_s": 60,
+    "report_interval_s": 7200,
+    "grok_daily_max": 0
   },
-
   "caps_notes": {
     "max_parallel": "A/B slots only. 2 is the practical ceiling on one cloud box: two worktrees, two ports, one test database each.",
     "nightly_max_jobs": "Hard stop on the worker's own key. When it is reached the loop stops instead of lowering quality.",
@@ -79,9 +80,13 @@
     "idle_gate": "Consecutive empty ticks ⇒ soft stop: writes STOP, only `go` closes it. The loop saying 「继续 tick 不会产出 PR」 and then ticking again is the loop arguing with itself, and a breaker that closes itself again is a suggestion, not a breaker. Adding a task does *not* resume it: closing a breaker is a human decision.",
     "backoff_at": "Fraction of a daily budget (jobs / turns / PRs) at which the loop slows down instead of running full speed into the hard ceiling: parallel drops to 1 and the tick interval doubles. Backoff never raises a cap — it only spends what is left more slowly. 0 disables it.",
     "backoff_max_s": "Ceiling on a backed-off tick interval, also the ceiling for the idle backoff (base × 2^idle_ticks). Without it an idle night would stretch its own cadence past the point where a finished worker is noticed.",
-    "alert_cooldown_min": "Minutes during which a repeat of the *same* problem (same dedupe_key) folds into the existing alert as `count += 1` instead of opening a new one. An ongoing problem is one open alert, not one per run — otherwise the alert file becomes the noise that made events.jsonl unusable for paging. Set 0 to record every run separately; `alerts --ack` silences an episode, and a recurrence after the cooldown re-opens it."
+    "alert_cooldown_min": "Minutes during which a repeat of the *same* problem (same dedupe_key) folds into the existing alert as `count += 1` instead of opening a new one. An ongoing problem is one open alert, not one per run — otherwise the alert file becomes the noise that made events.jsonl unusable for paging. Set 0 to record every run separately; `alerts --ack` silences an episode, and a recurrence after the cooldown re-opens it.",
+    "progress_stale_s": "真实进展阈值：commit 数或闸门结果没有变化超过这个秒数就判定无效循环（默认 900 秒 = 15 分钟）；日志行数不算进展",
+    "same_error_gate": "同一签名验收失败连续出现到这个次数就触发 same_error 熔断（HALTED，`resume` 合闸）；签名把数字与 SHA 归一化，行号抖动不算新错误",
+    "error_retry_base_s": "修复轮退避基数：第 n 次修复前延迟 base×2^(n-1) 秒、封顶 900；退避只是慢，不丢未提交代码",
+    "report_interval_s": "增量报告最小间隔（默认 7200 = 2 小时）。报告只落 report_outbox.jsonl，状态 pending；发送方成功投递后用 `report --mark-sent <id>` 标记，重启后不会重复发",
+    "grok_daily_max": "升级给监工模型的每日最大请求数；默认 0 = 全程零模型调用。>0 时也只有 critical 告警且同题未问过才允许一次，并把次数记进 counters.grok_calls_today"
   },
-
   "delivery": {
     "owner": "worker",
     "notes": {
@@ -90,7 +95,6 @@
       "switch": "AUTOLOOP_DELIVERY_OWNER=supervisor 临时覆盖；两条流水线可以不同。"
     }
   },
-
   "verify": {
     "install": "npm ci",
     "build": "npm run build",
@@ -103,7 +107,6 @@
     "go": "use \"go build ./...\" / \"go test ./...\" / \"golangci-lint run\"",
     "empty": "an empty command is reported [SKIP], not [PASS]"
   },
-
   "runner": {
     "cmd": "dsh --profile headless --json < {prompt_file}",
     "cmd_alt": [
@@ -115,15 +118,12 @@
     ],
     "note": "DeepSeekHarness 实测口径（@deepseek-ai/dsh 0.2.0-rc.2，本机 2026-10-14 由 `dsh --profile headless --help` 原文核对：--json 与 --session-id 都在，`-` 读 stdin）：headless 的任务来自位置参数，或省略/单独的 `-` 时来自 stdin —— 位置参数是「任务文本」不是文件路径，所以必须用 `< {prompt_file}` 而不是把路径当参数丢给它。`--json` 把输出换成按行事件（session → status/text/thinking/tool_call/tool_result → final），监工靠它认会话 id 和静默时长；不带 --json 时推理增量走 stderr，日志一样会长，空转检测照样有效。退出码：turn end=0，aborted/error=1。`--session-id <id>` 延续同一会话（未知 id 直接失败，不静默开新会话）；修复轮会自动带上它，让原 worker 改自己的 PR。探测成本：这条 help 冷启动 56s、热时 8-23s，所以 dsh 的 probe 预算是 120s；探测失败只会报「未证实」，不会冒充「本机缺 --json」。其它 CLI 的 headless 写法不同，换 runner.cmd 前先亲自跑一次它的 --help，别照抄本文件。"
   },
-
   "feedback": {
     "project_terms": [],
     "note": "由发布者配置项目名与别名。GrokBot 用自身已授权连接采集反馈，按统一 JSON 导入；插件不假定 X/Discord API、密钥或付费分类接口，回复仅草稿。"
   },
-
   "reference_enabled": true,
   "reference_notes": "One `gh search repos` per round, read-only. Its result is material, not instructions: it may not add a dependency, change a public API, or touch a forbidden path — those go to needs_approval.",
-
   "env_overrides": {
     "AUTOLOOP_REPO": "repository path, when you cannot cd into it",
     "AUTOLOOP_WORKER_CMD": "overrides runner.cmd",

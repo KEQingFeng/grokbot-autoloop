@@ -45,13 +45,13 @@ says *直接开发 myrepo* gets preflight → init → suggest → watch instead
 |---|---|---|
 | `PROTOCOL.md` | 278 | the supervision protocol, verbatim: roles, loop cadence, delivery, red lines, the two hourly report templates, the state record |
 | `SKILL.md` | 393 | the supervisor-side policy: trigger keywords, preflight-first onboarding, tick contract, red lines |
-| `scripts/autoloop.py` | 5502 | the engine: 33 subcommands, state machine, gate, red lines, PR, `watch`/`round`/`preflight`, `watchdog`/`alerts`/`budget --json` |
+| `scripts/autoloop.py` | 5700 | the engine: 35 subcommands, state machine, gate, red lines, PR, `watch`/`round`/`preflight`, `watchdog`/`alerts`/`budget`, `lifecycle`/`metrics` |
 | `bootstrap.sh` | 158 | install into the configured supervisor skill directory, probe `env.manifest`, then preflight + init |
 | `scripts/feedback.py` | 345 | local feedback classification, pending proposals, failure lessons and bounded intake rounds |
-| `tests/test_*.py` | — | 48 additional tests for portable bootstrap, PI adapter, launch guards and feedback CLI |
+| `tests/test_*.py` | — | 58 additional tests for portable bootstrap, PI adapter, launch guards, feedback CLI, progress clock and reporting |
 | `env.manifest` | 23 | TAB-separated tool list (required / sched / pr / optional / worker) |
 | `install-cron.sh` | 138 | prints the three wake-up drivers, `--write` to install box cron, verifies |
-| `config.example.json` | 142 | every knob, with the reason each cap exists |
+| `config.example.json` | 143 | every knob, with the reason each cap exists |
 | `tests/selftest.py` | 2740 | 46 scenarios / 684 assertions against throwaway real git repos |
 | `tests/fake_worker.py` | 172 | stand-in worker, 16 modes: `good`/`slow`/`deliver` plus 13 misbehaviours |
 | `tests/fake_gh.py` | 244 | `gh` stand-in; records every call, always refuses `--admin`/`--force`, refuses `pr merge` unless a scenario opts in, file-locked |
@@ -237,6 +237,11 @@ debug-only `AUTOLOOP_NO_LIMIT`).
 | `idle_gate` | 6 | consecutive empty ticks ⇒ **soft stop** (`STOP`, only `go` closes it). Adding a task does *not* resume it — closing a breaker is a human decision |
 | `backoff_at` / `backoff_max_s` | 0.8 / 900 | at this fraction of a daily budget the loop slows down (parallel → 1, interval ×2) instead of running full speed into the ceiling; the backed-off interval never exceeds the ceiling. Backoff never *raises* a cap |
 | `alert_cooldown_min` | 30 | minutes during which a repeat of the same problem folds into the open alert as `count += 1` instead of opening a new one |
+| `progress_stale_s` | 900 | real-progress guard: only a new commit or a changed gate result resets this clock. A chatty log, repeated heartbeat, or repeated tool output alone does not count as progress |
+| `same_error_gate` | 3 | the same normalized verification error this many times ⇒ `same_error` breaker (`HALTED`, only `resume` closes it). Signature normalizes digits and SHAs so line-number churn is not a new error |
+| `error_retry_base_s` | 60 | repair backoff base: try *n* waits `base × 2^(n−1)` seconds, capped at 900. Backoff slows retries; it never deletes worktrees or uncommitted work |
+| `report_interval_s` | 7200 | minimum interval for `report --outbox`. Reports are written locally to `report_outbox.jsonl` with `status=pending`; the sender calls `report --mark-sent <id>` after a successful delivery so a restart cannot send it twice |
+| `grok_daily_max` | 0 | supervisor-model escalations per day. Default **0** = local monitoring never calls a model. Raising it does not create an outbound channel by itself; it only caps how many escalation records a caller may generate |
 
 Raise them by editing the file, which is a human act — not by asking the bot, and not
 with `AUTOLOOP_NO_LIMIT` inside a scheduled task.
@@ -386,23 +391,28 @@ autoloop.py watchdog --act --json    # additionally: stop a provably silent work
 autoloop.py alerts --json            # open alerts, folded, acks applied
 autoloop.py alerts --ack <id> --note "为什么可以不管"
 autoloop.py budget --json            # counters vs caps + the backoff plan the next tick uses
+autoloop.py lifecycle --json         # read-only issue/PR reconciliation: reopened, unverified-closed, CI, conflicts, review decision
+autoloop.py metrics --json           # local load/quality/progress/budget summary; no model call
+autoloop.py report --outbox --force  # generate a durable pending report; never sends anything
+autoloop.py report --mark-sent <id>  # sender confirms delivery so a restart cannot send twice
 ```
 
-**Has it stopped delivering?** Two breakers, at two rungs, each writing a real flag file
+**Has it stopped delivering?** Three breakers, at three rungs, each writing a real flag file
 because a breaker that only logs is a suggestion:
 
 | breaker | trips on | writes | closed by |
 |---|---|---|---|
 | `idle` | `idle_gate` consecutive empty ticks | `STOP` | `go` |
+| `same_error` | `same_error_gate` repetitions of one normalized verification error | `HALTED` | `resume` |
 | `no_progress` | `no_progress_gate` consecutive tasks that ended blocked with nothing delivered | `HALTED` | `resume` |
 
 `state.json["breakers"]` records which one, when, and why, so the patrol report can say
 「熔断已断开（no_progress）」 instead of 「人工停止」 — blaming a human who never touched the
 box sends the operator looking for a person instead of a log line. The rungs are sequential,
-not simultaneous: a gate that is red for everything pushes `fails_consecutive` *and*
-`no_progress_streak` up together, so while maintenance mode is already handling that same
-broken gate the streak keeps counting but the hard stop stays shut
-(`no_progress_deferred`). Without that rule, maintenance mode is unreachable in exactly the
+not simultaneous: a gate that is red for everything pushes `fails_consecutive`,
+`same_error` and `no_progress_streak` up together, so while maintenance mode is already
+handling that same broken gate the hard stops stay shut (`same_error_deferred`,
+`no_progress_deferred`). Without that rule, maintenance mode is unreachable in exactly the
 situation it was written for. Neither breaker re-opens itself: adding a task does not resume
 an idle-tripped loop, because closing a breaker is a human decision.
 
@@ -451,6 +461,10 @@ channel that copies the secret it is alerting about is a second incident.
 | escalation is a ladder, not a race | while maintenance mode is handling the same broken gate the hard stop stays shut and says so (`no_progress_deferred`), so maintenance remains reachable | `failgate`, `noprog` |
 | the watchdog is independent of the thing it watches | no `git`, no `gh`, no `loop.lock`, and `--act` may only stop a provably silent worker — proven by holding a real flock and byte-comparing gh's argv and `origin/main` across a run | `watchdog` |
 | a stopped loop is not a dead loop | `loop_stale` is suppressed when STOP/HALTED or a breaker explains the silence, so your own shutdown does not page you | `watchdog` |
+| a chatty worker is not a progressing worker | only a commit-count change or a gate-state change resets `last_real_progress_at`; after `progress_stale_s` it is treated as stalled and stops burning the slot | `test_supervision_progress` |
+| the same error is not retried forever | error signature normalizes digits/SHAs; the `same_error` breaker trips at `same_error_gate`, blocks the task and writes `HALTED`, preserving the worktree | `test_supervision_progress`, `failgate` |
+| an issue's remote state is reconciled, not trusted | `lifecycle` flags reopened, unverified-closed and unclaimed issues from read-only `gh` data; it never closes, comments, or reopens anything itself | `test_lifecycle_reporting` |
+| report delivery is not duplicated by a restart | `report_outbox.jsonl` keeps a digest and `pending`; the sender's `--mark-sent` is what flips it, and an unchanged digest is never re-emitted | `test_supervision_cli` |
 | one problem is one alert | repeats fold inside `alert_cooldown_min` on read (append-only history intact), an ack silences an episode, a post-cooldown recurrence re-opens, and secrets are scrubbed on the way in | `alerts` |
 | backoff slows down, it never raises a cap | `backoff_plan()` cuts parallel and doubles the interval near a budget, caps idle growth at `backoff_max_s`, and a spent cap still dispatches nothing | `backoff` |
 | nothing is judged on an empty gate | all-`[SKIP]` ⇒ red ⇒ blocked, never a PR | `emptygate` |

@@ -37,7 +37,7 @@ import sys
 import time
 from datetime import datetime
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 ALO_DIR = ".autoloop"
 
 DEFAULT_CAPS = {
@@ -58,6 +58,9 @@ DEFAULT_CAPS = {
     # kept typing / waited on an approval prompt held its slot for half an hour.
     "finish_grace_s": 60,           # declared done -> session closed within a minute
     "stall_s": 420,                 # silent log + no commit -> the run is not coming back
+    "progress_stale_s": 900,        # real code/test progress absent for 15 minutes
+    "same_error_gate": 3,            # repeated identical failure -> breaker
+    "error_retry_base_s": 60,        # capped exponential repair backoff base
     "watch_interval_s": 60,         # `watch` cadence; also the `next` hint for ticks
     # PR 批量审查 (§PR-1). The instruction states both "累计 3 个待审 PR 时启动批量
     # 审查" and "默认参数：PR 阈值 5"; they are two different knobs, so both are here
@@ -81,6 +84,11 @@ DEFAULT_CAPS = {
     "backoff_at": 0.8,              # fraction of a budget at which the loop slows down
     "backoff_max_s": 900,           # ceiling on a backed-off tick interval
     "alert_cooldown_min": 30,       # one ongoing problem = one open alert, not one per run
+    "report_interval_s": 7200,      # delta report cadence; local generation only
+    "same_error_gate": 3,
+    "error_retry_base_s": 60,
+    "progress_stale_s": 900,
+    "grok_daily_max": 0,            # no implicit model calls; zero disables escalation
 }
 
 # Red lines that are mechanically checkable. Anything here is refused by code,
@@ -520,11 +528,16 @@ class Ctx:
         # whether *I* stopped the loop or a human did, and the patrol report must
         # not call a tripped breaker 「人工停止」.
         st.setdefault("breakers", {})
+        st.setdefault("failure_signatures", {})
+        st.setdefault("issue_state", {})
+        st.setdefault("last_report_digest", "")
+        st.setdefault("grok_calls_today", 0)
         # Set when the no-progress streak passed its gate but maintenance mode was
         # already handling the same broken gate, so the harder breaker stayed shut.
         # Kept in state (not recomputed) because the patrol report has to be able to
         # say 「熔断被推迟」 without re-deriving why.
         st.setdefault("no_progress_deferred", False)
+        st.setdefault("same_error_deferred", False)
         return st
 
     def ensure_state(self):
@@ -541,8 +554,10 @@ class Ctx:
                              "idle_ticks": 0, "no_progress_streak": 0},
                 "slots": {s: None for s in SLOTS},
                 "pending_pr": [], "gh_cooldown_until": 0,
+                "failure_signatures": {}, "issue_state": {}, "last_report_digest": "",
+                "grok_calls_today": 0,
                 "idle_reason": None, "maintenance": False, "breakers": {},
-                "no_progress_deferred": False,
+                "no_progress_deferred": False, "same_error_deferred": False,
                 "last_tick_at": 0, "last_report_at": 0,
                 "ref": None, "notes": [],
             }
@@ -1422,6 +1437,43 @@ def capture_session(ctx, meta):
     return sid
 
 
+def failure_signature(reasons):
+    normalized = " ".join(str(reasons).lower().split())
+    normalized = re.sub(r"\b[0-9a-f]{7,40}\b", "<sha>", normalized)
+    normalized = re.sub(r"\b\d+\b", "<n>", normalized)
+    return hashlib.sha256(normalized[:1000].encode("utf-8")).hexdigest()[:20]
+
+
+def record_failure_signature(ctx, signature):
+    failures = ctx.state.setdefault("failure_signatures", {})
+    failures[signature] = int(failures.get(signature, 0)) + 1
+    count = failures[signature]
+    ctx.event("verify", "failure_signature", sig=signature, count=count)
+    return count >= int(ctx.cap("same_error_gate"))
+
+
+def progress_snapshot(ctx, rec, meta, commits, test_state="unknown"):
+    """Only commit-count or gate-state changes count as real progress; log bytes do not."""
+    token = "commit:%s|test:%s" % (commits, test_state)
+    ts = now()
+    previous = rec.get("last_real_progress_token")
+    if previous is None:
+        rec["last_real_progress_token"] = token
+        rec["last_real_progress_at"] = rec.get("started") or meta.get("started") or ts
+    elif token != previous:
+        rec["last_real_progress_token"] = token
+        rec["last_real_progress_at"] = ts
+        ctx.event("run", "progress_real", task=rec.get("task"),
+                  commits=commits, test_state=test_state)
+    age = max(0, ts - int(rec.get("last_real_progress_at") or ts))
+    if age >= int(ctx.cap("progress_stale_s")):
+        return {"state": "stalled", "age_s": age, "token": token}
+    size, quiet = log_activity(meta)
+    return {"state": "progressing" if token != previous else
+            ("waiting" if quiet >= int(ctx.cap("stall_s")) else "active"),
+            "age_s": age, "log_bytes": size, "quiet_s": int(quiet), "token": token}
+
+
 def judge_running_job(ctx, rec, meta):
     """Is this still a worker, or is it 空转?
 
@@ -1436,6 +1488,12 @@ def judge_running_job(ctx, rec, meta):
     rec["log_bytes"] = size
     rec["log_quiet_s"] = int(quiet)
     rec["ahead"] = ahead
+    progress = progress_snapshot(ctx, rec, meta, ahead,
+                                 test_state=rec.get("verify", "unknown"))
+    rec["progress"] = progress
+    if progress["state"] == "stalled":
+        return "stalled", "no real commit or gate progress for %ss (threshold %ss)" % (
+            progress["age_s"], ctx.cap("progress_stale_s"))
     grace = ctx.cap("finish_grace_s")
     quiet_needed = min(CLOSE_QUIET_S, grace)
     if marker:
@@ -2585,6 +2643,11 @@ def verify_slot(ctx, rec, slot, pol, lines):
     vres = run_verify(ctx, task, wt, slot)
     findings, rows, churn = redline_check(ctx, task, wt, pol)
     rec["evidence"] = vres.get("evidence")
+    if vres.get("rc") == 0:
+        rec["last_test_result"] = "PASS"
+    elif vres.get("rc") is not None:
+        rec["last_test_result"] = "FAIL"
+    rec["last_test_at"] = now()
     rec["diff_files"] = [p for _, p in rows][:20]
     rec["churn"] = churn
     rec["verify_steps"] = vres.get("steps", [])
@@ -2628,10 +2691,25 @@ def verify_slot(ctx, rec, slot, pol, lines):
             mark_unverified_pr(ctx, rec, slot, lines, red)
         lines.append("- slot %s VERIFY RED (%d reason(s)): %s"
                      % (slot, len(red), " | ".join(r.splitlines()[0][:90] for r in red[:3])))
+        signature = failure_signature(red)
+        rec["last_failure_signature"] = signature
         if rec["tries"] > ctx.cap("max_repair_rounds"):
             c["fails_consecutive"] = c.get("fails_consecutive", 0) + 1
+            # The same-error breaker counts *blocked tasks*, not verify attempts:
+            # one task's repair ladder already owns the first repeats, and counting
+            # them here would pre-empt both the ladder and maintenance mode.
+            repeated = record_failure_signature(ctx, signature)
+            deferred = bool(ctx.state.get("maintenance")) or \
+                int(c.get("fails_consecutive", 0)) >= int(ctx.cap("fail_gate"))
+            ctx.state["same_error_deferred"] = bool(repeated and deferred)
+            if repeated and not deferred:
+                _trip_breaker(ctx, "same_error", signature=signature,
+                              count=ctx.state["failure_signatures"][signature],
+                              task=rec.get("task"), reason="same verification error repeated")
             _block(ctx, rec, "acceptance failed after %s tries: %s"
                    % (rec["tries"], "; ".join(red)[:900]))
+            if repeated and not deferred:
+                lines.append("- slot %s: same-error breaker tripped; preserved worktree for review" % slot)
             lines.append("- slot %s blocked, reason recorded; slot freed for the next task"
                          % slot)
             return
@@ -2681,6 +2759,10 @@ def repair(ctx, rec, slot, pol, lines, failure):
     # so the fix round keeps the context of the diff it wrote (protocol §六).
     prev = read_json(os.path.join(ctx.job_dir, (rec.get("job") or "") + ".json")) or {}
     sid = prev.get("session_id") or ""
+    delay = min(900, int(ctx.cap("error_retry_base_s")) * (2 ** max(0, int(rec.get("tries", 1)) - 1)))
+    rec["next_dispatch_at"] = now() + delay
+    ctx.event("repair", "retry_backoff", task=rec.get("task"), attempt=rec.get("tries"),
+              delay_s=delay, signature=rec.get("last_failure_signature"))
     prompt = task_prompt(ctx, task, wt, slot, mode_now(ctx), extra=failure,
                          session_id=sid)
     meta, err = launch(ctx, task, wt, prompt, slot,
@@ -2897,6 +2979,35 @@ def cmd_report(args):
         ctx.state = read_json(ctx.state_path) or ctx.state
         log(patrol_text(ctx))
         return 0
+    if getattr(args, "outbox", False) or getattr(args, "mark_sent", None):
+        ctx = Ctx(args.repo)
+        ctx.need_init()
+        ctx.state = read_json(ctx.state_path) or ctx.state
+        ctx.ensure_state()
+        if getattr(args, "mark_sent", None):
+            rows = read_jsonl(os.path.join(ctx.alo, "report_outbox.jsonl"))
+            hit = next((r for r in rows if r.get("report_id") == args.mark_sent), None)
+            if not hit:
+                log(json.dumps({"error": "report_id not found: %s" % args.mark_sent}))
+                return 2
+            if hit.get("status") == "sent":
+                log(json.dumps({"error": "already marked sent", "report_id": args.mark_sent}))
+                return 2
+            hit["status"] = "sent"
+            hit["sent_at"] = stamp()
+            tmp = os.path.join(ctx.alo, "report_outbox.jsonl.tmp")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                for row in rows:
+                    fh.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+            os.replace(tmp, os.path.join(ctx.alo, "report_outbox.jsonl"))
+            log(json.dumps({"report_id": args.mark_sent, "status": "sent"}))
+            return 0
+        body = report_text(ctx)
+        outcome = report_outbox(ctx, {"report": body, "engine": VERSION},
+                                force=bool(args.force))
+        ctx.save()
+        log(json.dumps(outcome, ensure_ascii=False))
+        return 0 if outcome.get("emitted") else 1
     rc = cmd_status(args)
     ctx = Ctx(args.repo)
     ctx.state["last_report_at"] = now()
@@ -2904,6 +3015,87 @@ def cmd_report(args):
     if args.journal:
         ctx.journal(report_text(ctx))
     return rc
+
+
+def cmd_lifecycle(args):
+    ctx = Ctx(args.repo)
+    ctx.need_init()
+    cmd = "issue list --state all --limit 100 --json number,title,state,url,updatedAt,labels,assignees"
+    rc, out, err = run(gh_bin() + " " + cmd, cwd=ctx.root, timeout=120, shell=True)
+    if rc != 0:
+        log(json.dumps({"error": (err or out)[:400] or "gh issue list failed"}))
+        return 3
+    try:
+        issues = json.loads(out or "[]")
+    except json.JSONDecodeError:
+        log(json.dumps({"error": "unparsable gh issue list output"}))
+        return 3
+    prs, pr_err = pr_review_list(ctx)
+    if prs is None:
+        log(json.dumps({"issues": issue_lifecycle_report(ctx, issues),
+                        "prs": None, "error": pr_err[:400]}))
+        return 3
+    ctx.state["issue_lifecycle"] = issue_lifecycle_report(ctx, issues)
+    ctx.state["pr_lifecycle"] = [pr_lifecycle_snapshot(p) for p in prs]
+    ctx.save()
+    if args.json:
+        log(json.dumps({"issues": ctx.state["issue_lifecycle"],
+                        "prs": ctx.state["pr_lifecycle"]}, ensure_ascii=False, indent=2))
+        return 0
+    log("# Issue lifecycle")
+    for key, rows in ctx.state["issue_lifecycle"].items():
+        log("- %s: %s" % (key, rows))
+    log("# PR lifecycle")
+    for row in ctx.state["pr_lifecycle"]:
+        log("- #%s %s ci=%s review=%s merge=%s" % (row.get("number"), row.get("state"),
+                                                   row.get("ci"), row.get("review"),
+                                                   row.get("mergeability")))
+    return 0
+
+
+def cmd_metrics(args):
+    ctx = Ctx(args.repo)
+    ctx.need_init()
+    events = read_jsonl(os.path.join(ctx.alo, "events.jsonl"))
+    slots = ctx.state.get("slots", {})
+    active = [s for s in SLOTS if slots.get(s)]
+    tasks = sum(1 for s in SLOTS if slots.get(s))
+    data = {
+        "generated_at": stamp(),
+        "load": {"active_slots": len(active), "slots": active, "tasks": tasks,
+                 "pending_pr": len(ctx.state.get("pending_pr", [])),
+                 "pool": len(ctx.coll("queue.json")) + len(ctx.coll("candidates.json")),
+                 "idle_ticks": ctx.state.get("counters", {}).get("idle_ticks", 0)},
+        "quality": {
+            "gate_green": sum(1 for e in events if e.get("kind") == "gate_green"),
+            "gate_red": sum(1 for e in events if e.get("kind") == "gate_red"),
+            "repair": sum(1 for e in events if e.get("phase") == "repair"),
+            "blocked": sum(1 for e in events if e.get("kind") in ("task_blocked", "blocked")),
+            "same_error_breaker": sum(1 for e in events if e.get("kind") == "same_error_breaker"),
+        },
+        "budget": {
+            "turns": ctx.state.get("counters", {}).get("turns_today", 0),
+            "jobs": ctx.state.get("counters", {}).get("jobs_today", 0),
+            "prs": ctx.state.get("counters", {}).get("pr_today", 0),
+            "grok_calls": ctx.state.get("grok_calls_today", 0),
+            "grok_daily_max": int(ctx.cap("grok_daily_max")),
+        },
+        "progress": [
+            {"slot": s, "task": slots.get(s, {}).get("task"),
+             "state": slots.get(s, {}).get("state"),
+             "commits": slots.get(s, {}).get("ahead", 0),
+             "log_bytes": slots.get(s, {}).get("log_bytes", 0),
+             "log_quiet_s": slots.get(s, {}).get("log_quiet_s", 0),
+             "progress": slots.get(s, {}).get("progress")} for s in SLOTS if slots.get(s)
+        ],
+    }
+    if data["load"]["tasks"] and len(active) < min(2, int(ctx.cap("max_parallel"))):
+        data["load"]["imbalance"] = "one or more slots are not using available capacity"
+    if args.json:
+        log(json.dumps(data, ensure_ascii=False, indent=2))
+    else:
+        log(json.dumps(data, ensure_ascii=False))
+    return 0
 
 
 def cmd_plan(args):
@@ -3509,6 +3701,8 @@ def cmd_go(args):
     ctx.state["counters"]["idle_ticks"] = 0
     ctx.state["counters"]["no_progress_streak"] = 0
     ctx.state["no_progress_deferred"] = False
+    ctx.state["same_error_deferred"] = False
+    ctx.state["failure_signatures"] = {}
     ctx.state["mode_forced"] = args.mode if args.mode in ("day", "night") else ctx.state.get("mode_forced")
     ctx.save()
     ctx.event("guard", "operator_go", removed=removed, breakers_closed=closed,
@@ -3552,6 +3746,8 @@ def _resume_or_halt(args, halt):
         ctx.state["breakers"] = brk
         ctx.state["counters"]["no_progress_streak"] = 0
         ctx.state["no_progress_deferred"] = False
+        ctx.state["same_error_deferred"] = False
+        ctx.state["failure_signatures"] = {}
         log("HALTED removed, maintenance cleared, breakers closed: %s, "
             "loop may take business work again" % (", ".join(closed) or "none"))
     ctx.save()
@@ -3784,6 +3980,9 @@ BREAKERS = {
              "event": "idle_breaker", "title": "循环连续空转，已自己软停",
              "action": "先看 idle_reason：池子空就 `suggest`/`approve` 补任务，环境坏了先修环境，"
                        "然后 `go` 合闸"},
+    "same_error": {"flag": "HALTED", "reset": "resume", "severity": "critical",
+                    "event": "same_error_breaker", "title": "相同验收错误反复出现，已硬停",
+                    "action": "保留 worktree 与分支；检查同错证据及验收环境后人工 resume"},
     "no_progress": {"flag": "HALTED", "reset": "resume", "severity": "critical",
                     "event": "no_progress_breaker", "title": "连续任务零交付，已硬停",
                     "action": "读 blocked.json 的原始失败与 evidence 文件：先判断是闸门坏了还是任务"
@@ -4524,7 +4723,7 @@ def cmd_watch(args):
 # 禁止未经确认就修改公共接口).
 PR_REVIEW_FIELDS = ("number,headRefName,baseRefName,state,title,url,isDraft,mergeable,"
                     "mergeStateStatus,createdAt,updatedAt,additions,deletions,"
-                    "changedFiles,labels,statusCheckRollup")
+                    "changedFiles,labels,statusCheckRollup,reviewDecision,headRefOid")
 
 
 def pr_review_list(ctx):
@@ -4552,6 +4751,83 @@ def _iso_age_h(val):
     if when.tzinfo is None:
         return None
     return max(0.0, (time.time() - when.timestamp()) / 3600.0)
+
+
+def report_outbox(ctx, report, force=False):
+    interval = int(ctx.cap("report_interval_s"))
+    current = now()
+    last = int(ctx.state.get("last_report_at") or 0)
+    if not force and current - last < interval:
+        return {"emitted": False, "reason": "interval_not_due"}
+    payload = scrub_secrets(report)
+    material = re.sub(r"\b\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?\b", "<ts>",
+                      json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                                 separators=(",", ":")))
+    digest = hashlib.sha256(material.encode()).hexdigest()
+    if digest == ctx.state.get("last_report_digest") or \
+            any(r.get("digest") == digest for r in
+                read_jsonl(os.path.join(ctx.alo, "report_outbox.jsonl"))):
+        return {"emitted": False, "reason": "unchanged", "digest": digest}
+    record = {"report_id": digest[:24], "digest": digest,
+              "created_at": stamp(current), "epoch": current,
+              "status": "pending", "report": payload}
+    append_jsonl(os.path.join(ctx.alo, "report_outbox.jsonl"), record)
+    ctx.state["last_report_at"] = current
+    ctx.state["last_report_digest"] = digest
+    return {"emitted": True, "digest": digest, "record": record}
+
+
+def issue_lifecycle_report(ctx, issues):
+    """Read-only issue/task/PR consistency report; never edits GitHub state."""
+    linked = {}
+    for pool_name in ("queue.json", "candidates.json", "done.json", "blocked.json"):
+        for task in ctx.coll(pool_name):
+            issue = task.get("issue") or task.get("issue_number")
+            if issue is not None:
+                linked[str(issue)] = task
+    issue_by_num = {str(row.get("number")): row for row in issues}
+    reopened, unverified_closed, unclaimed = [], [], []
+    for key, task in linked.items():
+        remote = issue_by_num.get(key)
+        if remote is None:
+            continue
+        state = str(remote.get("state") or "").upper()
+        if state == "OPEN" and task.get("status") in ("done", "closed", "pr_open"):
+            reopened.append(int(key) if key.isdigit() else key)
+        if state == "CLOSED" and task.get("verify") != "green" and task.get("status") not in ("done", "closed"):
+            unverified_closed.append(int(key) if key.isdigit() else key)
+        if state == "OPEN" and not task.get("claimed_by") and task.get("status") not in ("done", "closed"):
+            unclaimed.append(int(key) if key.isdigit() else key)
+    untracked_closed = [int(k) if k.isdigit() else k for k, row in issue_by_num.items()
+                        if str(row.get("state") or "").upper() == "CLOSED" and k not in linked]
+    return {"linked": len(linked), "reopened": sorted(reopened, key=str),
+            "unverified_closed": sorted(unverified_closed, key=str),
+            "unclaimed": sorted(unclaimed, key=str),
+            "untracked_closed": sorted(untracked_closed, key=str)}
+
+
+def pr_lifecycle_snapshot(pr):
+    ci, ci_detail = _ci_verdict(pr)
+    decision = str(pr.get("reviewDecision") or "").upper()
+    if decision == "CHANGES_REQUESTED":
+        review = "changes_requested"
+    elif decision == "APPROVED":
+        review = "approved"
+    elif decision == "REVIEW_REQUIRED":
+        review = "required"
+    else:
+        review = "pending"
+    merge_state = str(pr.get("mergeStateStatus") or "").upper()
+    mergeability = ("conflict" if merge_state in ("DIRTY", "CONFLICTING") else
+                    "blocked" if merge_state in ("BLOCKED", "BEHIND") else
+                    "mergeable" if merge_state == "CLEAN" else "unknown")
+    created = pr.get("createdAt")
+    return {"number": pr.get("number"), "branch": pr.get("headRefName"),
+            "state": str(pr.get("state") or "unknown").lower(),
+            "ci": ci, "ci_detail": ci_detail, "review": review,
+            "mergeability": mergeability, "created_at": created,
+            "age_h": _iso_age_h(created),
+            "verified_sha": pr.get("headRefOid"), "url": pr.get("url")}
 
 
 def _ci_verdict(pr):
@@ -5382,6 +5658,12 @@ def build_parser():
     add("status", cmd_status, "slot table and counters, no side effects")
     add("report", cmd_report, "the progress report + fixed footer line",
         (("--journal",), {"action": "store_true"}),
+        (("--outbox",), {"action": "store_true",
+                         "help": "生成本地 report_outbox.jsonl 报告，不发送、不调模型"}),
+        (("--mark-sent",), {"metavar": "REPORT_ID",
+                            "help": "发送方成功投递后标记，防止重启后重复发送"}),
+        (("--force",), {"action": "store_true",
+                        "help": "无视 report_interval_s 立即生成报告"}),
         (("--patrol",), {"action": "store_true",
                          "help": "§七 的定时巡检/异常告警模板，用真实状态填好"}))
     add("watch", cmd_watch, "foreground loop: tick every 60s so a finished worker is "
@@ -5437,6 +5719,10 @@ def build_parser():
     add("budget", cmd_budget, "counters against caps + 预算退避计划",
         (("--json",), {"action": "store_true",
                        "help": "机器可读：counter/cap 对照 + backoff 计划（下一次 tick 真会用）"}))
+    add("lifecycle", cmd_lifecycle, "只读 GitHub 对账 Issue/PR 生命周期；不关闭、不评论、不合并",
+        (("--json",), {"action": "store_true"}))
+    add("metrics", cmd_metrics, "本地负载、质量、进展与预算统计；零模型调用",
+        (("--json",), {"action": "store_true"}))
     add("watchdog", cmd_watchdog, "独立看门狗：只读状态判断循环是否还活着（另开调度器跑，"
                                   "不抢 loop.lock、不碰 git/gh）",
         (("--json",), {"action": "store_true", "help": "机器可读 findings，rc 0=正常 3=warn 4=critical"}),
