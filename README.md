@@ -7,7 +7,8 @@ the judgement fields of a PR, approves risky work. The **code** is written by he
 agent CLIs on that box, paid by their own keys, inside `git worktree` sandboxes, judged
 by the repository's own test command — and in the default configuration each worker
 pushes its own branch and opens its own PR. Everything stops at a branch plus a pull
-request. The human merges in the morning.
+request. The human merges in the morning — that is the shipped default, and the only way
+off it is the user's own `init --auto-merge` plus a scheduled merge stage.
 
 Built from two prompts: 《Guizang AutoLoop：7×24 自动开发监工与双分支调度系统》, which
 described the contract in prose, and 《DeepSeekHarness 持续自主开发监督协议》, which is
@@ -31,7 +32,10 @@ says *直接开发 myrepo* gets preflight → init → suggest → watch instead
   annotated `pr_unverified` and left alone (§六). The engine never issues `pr close` or
   `pr review`; it *can* issue `pr merge`, but only through the merge line below, which
   ships off and needs a config switch plus a per-invocation confirmation — see
-  [Reviewing the queue, and the merge line](#reviewing-the-queue-and-the-merge-line-review-merge).
+  [Reviewing the queue, and the merge line](#reviewing-the-queue-and-the-merge-line-review-merge),
+  and for putting that same line on a schedule
+  [Nightly auto-merge](#nightly-auto-merge-the-opt-in-tier). The loop itself never merges:
+  a tick does not touch the base branch with the cap on, which is asserted, not promised.
 - **Is not** a daemon. Nothing schedules itself: `install-cron.sh` prints the options
   and only writes a crontab with `--write`, and box cron may never fire on a sleeping
   cloud box — the bot's own scheduled task, or `watch` in a session you already have,
@@ -44,15 +48,15 @@ says *直接开发 myrepo* gets preflight → init → suggest → watch instead
 | file | lines | what it does |
 |---|---|---|
 | `PROTOCOL.md` | 278 | the supervision protocol, verbatim: roles, loop cadence, delivery, red lines, the two hourly report templates, the state record |
-| `SKILL.md` | 393 | the supervisor-side policy: trigger keywords, preflight-first onboarding, tick contract, red lines |
-| `scripts/autoloop.py` | 5700 | the engine: 35 subcommands, state machine, gate, red lines, PR, `watch`/`round`/`preflight`, `watchdog`/`alerts`/`budget`, `lifecycle`/`metrics` |
+| `SKILL.md` | 436 | the supervisor-side policy: trigger keywords, preflight-first onboarding, tick contract, red lines |
+| `scripts/autoloop.py` | 5870 | the engine: 35 subcommands, state machine, gate, red lines, PR, `watch`/`round`/`preflight`, `watchdog`/`alerts`/`budget`, `lifecycle`/`metrics` |
 | `bootstrap.sh` | 158 | install into the configured supervisor skill directory, probe `env.manifest`, then preflight + init |
 | `scripts/feedback.py` | 345 | local feedback classification, pending proposals, failure lessons and bounded intake rounds |
-| `tests/test_*.py` | — | 58 additional tests for portable bootstrap, PI adapter, launch guards, feedback CLI, progress clock and reporting |
+| `tests/test_*.py` | — | 69 additional tests for portable bootstrap, the nightly merge driver, PI adapter, launch guards, feedback CLI, progress clock and reporting |
 | `env.manifest` | 23 | TAB-separated tool list (required / sched / pr / optional / worker) |
-| `install-cron.sh` | 138 | prints the three wake-up drivers, `--write` to install box cron, verifies |
+| `install-cron.sh` | 207 | prints the three wake-up drivers — with the `review` → `merge` stage attached when the merge line is on — `--write` to install box cron, verifies |
 | `config.example.json` | 143 | every knob, with the reason each cap exists |
-| `tests/selftest.py` | 2740 | 46 scenarios / 684 assertions against throwaway real git repos |
+| `tests/selftest.py` | 2859 | 47 scenarios / 721 assertions against throwaway real git repos |
 | `tests/fake_worker.py` | 172 | stand-in worker, 16 modes: `good`/`slow`/`deliver` plus 13 misbehaviours |
 | `tests/fake_gh.py` | 244 | `gh` stand-in; records every call, always refuses `--admin`/`--force`, refuses `pr merge` unless a scenario opts in, file-locked |
 | `tests/bin/dsh` | 90 | `dsh` stand-in, so the DeepSeekHarness adapter (stdin prompt, `--json` events, `--session-id` resume) is really exercised |
@@ -135,7 +139,7 @@ use the engine lock. This is not evidence that a remote scheduler wakes successf
 
 ```bash
 # 1. get the plugin onto the box (clone, scp, or drop it in the bot's skill directory)
-git clone https://github.com/KEQingFeng/grokbot-autoloop.git ~/grokbot-autoloop && cd ~/grokbot-autoloop
+git clone https://github.com/aritosi/grokbot-autoloop.git ~/grokbot-autoloop && cd ~/grokbot-autoloop
 
 # 2. ask the box what it can actually do before anything is configured (§二 前置流程).
 #    Read-only: identity, ssh→GitHub, gh auth, origin, the worker CLI, the protocol file.
@@ -231,7 +235,7 @@ debug-only `AUTOLOOP_NO_LIMIT`).
 | `review_threshold` / `review_batch_max` / `review_max_age_h` | 3 / 5 / 2 | 批量审查 (§PR-1): three pending PRs make a batch due, a batch reads at most five, and the oldest pending PR is reviewed after two hours rather than waiting for the batch to fill |
 | `merge_threshold` | 5 | 「PR 阈值 5」(§PR-5): below this many *eligible* PRs the merge line waits for the next round. `--now` skips the wait, never the per-PR checks |
 | `risk_low_max` / `risk_mid_max` | 20 / 45 | the 0-100 grade bands: ≤ 20 and otherwise green ⇒ `auto_merge_ok` (the only verdict merge acts on); ≤ 45 ⇒ 需加强审查; above ⇒ `hold_high_risk`, which waits for a human even when every check is green |
-| `merge_enabled` | **false** | PROTOCOL.md §八 keeps the merge decision with the user. Config switch *and* `--yes-i-will-merge`, both required, every time |
+| `merge_enabled` | **false** | PROTOCOL.md §八 keeps the merge decision with the user. Config switch *and* `--yes-i-will-merge`, both required, every time. `init --auto-merge` is the only CLI that writes it, and it enables the merge stage in the wake-up driver — `tick`/`watch` still never merge |
 | `watchdog_stale_s` | 1800 | no `last_tick_at` for this long ⇒ `watchdog` calls the loop **dead** (critical, exit 4), not idle. Keep it ≥ 2× your tick cadence. A deliberately stopped loop is reported as stopped, never as dead |
 | `no_progress_gate` | 3 | consecutive tasks that end blocked having delivered nothing ⇒ **hard stop** (`HALTED`, only `resume` closes it). Counts deliverables, not exited processes |
 | `idle_gate` | 6 | consecutive empty ticks ⇒ **soft stop** (`STOP`, only `go` closes it). Adding a task does *not* resume it — closing a breaker is a human decision |
@@ -335,6 +339,59 @@ reads it can never mistake progress prose for a result. Each merge also writes `
 (with the base SHA before and after), flips the pool row to `status=merged` /
 `task_state=DONE`, and appends a `pr_merged` event, so `timeline` can answer "what landed,
 when, on which commit, and was it verified" without asking a model.
+
+To put this line on a schedule instead of running it by hand, see **Nightly auto-merge** below.
+
+#### Nightly auto-merge (the opt-in tier)
+
+The default tier is 分支+PR：work stops at a PR and a human merges in the morning. The nightly
+tier is *the same line* with a schedule attached to it — still two switches deep:
+
+```bash
+autoloop.py init --auto-merge [--merge-regression-cmd '<该仓库自己的回归命令>']
+bash install-cron.sh --repo <repo>            # prints the driver with the merge stage attached
+bash install-cron.sh --repo <repo> --write    # only if box cron is the driver you chose
+```
+
+`init --auto-merge` is the **only** command line that writes `caps.merge_enabled`. It writes
+config and appends a `merge_line_enabled` event; it reviews nothing and merges nothing, and
+running it twice reports 本来就开着 instead of pretending to be a fresh decision.
+`--merge-regression-cmd` can be set on its own — configuring a regression command does not
+open the merge line, and opening the line without one warns you on the spot that every merge
+will be booked as `pending_verification`.
+
+Each round the driver then runs `tick`, then `review --json`, then
+`merge --yes-i-will-merge --now --json`. Three properties the suite pins down (`nightmerge`):
+
+- **`tick` and `watch` never merge**, cap on or off. The merge is a separate command in a
+  separate stage, so "the loop ran 200 times tonight" is never evidence that anything landed.
+  `watch` is deliberately left out of the merge stage: re-reading gh every 60 s would burn the
+  rate limit and make PRs disappear faster than anyone can read the report.
+- **`--yes-i-will-merge` is still required on every invocation.** The cap enables the stage; it
+  does not pre-answer the confirmation for the hours that follow.
+- **`--now` skips only the 凑批 wait** (`caps.merge_threshold`), never a per-PR check. At most
+  `caps.review_batch_max` PRs (default 5) get a conclusion per round, so that number also caps
+  how many can merge — a night's queue drains over rounds rather than in one command.
+
+A round with nothing to merge exits **0** and writes `{"idle": true}`: with a driver firing
+every 15 minutes an empty queue is the normal case, and making it exit 1 would paint a failure
+into `merge.out` every quiet hour until nobody reads it any more. `merge` still exits 1 when the
+queue *stopped* on a PR and 3 when a gate refuses it, and a human running `merge` with no
+conclusion behind it still gets the refusal.
+
+What the night leaves behind: `.autoloop/merge.out` (raw JSON, per round),
+`.autoloop/merge.json` (the last round that got far enough to have a conclusion) and
+`events.jsonl` (`pr_merged` / `merge_idle` / `merge_queue_stopped` / `merge_line_enabled`).
+`status` and `tick` add a `- 合并线：已启用 …` line **only while the cap is on**, so the hourly
+read tells you whether the PRs listed there are waiting for you or already on main.
+
+PROTOCOL.md says 不得将 PR 自动合并 and 所有 PR 合并决定交给我 — that text is the user's own and
+stays verbatim; this tier does not amend it. It is that sentence *executed* rather than
+overridden: the user made the merge decision when they turned the tier on, and every round
+after just carries it out, which is why the engine still stops on anything it cannot prove
+green and why a `regression_red` gets no automatic revert — reverting shared history is
+another one of their decisions. The protocol injected into a worker round is unchanged, and
+a worker never gains a merge verb.
 
 ### Cadence: `watch`, `tick`, and the hourly report
 
@@ -440,8 +497,9 @@ channel that copies the secret it is alerting about is a second incident.
 | rule | mechanism | proven by (scenario) |
 |---|---|---|
 | worker cannot fake green | gate runs from the control copy; diff re-checked independently | `green`, `redlines` |
-| no auto-merge / no deploy | merging is off by default and needs `caps.merge_enabled` **and** `--yes-i-will-merge`; no deploy, no migration; `--admin`/`--force` are never passed — and `fake_gh.py` refuses them even in a scenario that allows merge, so a bypass cannot be tested into existence; `auto/` never `main` | `green`, `cap`, `backup`, `workerpr`, `mergegate` |
+| no auto-merge / no deploy | merging is off by default and needs `caps.merge_enabled` **and** `--yes-i-will-merge`; no deploy, no migration; `--admin`/`--force` are never passed — and `fake_gh.py` refuses them even in a scenario that allows merge, so a bypass cannot be tested into existence; `auto/` never `main`. Opening the nightly cap changes no behaviour inside the loop: `nightmerge` asserts a `tick` with `merge_enabled=true` still emits zero `gh pr merge` | `green`, `cap`, `backup`, `workerpr`, `mergegate`, `nightmerge` |
 | a merge decision is made against *now* | `_pr_fresh` re-reads each PR from gh immediately before acting; a disagreement (CI went red, conflict, draft, closed, already merged) stops the queue at that PR and the ones behind it wait | `mergeserial`, `mergegate` |
+| a schedule adds no new authority | the nightly driver is `tick` → `review` → `merge --yes-i-will-merge --now`, generated from whatever `config.json` says, so `init --auto-merge` and a hand-edited cap produce the same line; `--yes-i-will-merge` is still required every invocation, `--now` skips only the batching cap, and an empty queue reports `{"idle": true}` and exits 0 instead of dressing a quiet round up as a failure | `nightmerge`, `test_nightly_auto_merge.py` |
 | merged ≠ verified | `merge_regression_cmd` runs after each merge, on a checkout fast-forwarded to it; red ⇒ `regression_red`, queue stopped, base SHA printed, **no auto-rollback**; unconfigured ⇒ `pending_verification`, never success | `mergered` |
 | the queue cannot lie about what is left | `remaining` is computed against the whole reviewed order, so `--limit` cannot hide work; an already-MERGED PR is recorded `already_merged` — not a failure, and not a second merge | `mergeserial` |
 | a machine-read result is machine-readable | `merge --json` emits parseable JSON on every path, refusals included (`{"refused": true, "reason": …, "merged": []}`) | `mergegate` |
@@ -481,11 +539,18 @@ Run it yourself (no network, no global state, throwaway repos in `$TMPDIR`):
 
 ```bash
 python3 -m py_compile scripts/autoloop.py
-python3 tests/selftest.py            # 46 scenarios; add --only <name> for one
+python3 tests/selftest.py             # 47 scenarios; add --only <name> for one
+python3 -m unittest discover -s tests  # 69 tests: portable bootstrap + the merge drivers
 ```
 
-Latest full run on this machine: **684 passed, 0 failed (208.1 s)** — Python 3.14.6,
-git 2.50.1, macOS, load average ~4. The same suite took 1063 s at load average 213
+The `unittest` suite runs the real `install-cron.sh` against a `crontab` shim in `$TMPDIR`,
+so no version of this suite has ever touched the box's crontab — including the tests that
+install and remove a nightly entry.
+
+Latest full run on this machine: **721 passed, 0 failed (134 s)** and **69 tests, OK
+(46 s)** — Python 3.14.6,
+git 2.50.1, macOS, load average ~7. The *same* selftest took 391 s one hour earlier on the
+same box at load 16, and 1063 s at load average 213
 (`python3 -c pass` alone cost 3-9 s there), so the seconds are a property of the box, not
 a regression signal; the pass count is. The engine never touches the network in tests:
 `tests/fake_gh.py`
@@ -502,18 +567,27 @@ agent, `tests/bin/dsh` for the DeepSeekHarness CLI.
   merge path; this build grew one later (the 「PR 批量审查 + 受控合并」 instruction, §PR-1…§PR-6)
   and it ships **off**. `workerpr` still asserts the forbidden verb count is zero on the
   default path, where two agents deliver two PRs in one round and nothing merges;
-  `mergegate` and `mergeserial` exercise the opt-in line, and `fake_gh.py` refuses
-  `--admin`/`--force` even there, so a bypass cannot be tested into existence. §四 puts
-  branching, committing, pushing and the PR on the 开发 Agent;
+  `mergegate` and `mergeserial` exercise the opt-in line, `nightmerge` exercises the nightly
+  tier on top of it (the same two switches, put in a schedule — not a different code path),
+  and `fake_gh.py` refuses `--admin`/`--force` even there, so a bypass cannot be tested into
+  existence. §四 puts branching, committing, pushing and the PR on the 开发 Agent;
   `delivery.owner=supervisor` keeps the older split where no worker may
   touch the remote.
 - **Verification numbers, not billing numbers.** Counters are volumes; the money is on
   the worker CLIs' accounts.
+- **One URL in the protocol is older than the account.** PROTOCOL.md §二 names
+  `github.com/KEQingFeng/grokbot-autoloop`; the account is now `aritosi`, GitHub still
+  redirects the old path, and the protocol text stays byte-for-byte the user's own — so the
+  README and `preflight` print the current URL while §二 keeps the original. Nothing in this
+  build edits PROTOCOL.md to make a link look tidy.
 - **`gh` is optional.** Without it the loop pushes `auto/*` branches and prints the PR
   body, and says *why* in the log. It does not pretend a PR exists.
 - **No scheduler is installed by default.** §十 forbids claiming a background timer from a
   prompt alone, so `install-cron.sh` prints its options and writes only with `--write`,
-  and `watch` is offered as the in-session alternative you can actually see.
+  and `watch` is offered as the in-session alternative you can actually see. With
+  `caps.merge_enabled=true` the driver it prints and installs gains the `review` → `merge`
+  stage; with it false — the shipped default — the driver is tick-only and the merge line
+  stays wherever the user left it.
 
 ## Known limits
 
@@ -552,6 +626,21 @@ agent, `tests/bin/dsh` for the DeepSeekHarness CLI.
   of the merge itself. That is deliberate (a stale conclusion must not touch the base
   branch) but it is rate-limit-relevant on a big queue — which is what `merge_threshold`
   and `--limit` are for.
+- The nightly tier merges what it can *prove*, so on a night where the local gate never ran
+  for a branch, `review` holds that PR and the queue drains to zero merges. That is the
+  intended failure: a quiet `merge.out` is honest, a wrong merge is not. Read the tier's real
+  risk the other way too — a `regression_red` at 03:00 stops the queue and leaves the base
+  branch red until a human reads the report, because this engine never reverts and never
+  rewrites shared history. Choosing 夜间自己合 buys latency and pays for that window; the
+  早上人工合 tier buys the review and pays for the delay.
+- A quiet nightly round exits 0 (`{"idle": true}`), so `merge.out` is not an alert channel.
+  The signals that mean something are `merge.json`'s `stopped`, the `merge_queue_stopped` /
+  `pr_merged` events, and `alerts` — an exit code alone tells you only that the round did not
+  stop the queue.
+- The merge stage only runs if the *driver* runs. `install-cron.sh --write` verifies the line
+  is readable back in a crontab; it cannot verify a cron daemon fired it, and a sleeping box
+  merges nothing all night while every file above stays perfectly green. Same caveat as the
+  watchdog: the schedule is the thing you have to check, not the script.
 - `watchdog` is only as independent as the scheduler running it. If you schedule it from the
   same cron line as `tick`, a box whose cron is dead loses both at once and nothing pages
   you; the honest setup is a second scheduler, or a monitor that probes from outside the box.

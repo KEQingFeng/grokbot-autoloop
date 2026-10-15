@@ -1649,7 +1649,20 @@ def s_merge_serial():
             mj3 = json.loads(out)
         except json.JSONDecodeError:
             mj3 = {}
-        check(rc == 1 and mj3.get("reason") == "no_review" and mj3.get("merged") == [],
+        check(rc == 0 and mj3.get("idle") is True and mj3.get("merged") == [],
+              "刚 review 过、队里确实没有待审 PR → 空转轮报成 idle 而不是失败", out[-400:])
+        check(json.loads(read_text(os.path.join(box.alo, "merge.json"))).get("idle") is True,
+              "空转轮也落 merge.json，夜间产物永远是最后一轮的真相",
+              read_text(os.path.join(box.alo, "merge.json"))[:200])
+        check(any(e.get("kind") == "merge_idle" for e in events_of(box)),
+              "空转轮进了事件日志", events_of(box)[-1:])
+        os.remove(os.path.join(box.alo, "review.json"))
+        rc, out = box.run("merge", "--now", "--yes-i-will-merge", "--json")
+        try:
+            mj4 = json.loads(out)
+        except json.JSONDecodeError:
+            mj4 = {}
+        check(rc == 1 and mj4.get("reason") == "no_review" and mj4.get("merged") == [],
               "没有审查结论就拒绝合并，不靠上一轮的旧结论动手", out[-400:])
         check(len(merge_calls(box)) == 3, "整个过程只有三次 gh pr merge", merge_calls(box))
     finally:
@@ -1762,6 +1775,111 @@ def s_merge_regression_red():
         evs = [e for e in events_of(box, "pr_merged") if e.get("pr") == 4]
         check(evs and evs[0].get("result") == "pending_verification",
               "事件里也是待验证，日志和结论一致", evs[:1])
+    finally:
+        box.cleanup()
+
+
+def s_nightly_auto_merge():
+    head("夜间自动合并：--auto-merge 只写配置，tick 永不合并，动手的是唤醒驱动里的 review → merge")
+    box = Box("nightmerge")
+    base = box.base()
+    try:
+        check(not (box.config().get("caps") or {}).get("merge_enabled"),
+              "init 默认 caps.merge_enabled=false（PROTOCOL §八）", box.config().get("caps"))
+        push_branch(box, "auto/night", {
+            "src/night.py": "def night():\n    return 1\n",
+            "tests/test_night.py": "def test_night():\n    assert night() == 1\n"})
+        box.git("fetch", "-q", "origin")
+        seed_verified_task(box, "t01-night", "night 的边界情况", "auto/night")
+        box.gh_state({"prs": [pr_row(base, 1, "auto/night", 1.0, ci=GREEN_CI)],
+                      "next": 2, "auth": True, "search": "ok", "calls": [],
+                      "allow_merge": True})
+        sha0 = origin_sha(box, base)
+
+        # 关着的时候：循环和 merge 命令都动不了主分支
+        rc, out = box.run("tick")
+        check("合并线" not in out, "默认报告不提合并线，改动前它就是这个样子", out[-300:])
+        check(not merge_calls(box), "tick 不发 gh pr merge", merge_calls(box))
+        rc, out = box.run("merge", "--yes-i-will-merge", "--now")
+        check(rc == 3 and "merge 未启用" in out,
+              "开关关着时 --yes-i-will-merge 也拦得住 —— 双开关缺一不可", out[-400:])
+        check(not merge_calls(box) and origin_sha(box, base) == sha0,
+              "主分支停在原处", (merge_calls(box), sha0[:12]))
+
+        # 打开夜间档：写配置 + 记一笔事件，当场不合任何东西
+        rc, out = box.run("init", "--auto-merge")
+        check(rc == 0, "init --auto-merge 退出 0", out[-500:])
+        cfg = box.config()
+        check(cfg["caps"].get("merge_enabled") is True,
+              "caps.merge_enabled 被写成 true", cfg.get("caps"))
+        check("夜间自动合并线已开" in out, "输出说清打开的是哪条线", out[-900:])
+        check("循环本身永不合并" in out and "install-cron.sh" in out,
+              "同时说清开关不等于有人在跑它：命令要进唤醒驱动", out[-900:])
+        check("未配 merge_regression_cmd" in out,
+              "没配回归命令就当场告警，不让合完才说没人证明主分支还绿", out[-900:])
+        evs = events_of(box, "merge_line_enabled")
+        check(len(evs) == 1 and not evs[0].get("regression_cmd"),
+              "开线进了事件日志（谁开的、有没有配回归）", evs)
+        check(not merge_calls(box), "init --auto-merge 自己一条都不合", merge_calls(box))
+
+        # 回归命令单独配：不该再刷一遍开线事件，也不该把开关碰回去
+        rc, out = box.run("init", "--merge-regression-cmd", "bash tests/run.sh")
+        check(box.config().get("merge_regression_cmd") == "bash tests/run.sh",
+              "merge_regression_cmd 写进配置", box.config().get("merge_regression_cmd"))
+        check(box.config()["caps"].get("merge_enabled") is True, "配命令不会把开关关掉")
+        check(len(events_of(box, "merge_line_enabled")) == 1,
+              "只配命令不算重新开线，事件日志不虚增", events_of(box, "merge_line_enabled"))
+
+        # 关键不变量：开关开了，循环仍然不合并
+        rc, out = box.run("tick")
+        check(not merge_calls(box), "开关已开，tick 仍然不发 gh pr merge", merge_calls(box))
+        check(origin_sha(box, base) == sha0, "主分支依旧停在原处", sha0[:12])
+        check(not any(e.get("kind") == "pr_merged" for e in events_of(box)),
+              "没有合并就没有 pr_merged 事件", events_of(box))
+        check("合并线：已启用" in box.run("status")[1],
+              "报告里写明这条线是开的 —— 早上读报告的人要知道 PR 可能已经没了",
+              box.run("status")[1][-500:])
+        rc, out = box.run("init", "--auto-merge")
+        check(len(events_of(box, "merge_line_enabled")) == 2
+              and events_of(box, "merge_line_enabled")[1].get("already_enabled") is True,
+              "重复开线如实记成「本来就开着」，不假装是新动作",
+              events_of(box, "merge_line_enabled"))
+
+        # 真正动手的是驱动里的第二条命令
+        rc, out = box.run("review", "--json")
+        res = json.loads(out) if rc == 0 else {}
+        check(res.get("merge_order") == [1], "审查给出这一条可自动合并",
+              res.get("merge_order"))
+        check(res.get("merge_enabled") is True, "审查结论里带着合并线状态",
+              res.get("merge_enabled"))
+        check(not merge_calls(box), "review 只读，不动主分支", merge_calls(box))
+
+        rc, out = box.run("merge", "--yes-i-will-merge", "--now", "--json")
+        check(rc == 0, "唤醒驱动的第二条命令才真的合", out[-800:])
+        mj = json.loads(out) if rc == 0 else {}
+        check([m["pr"] for m in mj.get("merged", [])] == [1],
+              "合的就是审查队首那条", mj.get("merged"))
+        check((mj.get("merged") or [{}])[0].get("result") == "merged",
+              "配了回归命令且跑绿 → 记成 merged，不是待验证", mj.get("merged"))
+        check(len(merge_calls(box)) == 1
+              and all("--admin" not in c and "--force" not in c for c in merge_calls(box)),
+              "一次合并一次调用，且不绕过分支保护", merge_calls(box))
+        sha1 = origin_sha(box, base)
+        check(sha1 != sha0 and is_ancestor(box, "origin/auto/night", "origin/" + base),
+              "夜间档合完主分支真的前进了", (sha0[:12], sha1[:12]))
+
+        # 同一个夜里再跑一轮：空转必须是 rc 0，否则真停下时没人看得见
+        rc, out = box.run("review", "--json")
+        res = json.loads(out) if rc == 0 else {}
+        check(res.get("pending") == 0 and res.get("merge_order") == [],
+              "合掉的 PR 不再算待审", (res.get("pending"), res.get("merge_order")))
+        rc, out = box.run("merge", "--yes-i-will-merge", "--now", "--json")
+        check(rc == 0 and json.loads(out).get("idle") is True,
+              "空轮退出 0 并如实报 idle", out[-400:])
+        check(len(merge_calls(box)) == 1, "整夜总共只有一次 gh pr merge", merge_calls(box))
+        check(origin_sha(box, base) == sha1, "空轮没有再动主分支", sha1[:12])
+        check(box.state()["counters"]["jobs_today"] == 0,
+              "开线 + 审查 + 合并全程零模型调用", box.state()["counters"])
     finally:
         box.cleanup()
 
@@ -2692,6 +2810,7 @@ SCENARIOS = [
     ("mergegate", s_merge_refusal_ladder),
     ("mergeserial", s_merge_serial),
     ("mergered", s_merge_regression_red),
+    ("nightmerge", s_nightly_auto_merge),
     ("backup", s_backup_queue),
     ("manual", s_dispatch_by_hand),
     ("protocol", s_protocol_text),

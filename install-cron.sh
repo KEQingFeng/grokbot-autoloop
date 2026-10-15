@@ -23,6 +23,12 @@
 # This script never claims a daemon exists. It probes, prints, writes only with
 # --write, then re-reads the crontab and reports PASS or FAIL. Whichever driver you
 # pick, the hourly §七 report is a *command you run*: `autoloop.py report --patrol`.
+#
+# Nightly auto-merge: when .autoloop/config.json says caps.merge_enabled=true (set it
+# with `autoloop.py init --auto-merge`), every driver printed or installed here carries
+# the merge stage too — `review` then `merge --yes-i-will-merge --now`. Without that cap
+# the drivers only tick, because PROTOCOL §八 puts the merge decision with the user.
+# The loop never merges inside a tick: merging happens only through this explicit stage.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,7 +43,7 @@ while [ $# -gt 0 ]; do
     --every)  EVERY="${2:-10}"; shift 2 ;;
     --write)  ACTION="write"; shift ;;
     --remove) ACTION="remove"; shift ;;
-    -h|--help) sed -n '1,27p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '1,31p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "unknown flag: $1 (try --help)" >&2; exit 2 ;;
   esac
 done
@@ -48,10 +54,54 @@ REPO="$(cd "$REPO_ARG" 2>/dev/null && pwd)" || { echo "repo path not found: $REP
 PY="$(command -v python3 || true)"
 [ -n "$PY" ] || { echo "python3 missing — run bootstrap.sh first" >&2; exit 1; }
 
+# Is the merge line on? Read the cap out of the config the engine actually uses, so a
+# hand-edited .autoloop/config.json and `init --auto-merge` produce the same driver.
+CFG="$REPO/.autoloop/config.json"
+MERGE_ON=""
+MERGE_REG=""
+if [ -f "$CFG" ]; then
+  MERGE_ON="$($PY -c '
+import json,sys
+try:
+    cfg = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.exit(0)
+if (cfg.get("caps") or {}).get("merge_enabled"):
+    print("yes")
+' "$CFG" 2>/dev/null || true)"
+  MERGE_REG="$($PY -c '
+import json,sys
+try:
+    cfg = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.exit(0)
+print((cfg.get("merge_regression_cmd") or "").strip())
+' "$CFG" 2>/dev/null || true)"
+fi
+
 MARK="# autoloop-tick"
-LINE="*/$EVERY * * * * cd $REPO && $PY $ENGINE --repo $REPO tick --quiet >> $REPO/.autoloop/cron.out 2>&1 $MARK"
+TICK_STAGE="$PY $ENGINE --repo $REPO tick --quiet >> $REPO/.autoloop/cron.out 2>&1"
+# `;` not `&&`: a tick that found the lock held, or a review that had nothing to grade,
+# must not silently cancel the merge stage of the round it was scheduled after.
+MERGE_STAGE="$PY $ENGINE --repo $REPO review --json >> $REPO/.autoloop/merge.out 2>&1; $PY $ENGINE --repo $REPO merge --yes-i-will-merge --now --json >> $REPO/.autoloop/merge.out 2>&1"
+if [ -n "$MERGE_ON" ]; then
+  LINE="*/$EVERY * * * * cd $REPO && $TICK_STAGE; $MERGE_STAGE $MARK"
+else
+  LINE="*/$EVERY * * * * cd $REPO && $TICK_STAGE $MARK"
+fi
 
 echo "== AutoLoop wake-up — repo $REPO, every ${EVERY} min"
+if [ -n "$MERGE_ON" ]; then
+  echo "   合并线：已启用（caps.merge_enabled=true）—— 下面每个驱动都在 tick 之后接 review → merge。"
+  if [ -z "$MERGE_REG" ]; then
+    echo "   ! 未配 merge_regression_cmd：合并之后不跑回归，每条合并按 pending_verification（待验证）记账。"
+  else
+    echo "   合并后回归：$MERGE_REG（每条合并各跑一次，红了就停队列、不回滚）"
+  fi
+else
+  echo "   合并线：关闭（PROTOCOL §八 的默认值）—— 驱动里只有 tick，产出停在分支+PR 由你早上合。"
+  echo "   要夜间自己合：python3 $ENGINE --repo $REPO init --auto-merge --merge-regression-cmd '<回归命令>'，然后重跑本脚本。"
+fi
 echo ""
 echo "Option 1 (preferred for a reporting bot): Grok Bot native scheduled task"
 echo "  Create a scheduled/recurring task in the bot itself with this prompt text —"
@@ -61,6 +111,15 @@ echo ""
 echo "    cd $REPO && python3 $ENGINE --repo $REPO tick"
 echo "    (no --quiet here: the report on stdout is what you read and relay — one footer line."
 echo "    if it reports cap/halt/maintenance, say so; otherwise keep it to that one line.)"
+if [ -n "$MERGE_ON" ]; then
+  echo ""
+  echo "    合并线已开，同一个周期里再按顺序跑这两条（review 只读、merge 只合 auto_merge_ok 的）："
+  echo "    cd $REPO && python3 $ENGINE --repo $REPO review --json"
+  echo "    cd $REPO && python3 $ENGINE --repo $REPO merge --yes-i-will-merge --now --json"
+  echo "    单批上限是 caps.review_batch_max（默认 5）：review 每轮最多给这么多条 PR 出结论，"
+  echo "    merge 只按结论动手，所以一轮夜合的实际条数被它压住。--now 是跳过 merge_threshold(5)"
+  echo "    的凑批等待，不改任何逐条检查。"
+fi
 echo ""
 echo "  Why preferred: the box is a cloud agent's machine — it may be asleep between"
 echo "  bot turns, and a crontab line on a sleeping box silently never runs."
@@ -76,11 +135,21 @@ echo "  checks at its own cadence and lets finished work sit. It is not a daemon
 echo "  dies with the session, Ctrl-C stops it, and after 6 idle ticks it exits 4 with"
 echo "  空转 6 轮 instead of burning turns till dawn. Pair it with a scheduled task if"
 echo "  you need the loop to outlive this conversation, and say which one is running."
+if [ -n "$MERGE_ON" ]; then
+  echo ""
+  echo "  注意：watch 只跑 tick，它不合并任何东西 —— 60s 一次去重读 gh 再合 PR 会把"
+  echo "  rate limit 烧穿，也会让你没来得及看的 PR 先消失。用 Option 2 当开发驱动时，"
+  echo "  合并仍然要 Option 1 或 3 那条低频调度来跑。"
+fi
 echo ""
 echo "Option 3: box crontab"
 echo "  $LINE"
 echo "  --quiet is deliberate here: the full report goes to $REPO/.autoloop/log/<day>.md"
 echo "  anyway, and cron.out then only holds errors worth reading."
+if [ -n "$MERGE_ON" ]; then
+  echo "  合并两条的输出在 $REPO/.autoloop/merge.out —— 那是能被读回、被 grep 的 JSON，"
+  echo "  不是终端上滚过去的散文。合并结论同时写进 .autoloop/merge.json 和 events.jsonl。"
+fi
 echo "  Latency is the interval: a worker that finished a minute ago is discovered up to"
 echo "  ${EVERY} minutes later. If that gap matters on this box, run Option 2 as well."
 echo ""

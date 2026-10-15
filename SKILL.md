@@ -2,10 +2,10 @@
 name: grokbot-autoloop
 description: Turn Grok Bot into a 7×24 development supervisor on its own cloud computer — one spoken instruction starts a loop where the bot only plans and judges, headless worker CLIs on that box write the code with their own keys and open their own PR, and everything stops at a branch plus a PR for the human to merge in the morning. Use when the user says 直接开发 xx 项目, 开发 xx 项目, 全天候开发, 自动开发, 开始循环, 挂个循环, 一直开发到早上, 明早看 PR, 监工, or asks to keep developing a repo unattended, or before any multi-hour coding job that would otherwise run inside the bot's own context. Also use to stop, resume, or review such a loop, and use it FIRST for 我要开发个项目 / GitHub 还没连上这类请求 — preflight tells the user exactly what is missing instead of the bot quietly changing their environment.
 metadata:
-  version: "1.4.0"
+  version: "1.5.0"
   supervisor: Grok Bot — plans, monitors, recovers, schedules; never types the diff (§一)
   workers: PI or DeepSeek Harness (dsh) on GrokBot's cloud computer; other headless CLIs remain configurable
-  delivery: branch + PR only — the 开发 Agent opens its own PR, the human merges it (§四/§六)
+  delivery: branch + PR — the 开发 Agent opens its own PR and the human merges it (§四/§六); 夜间自己合 only via init --auto-merge plus a scheduled merge stage (§五)
   protocol: PROTOCOL.md in this plugin is the prompt to inject before every round (§二)
   license: MIT
 ---
@@ -111,6 +111,12 @@ bash <plugin>/install-cron.sh --repo <repo>          # prints all three drivers,
 bash <plugin>/install-cron.sh --repo <repo> --write  # only if the user chose box cron
 ```
 
+If the user chose 夜间自己合 (§五), `$ALO init --auto-merge [--merge-regression-cmd '…']`
+happens *before* the driver is printed, and those same two `install-cron.sh` lines then carry
+the `review` → `merge` stage — the driver is generated from `config.json`, there is no second
+installer for it. Without that instruction the driver is tick-only, and adding a merge command
+to it is not your call to make.
+
 `watch` exists because of 空转: a `tick`-only driver re-checks the box when the bot
 happens to wake, so a worker that finished three minutes ago still holds its slot for
 another seven. `watch` reaps every 60 s, which is the "about a minute after the Agent
@@ -181,11 +187,15 @@ The engine refuses these mechanically. Do not work around them, do not do it you
 instead, do not lower quality to keep the loop green:
 
 - no auto-merge, no deploy, no DB migration, no paid API, no mail/comment/notification
-  to a real user. Under the default `delivery.owner=worker` the 开发 Agent pushes its own
-  `auto/<task>` branch and opens its own PR (§四 of the protocol — the supervisor only
+  to a real user. The scheduled merge line (§五) is the one thing that can ever touch the
+  base branch, and it is the user's decision rather than the loop's: it exists only while
+  `caps.merge_enabled=true` **and** `--yes-i-will-merge`, and it runs as its own command,
+  never from inside a round. Under the default `delivery.owner=worker` the 开发 Agent pushes
+  its own `auto/<task>` branch and opens its own PR (§四 of the protocol — the supervisor only
   starts, monitors, recovers and schedules); that worker prompt still forbids merging,
-  closing, rebasing or touching `main` and another agent's branch, and the engine never
-  issues `pr merge`/`pr close`/`pr review` itself. Set `delivery.owner=supervisor` to
+  closing, rebasing or touching `main` and another agent's branch, and no loop command
+  issues `pr merge`/`pr close`/`pr review`: `tick` does not merge with the cap on, which is
+  what `nightmerge` asserts. Set `delivery.owner=supervisor` to
   get the v1.0.0 behaviour, where no worker touches the remote and the engine opens the
   PR after the gate goes green;
 - a PR that exists but did not pass the gate is **annotated, never touched**: the slot
@@ -260,6 +270,20 @@ raises a cap. `budget --json` prints the plan the next tick will actually use; `
 follows it unless you passed `--interval` yourself, because an explicit cadence is a human
 decision and humans outrank heuristics.
 
+Where the night *ends* is the user's choice, not a debate you re-open each round. The
+default is branch + PR, merged by a human in the morning. If the user chose 夜间自己合, the
+tier is `autoloop.py init --auto-merge [--merge-regression-cmd '<回归命令>']` (the only
+thing that writes `caps.merge_enabled`) plus a wake-up driver that carries the merge stage —
+`install-cron.sh` prints it, and installs it if asked, reading whatever `config.json` says,
+so a hand-edited cap and the flag produce the same driver. Its boundary is absolute: **you
+never run `merge` inside a turn, and you never "help" a night along from a `tick`.** With
+the cap on, `tick` and `watch` still emit zero `gh pr merge` — the only thing that moves the
+base branch is the scheduled `review` → `merge --yes-i-will-merge --now`. A round with
+nothing pending exits `0` and writes `{"idle": true}`; a quiet night is not an incident, and
+`merge.out` is not an alert channel. On this tier your morning job is to read
+`.autoloop/merge.json` and the `merge_*` events and report what landed, what stopped the
+queue, and what is still `pending_verification` — not to decide anything.
+
 `watchdog` is the one command meant for a **different** scheduler (cron / launchd / your
 monitor's own probe), because `tick` cannot report that it never ran and `watch` dies with
 the thing it watches. It reads state, disk and the workers' own logs, exits `0` / `3` warn /
@@ -318,7 +342,9 @@ its blockers into `.autoloop/review.json`, plus the order to merge in. Run it fr
 changes nothing.
 
 Merge nothing yourself from within the loop, and do not run `merge --yes-i-will-merge`
-unless the user turned the merge line on *and* told you to run it in this session.
+unless the user turned the merge line on *and* told you to run it in this session. On the
+夜间自己合 tier (§五) the user threw the switch by *scheduling* it — the driver runs that
+command, you don't; your part is to read what it did.
 `caps.merge_enabled` ships false and PROTOCOL.md §八 says the merge decision is the user's,
 so the two switches (config + that flag) are the user's to throw, not yours to infer. When
 they are thrown, the engine still re-reads every PR from gh immediately before acting, stops
@@ -352,7 +378,8 @@ branch `autoloop/state`): `state.json` `queue.json` `candidates.json` `blocked.j
 `review.json` `merge.json` `ledger.jsonl` `events.jsonl` `alerts.jsonl` `alert_acks.json`
 `watchdog.json` `log/<day>.md` `history/<day>.json` `jobs/`, plus the `STOP` / `HALTED`
 marker files — written by a human with `stop`/`halt`, or by the engine when a breaker
-trips, and `state.json["breakers"]` says which.
+trips, and `state.json["breakers"]` says which. On the 夜间自己合 tier the driver adds
+`merge.out` (its own raw JSON per round); the engine never creates it.
 
 `events.jsonl` is the audit trail `timeline` rebuilds a task from (§六's seven questions,
 no model call); `alerts.jsonl` is append-only and `alert_acks.json` is separate, so
@@ -391,6 +418,11 @@ returns without changing anything.
   actually wakes the bot. Verify each once, by hand, before trusting a night.
 - If the box cannot be woken, this is not a daemon — it is a loop you start. Say that
   plainly instead of claiming 7×24 coverage.
+- The 夜间自己合 tier (§五) inherits every limit of the driver it lives in: the merge stage
+  only runs when cron actually ran, `merge.out` is a log and not an alert channel (a quiet
+  round exits 0), and a `regression_red` stops the queue without reverting. None of it is a
+  decision you make in a turn — read `.autoloop/merge.json` in the morning and report what
+  landed, what stopped, and what is 待验证.
 - `watchdog` is only as independent as the scheduler that runs it. Scheduled from the same
   cron line as `tick`, a dead cron loses both at once and nothing pages you. Its
   `worker_stuck` finding inherits `stall_s`'s weakness (a legitimately slow step looks

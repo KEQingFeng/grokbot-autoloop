@@ -37,7 +37,7 @@ import sys
 import time
 from datetime import datetime
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 ALO_DIR = ".autoloop"
 
 DEFAULT_CAPS = {
@@ -85,9 +85,9 @@ DEFAULT_CAPS = {
     "backoff_max_s": 900,           # ceiling on a backed-off tick interval
     "alert_cooldown_min": 30,       # one ongoing problem = one open alert, not one per run
     "report_interval_s": 7200,      # delta report cadence; local generation only
-    "same_error_gate": 3,
-    "error_retry_base_s": 60,
-    "progress_stale_s": 900,
+    # `same_error_gate` / `error_retry_base_s` / `progress_stale_s` are already above;
+    # a dict literal silently keeps the last duplicate, so re-listing them here would
+    # look like a fifth tuning knob and actually be two places to change.
     "grok_daily_max": 0,            # no implicit model calls; zero disables escalation
 }
 
@@ -1769,6 +1769,13 @@ def report_text(ctx):
                  % (len([t for t in queue if t.get("status") not in ("done", "blocked")]),
                     len([t for t in cands if t.get("status") not in ("done", "blocked")]),
                     len(pend), len(blocked), len(ctx.coll("done.json"))))
+    # Only when the line is on: the default report must stay exactly as it read before
+    # this feature existed. A reader of the hourly report needs to know whether the PRs
+    # named above are waiting for them or have already been folded into main by the
+    # scheduled `merge --yes-i-will-merge` — tick itself never touches main, so say that.
+    if ctx.cap("merge_enabled"):
+        lines.append("- 合并线：已启用 —— 主分支由唤醒驱动里的 `merge --yes-i-will-merge` 推进，"
+                     "tick 不动它；昨夜合了哪几条看 .autoloop/merge.json 与 events.jsonl")
     for ref in st.get("pending_pr", []):
         lines.append("- pending_pr (cap reached): `%s` — verify green, waiting for a PR slot"
                      % ref.get("branch"))
@@ -1899,6 +1906,47 @@ def _pgrep(name):
     return None
 
 
+def _apply_merge_opts(ctx, args):
+    """`init --auto-merge` — the one command line allowed to turn the merge line on.
+
+    `caps.merge_enabled` ships false because PROTOCOL.md §八 puts the merge decision
+    with the user. Flipping it is therefore a deliberate human act, and `init` is the
+    command where the repo already asks a human for those calls (the runner, the gate
+    commands). Nothing else writes it: `tick`/`watch` never merge, and `merge` itself
+    still needs `--yes-i-will-merge` on every single invocation.
+
+    Turning the cap on does not merge anything by itself. It only makes
+    `install-cron.sh` include the review → merge stage in the driver it prints or
+    installs, so the nightly merge is a scheduled command the user can see.
+    """
+    auto = bool(getattr(args, "auto_merge", False))
+    reg = getattr(args, "merge_regression_cmd", None)
+    if not auto and reg is None:
+        return []
+    path = os.path.join(ctx.alo, "config.json")
+    cfg = read_json(path, {}) or {}
+    notes = []
+    if reg is not None:
+        cfg["merge_regression_cmd"] = reg
+        notes.append("- merge_regression_cmd = %s" % (reg.strip() or "(cleared)"))
+    if auto:
+        was = bool((cfg.get("caps") or {}).get("merge_enabled"))
+        cfg.setdefault("caps", {})["merge_enabled"] = True
+        notes.append("- caps.merge_enabled: %s → true —— 夜间自动合并线已开"
+                     % ("true" if was else "false"))
+    write_json(path, cfg)
+    ctx.cfg = ctx._load_cfg()
+    if auto:
+        ctx.event("config", "merge_line_enabled",
+                  regression_cmd=cfg.get("merge_regression_cmd") or None,
+                  already_enabled=was)
+        if not cfg.get("merge_regression_cmd"):
+            notes.append("  ! 未配 merge_regression_cmd：每条合并都会记成 pending_verification"
+                         "（待验证），合完之后主分支是否还绿没人证明。配上它，或接受"
+                         "报告里出现「待验证」。")
+    return notes
+
+
 def cmd_init(args):
     ctx = Ctx(args.repo)
     ctx.ensure_state()
@@ -1955,6 +2003,7 @@ def cmd_init(args):
             else:
                 log("- updated config.json commands; left verify.sh alone because it "
                     "may be hand-tuned. Pass --force-gate to regenerate it.")
+    merge_notes = _apply_merge_opts(ctx, args)
     if not os.path.exists(vsh):
         cfg = read_json(os.path.join(ctx.alo, "config.json"), {})
         with open(vsh, "w", encoding="utf-8") as fh:
@@ -1993,6 +2042,12 @@ def cmd_init(args):
     det = (read_json(os.path.join(ctx.alo, "config.json"), {}) or {}).get("verify", {})
     log("- detected gate: build=%s test=%s lint=%s"
         % (det.get("build") or "-", det.get("test") or "-", det.get("lint") or "-"))
+    for note in merge_notes:
+        log(note)
+    if getattr(args, "auto_merge", False):
+        log("  ! 开了开关不等于有人在跑它：循环本身永不合并。要让夜间真的自动合，"
+            "唤醒驱动里必须带这条 —— `bash install-cron.sh --repo %s` 会把它打印出来，"
+            "--write 时装进 crontab。" % ctx.root)
     if not det.get("test"):
         log("  ! no test command found. A loop without an external gate cannot "
             "prove anything. Edit .autoloop/config.json + verify.sh, or pass "
@@ -4535,7 +4590,7 @@ def cmd_preflight(args):
     have_id = (rc == 0 and name.strip()) or os.environ.get("GIT_AUTHOR_NAME")
     add("git identity", have_id, "user.name=%s user.email=%s" % (name.strip() or "-",
                                                                  mail.strip() or "-"),
-        'git config --global user.name "KEQingFeng" && git config --global '
+        'git config --global user.name "<你的 git 用户名>" && git config --global '
         'user.email "you@example.com"')
     add("repository", bool(root), root or "不是 git 仓库: %s" % requested,
         "git clone <your repo> && cd into it，或 git init")
@@ -4591,7 +4646,7 @@ def cmd_preflight(args):
         "cp -R %s/.. %s（不要覆盖已有同名目录）" % (here, os.path.dirname(skill_home)),
         level="warn")
     add("监督协议", bool(protocol_path()), protocol_path() or "PROTOCOL.md missing",
-        "git clone https://github.com/KEQingFeng/grokbot-autoloop", level="warn")
+        "git clone https://github.com/aritosi/grokbot-autoloop", level="warn")
     if ctx:
         add(".autoloop 已初始化", os.path.exists(os.path.join(ctx.alo, "state.json")),
             ctx.alo if os.path.isdir(ctx.alo) else "missing",
@@ -5216,12 +5271,31 @@ def cmd_merge(args):
         review = read_json(os.path.join(ctx.alo, "review.json"), {}) or {}
         rows = review.get("rows") or []
         if not rows or review.get("error"):
-            ctx.event("merge", "merge_refused", reason="no_review")
+            # A nightly driver runs `review` and `merge` back to back every round, so an
+            # empty queue is the normal case, not an incident. Reporting it as a failure
+            # would make every quiet night exit 1 — and a line that is always red is a
+            # line nobody reads when something really does stop. The refusal below still
+            # stands for a human who runs `merge` without a conclusion behind it.
+            if rows or review.get("error") or not args.now or review.get("pending") != 0:
+                ctx.event("merge", "merge_refused", reason="no_review")
+                ctx.save()
+                return _merge_refusal(args, 1, "no_review", [
+                    "没有可用的审查结论（review.json %s）—— 先跑 `review`。"
+                    % ("报错: %s" % review["error"][:120] if review.get("error") else "为空"),
+                    "不会在没有逐条审查结论的情况下合并任何 PR。"])
+            ctx.event("merge", "merge_idle", pending=0, reviewed_at=review.get("at"))
+            write_json(os.path.join(ctx.alo, "merge.json"),
+                       {"at": stamp(), "idle": True, "reviewed_at": review.get("at"),
+                        "merged": [], "skipped": [], "stopped": None, "remaining": []})
             ctx.save()
-            return _merge_refusal(args, 1, "no_review", [
-                "没有可用的审查结论（review.json %s）—— 先跑 `review`。"
-                % ("报错: %s" % review["error"][:120] if review.get("error") else "为空"),
-                "不会在没有逐条审查结论的情况下合并任何 PR。"])
+            say("本轮没有待审 PR（review 于 %s 确认 pending=0）—— 一条都不合并，"
+                "这不是失败。" % review.get("at"))
+            if args.json:
+                log(json.dumps({"at": stamp(), "idle": True, "refused": False,
+                                "dry_run": False, "reason": None, "merged": [],
+                                "skipped": [], "stopped": None, "remaining": []},
+                               ensure_ascii=False, indent=2))
+            return 0
         by_num = {r["pr"]: r for r in rows}
         order = review.get("merge_order") or []
         eligible = [by_num[n] for n in order if n in by_num]
@@ -5651,7 +5725,15 @@ def build_parser():
         (("--mode",), {"choices": ["day", "night"]}),
         (("--test-cmd",), {}), (("--lint-cmd",), {}), (("--build-cmd",), {}),
         (("--force-gate",), {"action": "store_true",
-                             "help": "regenerate verify.sh from the commands above"}))
+                             "help": "regenerate verify.sh from the commands above"}),
+        (("--auto-merge",), {"action": "store_true",
+                             "help": "把 caps.merge_enabled 写成 true：夜间由唤醒驱动跑 "
+                                     "review → merge --yes-i-will-merge 自己合。这一条"
+                                     "显式放弃 PROTOCOL §八 的默认红线，且每次合并仍需"
+                                     "该 flag，循环本身永不合并"}),
+        (("--merge-regression-cmd",), {"metavar": "CMD",
+                                       "help": "每条合并后在主分支上跑的回归命令；不填则"
+                                               "每条合并只记 pending_verification"}))
     add("tick", cmd_tick, "one supervisor cycle: recover, reap, verify, dispatch, report",
         (("--quiet",), {"action": "store_true"}),
         (("--no-ref",), {"action": "store_true", "help": "skip the GitHub reference search"}))

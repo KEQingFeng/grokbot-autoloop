@@ -1,0 +1,256 @@
+"""The nightly auto-merge driver: what `install-cron.sh` prints, installs, removes.
+
+The engine side lives in selftest.py (`s_nightly_auto_merge`). This file covers the one
+thing a user actually runs to get a nightly merge — the wake-up driver — against a fake
+`crontab(1)` in a temp dir. Nothing here touches the machine's real crontab.
+"""
+
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+sys.path.insert(0, os.path.dirname(__file__))
+from selftest import Box  # noqa: E402  (the throwaway repo + initialised .autoloop/)
+
+INSTALLER = Path(__file__).resolve().parents[1] / "install-cron.sh"
+
+CRONTAB_SHIM = """#!/bin/sh
+# Minimal crontab(1) stand-in: the table lives in $FAKE_CRONTAB_STORE.
+STORE="${FAKE_CRONTAB_STORE:?}"
+case "${1:-}" in
+  -l) if [ -f "$STORE" ]; then cat "$STORE"; else exit 1; fi ;;
+  -r) rm -f "$STORE" ;;
+  -)  cat > "$STORE" ;;
+  "") cat > "$STORE" ;;
+  *)  if [ -f "$1" ]; then cp "$1" "$STORE"; else echo "fake crontab: $1 is not a table" >&2; exit 1; fi ;;
+esac
+"""
+
+TOOLS = ("sed", "grep", "wc", "tr", "pgrep", "dirname", "basename", "cat", "cp",
+         "rm", "mktemp", "date", "sort", "head")
+
+
+class NightlyAutoMergeDriverTests(unittest.TestCase):
+    def setUp(self):
+        self.work = Path(tempfile.mkdtemp(prefix="autoloop-driver-"))
+        self.addCleanup(shutil.rmtree, self.work, True)
+        self.bin = self.work / "bin"
+        self.bin.mkdir()
+        shim = self.bin / "crontab"
+        shim.write_text(CRONTAB_SHIM)
+        shim.chmod(0o755)
+        self.store = self.work / "crontab.table"
+
+    def bare_bin(self):
+        """A PATH with everything the installer needs *except* crontab(1)."""
+        bare = self.work / "bare"
+        bare.mkdir(exist_ok=True)
+        for name in TOOLS:
+            found = shutil.which(name)
+            if found:
+                os.symlink(found, str(bare / name))
+        # python3 comes from its own real directory: the installer resolves `$PY` into
+        # the crontab line it prints, so a symlinked interpreter living under a path
+        # with a space would break the very line this test is checking.
+        return "%s:%s" % (bare, os.path.dirname(sys.executable))
+
+    def run_installer(self, repo, *args, crontab=True):
+        home = str(Path(repo).parent)
+        if crontab:
+            path = "%s:%s:/usr/bin:/bin" % (self.bin, os.path.dirname(sys.executable))
+        else:
+            path = self.bare_bin()
+        env = {"HOME": home, "PATH": path, "FAKE_CRONTAB_STORE": str(self.store)}
+        return subprocess.run(["/bin/bash", str(INSTALLER), "--repo", repo, *args],
+                              cwd=home, env=env, text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              timeout=60)
+
+    def table_lines(self):
+        if not self.store.exists():
+            return []
+        return [l for l in self.store.read_text().splitlines() if l.strip()]
+
+    def cron_line(self, text):
+        lines = [l for l in text.splitlines() if l.strip().startswith("*/")]
+        self.assertEqual(len(lines), 1, text)
+        return lines[0].strip()
+
+    def enable(self, box, regression="bash tests/run.sh"):
+        args = ["init", "--auto-merge"]
+        if regression:
+            args += ["--merge-regression-cmd", regression]
+        rc, out = box.run(*args)
+        self.assertEqual(rc, 0, out)
+
+    # -- the switch itself -------------------------------------------------------
+
+    def test_init_auto_merge_writes_the_cap_and_merges_nothing(self):
+        box = Box("driverinit")
+        try:
+            self.assertFalse((box.config().get("caps") or {}).get("merge_enabled"),
+                             "默认 caps.merge_enabled=false")
+            rc, out = box.run("init", "--auto-merge")
+            self.assertEqual(rc, 0, out)
+            self.assertTrue(box.config()["caps"]["merge_enabled"], box.config()["caps"])
+            self.assertIn("循环本身永不合并", out)
+            self.assertIn("install-cron.sh", out)
+            # turning the cap on must not merge, review or dispatch anything
+            self.assertFalse(os.path.exists(os.path.join(box.alo, "merge.json")))
+            self.assertFalse(os.path.exists(os.path.join(box.alo, "review.json")))
+            self.assertEqual(box.state()["counters"]["jobs_today"], 0)
+        finally:
+            box.cleanup()
+
+    def test_merge_regression_cmd_alone_does_not_open_the_line(self):
+        box = Box("driverreg")
+        try:
+            rc, out = box.run("init", "--merge-regression-cmd", "bash tests/run.sh")
+            self.assertEqual(rc, 0, out)
+            cfg = box.config()
+            self.assertEqual(cfg.get("merge_regression_cmd"), "bash tests/run.sh")
+            self.assertFalse((cfg.get("caps") or {}).get("merge_enabled"),
+                             "配置回归命令不等于授权合并：%s" % cfg.get("caps"))
+        finally:
+            box.cleanup()
+
+    # -- what the driver prints --------------------------------------------------
+
+    def test_print_with_the_line_off_shows_tick_only(self):
+        box = Box("driveroff")
+        try:
+            proc = self.run_installer(box.repo)
+            self.assertEqual(proc.returncode, 0, proc.stdout)
+            self.assertIn("合并线：关闭", proc.stdout)
+            self.assertIn("init --auto-merge --merge-regression-cmd", proc.stdout)
+            line = self.cron_line(proc.stdout)
+            self.assertIn("tick --quiet", line)
+            self.assertNotIn("review", line)
+            self.assertNotIn("--yes-i-will-merge", line)
+            self.assertIn("NOTHING WAS WRITTEN", proc.stdout)
+            self.assertEqual(self.table_lines(), [], "打印模式不装 crontab")
+        finally:
+            box.cleanup()
+
+    def test_print_with_the_line_on_shows_review_then_merge(self):
+        box = Box("driveron")
+        try:
+            self.enable(box)
+            proc = self.run_installer(box.repo)
+            self.assertEqual(proc.returncode, 0, proc.stdout)
+            self.assertIn("合并线：已启用", proc.stdout)
+            self.assertIn("合并后回归：bash tests/run.sh", proc.stdout)
+            self.assertIn("watch 只跑 tick", proc.stdout)
+            self.assertIn("merge.out", proc.stdout)
+            line = self.cron_line(proc.stdout)
+            self.assertIn("tick --quiet", line)
+            self.assertIn("review --json", line)
+            self.assertIn("merge --yes-i-will-merge --now --json", line)
+            self.assertLess(line.index("review --json"), line.index("merge --yes-i-will-merge"),
+                            "审查排在合并之前，顺序写死在驱动里：%s" % line)
+            # `;` not `&&`: a tick that found the lock held must not cancel the merge
+            self.assertIn("cron.out 2>&1; ", line, line)
+            self.assertNotIn("cron.out 2>&1 && ", line, line)
+        finally:
+            box.cleanup()
+
+    def test_print_warns_when_the_line_has_no_regression_command(self):
+        box = Box("drivernoreg")
+        try:
+            self.enable(box, regression=None)
+            proc = self.run_installer(box.repo)
+            self.assertIn("未配 merge_regression_cmd", proc.stdout)
+            self.assertIn("pending_verification", proc.stdout)
+        finally:
+            box.cleanup()
+
+    def test_hand_edited_config_produces_the_same_driver(self):
+        box = Box("driveredit")
+        try:
+            cfg = box.config()
+            cfg.setdefault("caps", {})["merge_enabled"] = True
+            cfg["merge_regression_cmd"] = "make ci"
+            box.write_config(cfg)
+            proc = self.run_installer(box.repo)
+            self.assertIn("合并线：已启用", proc.stdout)
+            self.assertIn("合并后回归：make ci", proc.stdout)
+            self.assertIn("make ci", json.dumps(cfg))
+        finally:
+            box.cleanup()
+
+    def test_no_crontab_still_prints_the_other_drivers(self):
+        box = Box("drivernocrontab")
+        try:
+            self.enable(box)
+            proc = self.run_installer(box.repo, crontab=False)
+            self.assertEqual(proc.returncode, 0, proc.stdout)
+            self.assertIn("no crontab(1)", proc.stdout)
+            self.assertIn("Option 1", proc.stdout)
+            self.assertIn("review --json", proc.stdout)
+        finally:
+            box.cleanup()
+
+    # -- installing and removing --------------------------------------------------
+
+    def test_write_installs_the_full_round_and_reads_it_back(self):
+        box = Box("driverwrite")
+        try:
+            self.enable(box)
+            proc = self.run_installer(box.repo, "--write", "--every", "15")
+            self.assertEqual(proc.returncode, 0, proc.stdout)
+            self.assertIn("PASS", proc.stdout)
+            lines = self.table_lines()
+            self.assertEqual(len(lines), 1, lines)
+            self.assertTrue(lines[0].startswith("*/15 * * * * "), lines[0])
+            for stage in ("tick --quiet", "review --json", "merge --yes-i-will-merge --now"):
+                self.assertIn(stage, lines[0], lines[0])
+        finally:
+            box.cleanup()
+
+    def test_write_twice_leaves_one_line(self):
+        box = Box("driveridem")
+        try:
+            self.enable(box)
+            self.assertEqual(self.run_installer(box.repo, "--write").returncode, 0)
+            proc = self.run_installer(box.repo, "--write")
+            self.assertEqual(proc.returncode, 0, proc.stdout)
+            mine = [l for l in self.table_lines() if "autoloop-tick" in l]
+            self.assertEqual(len(mine), 1, self.table_lines())
+        finally:
+            box.cleanup()
+
+    def test_remove_leaves_someone_elses_cron_alone(self):
+        box = Box("driverremove")
+        try:
+            self.store.write_text("0 6 * * * /usr/local/bin/other-job\n")
+            self.enable(box)
+            self.assertEqual(self.run_installer(box.repo, "--write").returncode, 0)
+            self.assertIn("autoloop-tick", self.store.read_text())
+            proc = self.run_installer(box.repo, "--remove")
+            self.assertEqual(proc.returncode, 0, proc.stdout)
+            self.assertIn("autoloop entries now: 0", proc.stdout)
+            self.assertEqual(self.table_lines(), ["0 6 * * * /usr/local/bin/other-job"],
+                             self.store.read_text())
+        finally:
+            box.cleanup()
+
+    def test_a_line_off_round_never_installs_a_merge_stage(self):
+        box = Box("driveroffwrite")
+        try:
+            proc = self.run_installer(box.repo, "--write")
+            self.assertEqual(proc.returncode, 0, proc.stdout)
+            self.assertIn("PASS", proc.stdout)
+            line = self.table_lines()[0]
+            self.assertIn("tick --quiet", line)
+            self.assertNotIn("--yes-i-will-merge", line, line)
+        finally:
+            box.cleanup()
+
+
+if __name__ == "__main__":
+    unittest.main()
