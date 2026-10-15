@@ -242,6 +242,23 @@ class FeedbackTests(unittest.TestCase):
         self.assertNotEqual(self.call("promote", id=item["id"])[0], 0)
         self.assertFalse((self.alo / "queue.json").exists())
 
+    def test_credentials_in_untrusted_mapping_keys_are_redacted(self):
+        token = "ghp_" + "KeyCredential1234567890"
+        fields = {"classification": {token: {"nested": token}, "safe": [token]}}
+        code, out = self.ingest([self.row(**fields)])
+        self.assertEqual(code, 0)
+        self.assertNotIn(token, json.dumps(out))
+        item = self.read("feedback.json")[0]
+        self.assertNotIn(token, json.dumps(item))
+        self.assertIn("credential_redacted", item["review_reasons"])
+        self.assertTrue(item["needs_review"])
+        self.assertNotEqual(self.call("promote", id=item["id"])[0], 0)
+        self.assertFalse((self.alo / "queue.json").exists())
+        code, out = self.call("list")
+        self.assertEqual(code, 0)
+        self.assertNotIn(token, json.dumps(out))
+        self.assertNotIn(token, (self.alo / "feedback.json").read_text())
+
     def test_historical_credentials_are_not_listed_or_promoted(self):
         token = "ghp_" + "HistoricalCredential1234567890"
         self.ingest([self.row()])

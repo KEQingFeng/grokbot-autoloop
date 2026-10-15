@@ -34,8 +34,22 @@ def _read(path, default):
 
 
 def _scrub(value):
+    """Redact credentials in string values *and* in mapping keys.
+
+    `autoloop.scrub_secrets` only walks values, but a feedback record carries
+    untrusted JSON in `classification`, and JSON keys are attacker-controlled
+    too. A token placed in a key would otherwise be written into feedback.json,
+    an append-only store that keeps it forever (§八 forbids credentials in state
+    files). Scrubbing keys here closes that leak at the one boundary where
+    untrusted keys are retained.
+    """
     from autoloop import scrub_secrets
 
+    if isinstance(value, dict):
+        return {(scrub_secrets(key) if isinstance(key, str) else key): _scrub(item)
+                for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_scrub(item) for item in value]
     return scrub_secrets(value)
 
 
