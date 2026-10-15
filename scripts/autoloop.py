@@ -836,17 +836,49 @@ def path_matches(pattern, path):
     return False
 
 
+def _is_glob(pattern):
+    return any(ch in pattern for ch in "*?[")
+
+
+def _glob_root(pattern):
+    """The literal directory a glob is anchored in, or "" when it has none.
+
+    `scripts/*.py` is anchored in `scripts`, `src/*/x.py` in `src`, and a pattern
+    whose very first segment is a wildcard (`**/x`, `*.py`) has no anchor. Used only
+    to compare two globs, where `path_matches` cannot help."""
+    norm = pattern.replace("\\", "/")
+    cut = min([norm.find(ch) for ch in "*?[" if ch in norm] or [len(norm)])
+    if cut == len(norm):
+        return norm.rstrip("/")
+    head = norm[:cut]
+    return head.rsplit("/", 1)[0].rstrip("/") if "/" in head else ""
+
+
 def paths_overlap(left, right):
+    """Do two declared `paths` scopes share at least one file? Conservative: a
+    false positive only serialises two tasks, a false negative lets two slots
+    edit the same file.
+
+    The old check only compared the two pattern strings, so a glob that matched
+    the other side's literal path (`scripts/*.py` vs `scripts/autoloop.py`) was
+    reported clean whenever the wildcard was not the final character — exactly
+    the case `path_matches` already knows how to decide.
+    """
     for a in left or []:
         for b in right or []:
             if a == b:
                 return True
-            if ("/**" in a or "**" in b or "*" in a or "*" in b):
-                pa = a.replace("/**", "*")
-                pb = b.replace("/**", "*")
-                if pa == pb or pa.rstrip("*").rstrip("/") == pb.rstrip("*").rstrip("/"):
-                    return True
-                if pa.startswith(pb.rstrip("*")) or pb.startswith(pa.rstrip("*")):
+            # A glob owns every path it matches, not just a sibling of its own
+            # text; `path_matches` is the engine's own definition of that relation.
+            if path_matches(a, b) or path_matches(b, a):
+                return True
+            # Two globs can still collide when neither matches the other's text
+            # as-is (`src/*/handler.py` vs `src/api/*.py`): compare their literal
+            # anchors at a path boundary, never by string prefix of the raw globs.
+            if _is_glob(a) and _is_glob(b):
+                ra, rb = _glob_root(a), _glob_root(b)
+                if ra and rb and (ra == rb or ra.startswith(rb + "/")
+                                  or rb.startswith(ra + "/")):
                     return True
     return False
 
