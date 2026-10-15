@@ -2383,7 +2383,14 @@ def _finish(ctx, lines, idle, quiet=False):
     # wasted turn would make `watch` bail out while a worker is still developing.
     busy = any((ctx.state["slots"].get(s) or {}).get("state") in ACTIVE_STATES
                for s in SLOTS)
-    c["idle_ticks"] = c.get("idle_ticks", 0) + 1 if (idle and not busy) else 0
+    # 空转 means the loop ran and found nothing to do. A tick that refused because
+    # the operator wrote STOP/HALTED (or set AUTOLOOP_HARD_STOP) is not that: the
+    # loop is deliberately down. Counting those ticks tripped the `idle` breaker over
+    # the human's own stop after idle_gate ticks, and then the patrol said
+    # 「熔断已断开（idle）」 instead of 「人工停止」 — the exact 「who stopped it」
+    # confusion state.json["breakers"] exists to prevent. A stop resets the streak.
+    counting = bool(idle) and idle != "stopped"
+    c["idle_ticks"] = c.get("idle_ticks", 0) + 1 if (counting and not busy) else 0
     gate = int(ctx.cap("idle_gate"))
     if gate and c["idle_ticks"] >= gate:
         # 空转熔断 (#12). Saying "more ticking will not help" and then ticking again
@@ -4724,9 +4731,22 @@ def cmd_watch(args):
                c.get("idle_ticks", 0), st.get("next") or "-"))
         if rc not in (0,):
             log("watch: tick 退出码 %s（环境或红线问题，见上面输出）" % rc)
-        if args.until_stop and (os.path.exists(os.path.join(ctx.alo, "STOP"))
-                                or os.path.exists(os.path.join(ctx.alo, "HALTED"))):
-            log("watch: 检测到 STOP/HALTED，退出前台循环")
+        flags = [f for f in ("STOP", "HALTED")
+                 if os.path.exists(os.path.join(ctx.alo, f))]
+        if flags:
+            # Who wrote the flag is the message. A flag a breaker wrote is an engine
+            # stop (exit 4, with its reset command); a bare flag is the operator's
+            # own `stop`/`halt`, and paging them (exit 4) for their own command is
+            # how the channel gets ignored. Either way, stop ticking: the loop is
+            # down, not 空转, and more ticks only spend the turn budget.
+            mine = [k for k, v in (st.get("breakers") or {}).items()
+                    if v.get("flag") in flags]
+            if mine and not args.until_stop:
+                log("watch: %s 是 autoloop 自己的熔断（%s）—— 退出前台循环，`%s` 合闸后重跑"
+                    % ("/".join(flags), "、".join(mine), BREAKERS[mine[0]]["reset"]))
+                return 4
+            log("watch: 检测到 %s（%s），退出前台循环"
+                % ("/".join(flags), "熔断：%s" % "、".join(mine) if mine else "人工停机"))
             return 0
         if int(c.get("idle_ticks") or 0) >= int(ctx.cap("idle_gate")) and not args.keep_spinning:
             log("watch: 连续空转 %s 轮（阈值 %s）—— 再 tick 也不会产出 PR。熔断已断开，"
