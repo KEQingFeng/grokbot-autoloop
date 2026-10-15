@@ -273,9 +273,10 @@ worker has no `gh` authorisation, or when an unverified diff must not become pub
 cargo, go, make) and writes `.autoloop/verify.sh` **plus** records them in
 `config.json`. `verify.sh` in `.autoloop/` is the *control copy*: the engine always
 executes the copy from the control checkout, fingerprints it (`sha256` in `doctor`),
-and `.autoloop/**` is a forbidden path for workers. An empty command prints `[SKIP]`,
-never `[PASS]` — and a tick whose every step is `[SKIP]` is **red**, because a loop
-that runs nothing has no right to call anything verified.
+and `.autoloop/**` is a forbidden path for workers — at *any* depth, so a nested
+`vendor/.autoloop/verify.sh` is a second copy of the rules and is refused too. An empty
+command prints `[SKIP]`, never `[PASS]` — and a tick whose every step is `[SKIP]` is
+**red**, because a loop that runs nothing has no right to call anything verified.
 
 ### Policy and approval
 
@@ -508,7 +509,7 @@ channel that copies the secret it is alerting about is a second incident.
 | the supervisor's chat log is not evidence | PR adoption re-reads `gh` by head branch; a self-reported PR that does not exist counts as zero | `workerpr`, `nomarker` |
 | a red PR is annotated, never destroyed | `pr_unverified` + 勿合并 in the patrol; no close, no force-push, the repair round updates the same PR | `badpr` (§六) |
 | tests are not negotiable | M/D/R on an existing test path is red; additions are fine | `redlines`, `unit` |
-| forbidden files untouched | `FORBIDDEN_GLOBS` (lockfiles, manifests, migrations, `.github/`, Dockerfiles, `.env*`, keys, `.autoloop/**`) | `redlines`, `unit` |
+| forbidden files untouched | `FORBIDDEN_GLOBS` (lockfiles, manifests, migrations, `.github/`, Dockerfiles, `.env*`, keys, `.autoloop/**`) — control dirs and CI config are refused at any depth, not only at the repo root | `redlines`, `unit` |
 | scope discipline | `paths` whitelist, disjoint between slots, new test files exempt | `collision`, `green` |
 | no secrets anywhere | `SECRET_LINE_RE` over the diff; state files and PR bodies are checked too | `redlines`, `unit` |
 | a finished worker does not squat in a slot | `AUTOLOOP_DONE` (or commits + silence) ⇒ session closed, gate run, delivery inside the same tick | `finish`, `nomarker` |
@@ -604,9 +605,10 @@ agent, `tests/bin/dsh` for the DeepSeekHarness CLI.
   only its own process group, so the failure mode is a wasted round, not a lost repo —
   but a repo with one very long build wants a higher `stall_s`, decided by a human.
 - Nothing here survives a hostile worker with write access to the *control* checkout.
-  `.autoloop/**` being a forbidden path plus `git add -A` catching force-adds covers the
-  accidental case; a box where the worker can edit `verify.sh` directly is outside the
-  threat model.
+  `.autoloop/**` being a forbidden path — at any depth, so a force-added
+  `vendor/.autoloop/verify.sh` is refused rather than silently becoming a second copy of
+  the gate rules — plus `git add -A` catching force-adds covers the accidental case; a
+  box where the worker can edit `verify.sh` directly is outside the threat model.
 - The 空转 judges are wall-clock timers, so they assume a box that is not oversubscribed.
   Measured here on 2026-10-14 with load average 213: `python3 -c pass` took 3-9 s, so a
   `watch_interval_s: 60` sweep could be a few seconds late and `preflight`'s CLI probe
