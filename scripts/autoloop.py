@@ -1827,7 +1827,12 @@ def cmd_doctor(args):
     for cand in ("pi", "dsh", "codex", "claude", "qoder", "grok", "aider", "opencode"):
         if which(cand):
             rc, out, _ = run(cand + " --version", timeout=20, shell=True)
-            workers[cand] = (out or "").splitlines()[0][:60] if rc == 0 else "present"
+            # A worker can exit 0 while printing nothing (or only whitespace) to stdout
+            # -- e.g. `pi --version` writes the version to stderr. `splitlines()[0]` on
+            # that would raise IndexError and take the whole `doctor` down, so an empty
+            # answer is reported as "present" rather than as a version string.
+            ver = (out or "").strip()
+            workers[cand] = ver.splitlines()[0][:60] if rc == 0 and ver else "present"
     log("- worker CLIs on this box: %s"
         % (", ".join("%s(%s)" % kv for kv in workers.items()) or
            "NONE — set AUTOLOOP_WORKER_CMD / runner.cmd"))
