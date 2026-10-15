@@ -2851,8 +2851,24 @@ def repair(ctx, rec, slot, pol, lines, failure):
         lines.append("- slot %s: repair resumes session %s" % (slot, sid[:24]))
     rec["job"] = meta["jid"]
     rec["state"] = "repairing"
+    # A repair round is a *new* run, so the flags that describe a run must not follow
+    # it. `stalled` is the one with teeth: verify_slot() reads it as a red reason
+    # ("went silent … never reported the task finished"), and `launch()` reuses the
+    # same job id for every round of a task, so a slot that stalled once could never
+    # go green again — the repair round that actually delivered was judged on the
+    # silence of the run it replaced and got blocked after max_repair_rounds. The
+    # *fact* is still worth keeping for the patrol (§七 must be able to say a run of
+    # this task was stopped), so it moves to `stall_seen`; the verdict does not.
+    if rec.get("stalled"):
+        rec["stall_seen"] = True
+        rec["stalled"] = False
     rec["worker_exit"] = None
     rec["timed_out"] = False
+    # Same class of leak, for the finish guard and the PR-claim check: a stale
+    # `marker_seen_at` closes the new session the moment it prints the marker, and a
+    # stale `done_signal` keeps reporting the old run's own claim.
+    rec["marker_seen_at"] = None
+    rec["done_signal"] = None
     ctx.state["counters"]["jobs_today"] = ctx.state["counters"].get("jobs_today", 0) + 1
 
 
@@ -3946,7 +3962,7 @@ def anomalies_of(ctx):
         if rec.get("pr_wrong_base"):
             out.append("PR #%s 的基分支是 %s，不是 %s"
                        % (rec.get("pr"), rec["pr_wrong_base"], ctx.base))
-        if rec.get("stalled"):
+        if rec.get("stalled") or rec.get("stall_seen"):
             out.append("slot %s worker 静默 %ss 被停（未打印 %s）"
                        % (slot, ctx.cap("stall_s"), DONE_MARKER))
         if rec.get("timed_out"):

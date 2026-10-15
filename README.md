@@ -513,7 +513,7 @@ channel that copies the secret it is alerting about is a second incident.
 | scope discipline | `paths` whitelist, disjoint between slots, new test files exempt | `collision`, `green` |
 | no secrets anywhere | `SECRET_LINE_RE` over the diff; state files and PR bodies are checked too | `redlines`, `unit` |
 | a finished worker does not squat in a slot | `AUTOLOOP_DONE` (or commits + silence) ⇒ session closed, gate run, delivery inside the same tick | `finish`, `nomarker` |
-| a silent worker is not waited on | `stall_s` ⇒ process group killed, reason recorded, repair round resumes the *same* agent session | `stall`, `dsh` |
+| a silent worker is not waited on | `stall_s` ⇒ process group killed, reason recorded, repair round resumes the *same* agent session — and that round is judged on its own run, so one silence cannot block the task | `stall`, `dsh`, `test_stall_repair_recovers` |
 | a hung worker cannot burn the budget | timeout ⇒ kill process group ⇒ force red | `timeout` (also asserts a tick returns in <5 s while the worker sleeps 20 s) |
 | a spinning loop says so out loud | `idle_gate` idle ticks ⇒ writes `STOP` (an open breaker, not a log line) + `watch` exits 4; a tick with work in flight never counts as idle; adding a task does **not** auto-resume | `idlespin` |
 | a loop that delivers nothing stops itself | `no_progress_gate` tasks ending blocked with nothing delivered ⇒ `HALTED` + a critical alert; a real PR resets the streak; `resume` clears file, record and streak | `noprog` |
