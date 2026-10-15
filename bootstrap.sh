@@ -1,26 +1,30 @@
 #!/usr/bin/env bash
-# 一键安装 AutoLoop 监工插件：装进 dsh 的技能目录，并对目标仓库做预检。
-#
-# 可重复执行（idempotent）：已经装着且内容一致时只报告，不覆盖；内容有变化时
-# 更新，并在更新前把旧版本备份到 ~/.dsh/skills-backup/。
+# 一键安装 AutoLoop 监工插件：GrokBot 做监工，PI/dsh 等编码 CLI 做 worker。
+# 技能目录不代表 worker 选择；worker 仍由 AUTOLOOP_WORKER_CMD / 项目配置指定。
+# 云机请显式提供 GrokBot 可读取的技能目录；本脚本不猜测 Grok 私有目录。
 #
 #   bash bootstrap.sh                       # 安装 + 探测环境 + 对当前目录跑 preflight
 #   bash bootstrap.sh /path/to/目标仓库      # 同上，位置参数也接受
 #   bash bootstrap.sh --repo /path/to/仓库   # 同上，长选项
+#   bash bootstrap.sh --skills-dir '/srv/bot skills' --repo /path/to/仓库
+#   AUTOLOOP_SKILLS_DIR=/srv/skills bash bootstrap.sh
 #   bash bootstrap.sh --install              # 额外打印缺失工具的安装命令（只打印）
 #   AUTOLOOP_TEST_CMD='npm test' bash bootstrap.sh /path/to/仓库
-#   FORCE=1 bash bootstrap.sh               # 内容不一致时强制刷新
+#   FORCE=1 bash bootstrap.sh               # 内容不一致时强制刷新（也可用 --force）
+#   bash bootstrap.sh --help                # 只显示帮助，不安装
 #
-# 这个脚本不装任何后台进程、不改你的 git 配置、不碰 GitHub、不替你 apt-get ——
-# 它只做三件事：复制技能文件、检查环境、告诉你下一步该敲哪条命令。
-# --install 会列出 env.manifest 里缺失项对应的安装命令，但坚持由你亲手执行：
-# §八 把「为解决问题而大规模重装、覆盖或重置现有环境」列为禁止项，插件不自作主张。
+# 技能目录优先级：--skills-dir > AUTOLOOP_SKILLS_DIR > DSH_SKILLS > ~/.dsh/skills。
+# --skills-dir 缺值/空值、选中的 AUTOLOOP_SKILLS_DIR 空值会在复制前报错（退出码 2）。
+# 可重复执行：内容一致时跳过；更新前备份旧版本。显式配置技能目录时，备份根默认
+# 为该目录同级的 skills-backup；未配置时仍为 ~/.dsh/skills-backup。
+# DSH_SKILLS_BACKUP 可覆盖备份根目录；DSH_SKILLS 保持兼容。
+#
+# 这个脚本不装后台进程、不改 git 配置、不碰 GitHub、不替你 apt-get。
+# 它只复制技能文件、检查环境、告诉你下一步命令；--install 只打印安装建议。
 set -uo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEST_ROOT="${DSH_SKILLS:-$HOME/.dsh/skills}"
-DEST="$DEST_ROOT/grokbot-autoloop"
-BACKUP_ROOT="${DSH_SKILLS_BACKUP:-$HOME/.dsh/skills-backup}"
+DEST_ROOT="${AUTOLOOP_SKILLS_DIR-${DSH_SKILLS:-$HOME/.dsh/skills}}"
 TARGET=""
 PLAN=0
 TEST_CMD="${AUTOLOOP_TEST_CMD:-}"
@@ -29,13 +33,29 @@ PY="${PYTHON:-python3}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo)  TARGET="${2:-}"; if [ $# -ge 2 ]; then shift 2; else shift; fi ;;
+    --skills-dir)
+      if [ $# -lt 2 ] || [ -z "${2:-}" ] || [[ "${2:-}" == -* ]]; then
+        echo "!! --skills-dir 需要非空路径参数" >&2
+        exit 2
+      fi
+      DEST_ROOT="$2"
+      shift 2 ;;
     --install|--install-yes|--yes) PLAN=1; shift ;;
     --force) FORCE=1; shift ;;
-    -h|--help) sed -n '1,17p' "${BASH_SOURCE[0]}"; exit 0 ;;
-    --*) echo "!! 未知参数: $1（--repo <路径> / --install / --force / --help）" >&2; exit 2 ;;
+    -h|--help) sed -n '2,/^set -uo pipefail/{ /^set -uo pipefail/d; p; }' "${BASH_SOURCE[0]}"; exit 0 ;;
+    --*) echo "!! 未知参数: $1（--skills-dir <路径> / --repo <路径> / --install / --force / --help）" >&2; exit 2 ;;
     *)   TARGET="$1"; shift ;;
   esac
 done
+if [ -z "$DEST_ROOT" ]; then
+  echo "!! AUTOLOOP_SKILLS_DIR 需要非空路径" >&2
+  exit 2
+fi
+while [ "$DEST_ROOT" != / ] && [[ "$DEST_ROOT" == */ ]]; do
+  DEST_ROOT="${DEST_ROOT%/}"
+done
+DEST="$DEST_ROOT/grokbot-autoloop"
+BACKUP_ROOT="${DSH_SKILLS_BACKUP:-$(dirname -- "$DEST_ROOT")/skills-backup}"
 RAW_TARGET="${TARGET:-${AUTOLOOP_REPO:-$PWD}}"
 TARGET="$(cd "$RAW_TARGET" 2>/dev/null && pwd)" || {
   echo "!! 目标仓库路径不存在: $RAW_TARGET —— 用 --repo <真实路径>，或先 cd 进仓库" >&2

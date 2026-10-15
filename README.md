@@ -44,16 +44,92 @@ says *直接开发 myrepo* gets preflight → init → suggest → watch instead
 | file | lines | what it does |
 |---|---|---|
 | `PROTOCOL.md` | 278 | the supervision protocol, verbatim: roles, loop cadence, delivery, red lines, the two hourly report templates, the state record |
-| `SKILL.md` | 285 | the supervisor-side policy: trigger keywords, preflight-first onboarding, tick contract, red lines |
-| `scripts/autoloop.py` | 5425 | the engine: 32 subcommands, state machine, gate, red lines, PR, `watch`/`round`/`preflight`, `watchdog`/`alerts`/`budget --json` |
-| `bootstrap.sh` | 138 | install the skill the way dsh reads it, probe `env.manifest`, then preflight + init + the next commands |
+| `SKILL.md` | 393 | the supervisor-side policy: trigger keywords, preflight-first onboarding, tick contract, red lines |
+| `scripts/autoloop.py` | 5502 | the engine: 33 subcommands, state machine, gate, red lines, PR, `watch`/`round`/`preflight`, `watchdog`/`alerts`/`budget --json` |
+| `bootstrap.sh` | 158 | install into the configured supervisor skill directory, probe `env.manifest`, then preflight + init |
+| `scripts/feedback.py` | 345 | local feedback classification, pending proposals, failure lessons and bounded intake rounds |
+| `tests/test_*.py` | — | 48 additional tests for portable bootstrap, PI adapter, launch guards and feedback CLI |
 | `env.manifest` | 23 | TAB-separated tool list (required / sched / pr / optional / worker) |
 | `install-cron.sh` | 138 | prints the three wake-up drivers, `--write` to install box cron, verifies |
-| `config.example.json` | 136 | every knob, with the reason each cap exists |
+| `config.example.json` | 142 | every knob, with the reason each cap exists |
 | `tests/selftest.py` | 2740 | 46 scenarios / 684 assertions against throwaway real git repos |
 | `tests/fake_worker.py` | 172 | stand-in worker, 16 modes: `good`/`slow`/`deliver` plus 13 misbehaviours |
 | `tests/fake_gh.py` | 244 | `gh` stand-in; records every call, always refuses `--admin`/`--force`, refuses `pr merge` unless a scenario opts in, file-locked |
 | `tests/bin/dsh` | 90 | `dsh` stand-in, so the DeepSeekHarness adapter (stdin prompt, `--json` events, `--session-id` resume) is really exercised |
+
+## GrokBot supervising PI / DeepSeek Harness
+
+GrokBot reads this skill and invokes the engine **on its cloud computer**. PI or
+DeepSeek Harness runs there as the coding worker; the plugin does not call a Grok
+API or require the supervisor and worker to share an account. A local installation
+on your laptop does not monitor a separate cloud computer. Transfer the plugin and
+run preflight on the machine that owns the repository and workers.
+
+Choose the skill directory that your GrokBot environment actually reads:
+`bash bootstrap.sh --skills-dir /actual/supervisor/skills --repo /actual/project`.
+`AUTOLOOP_SKILLS_DIR` provides the same setting; `DSH_SKILLS` remains compatible.
+No GrokBot private directory or scheduler API is assumed. Without a discoverable
+skill directory, have GrokBot read `SKILL.md` and `PROTOCOL.md` from the clone and
+invoke `python3 /path/to/plugin/scripts/autoloop.py --repo /actual/project …`.
+
+Worker candidates (verify against the cloud computer's installed version):
+
+| worker | candidate runner | verification status |
+|---|---|---|
+| DeepSeek Harness | `dsh --profile headless --json < {prompt_file}` | existing adapter regression tests; cloud credentials still need checking |
+| PI | `pi -p --mode json < {prompt_file}` | print/JSON documented at https://pi.dev; stdin and `--session` recovery require a real cloud run |
+
+PI detection uses `pi --help`; missing or failed probes are reported honestly. The
+PI executable on the development machine is a broken symlink, so this release does
+not claim a successful PI end-to-end run. Use a full executable path in `runner.cmd`
+if the cloud scheduler has a different PATH. Run two tasks and a repair before
+leaving it unattended; confirm session recovery uses the intended task's session.
+
+## Three input loops for GrokBot
+
+The supervisor collects feedback using its own authorized tools and saves real
+records as a JSON array. The engine provides no implicit X/Discord login, paid
+classifier, reply sender or release publisher. Example input:
+
+```json
+[{"source":"github","source_id":"owner/repo#42","title":"Crash on export",
+  "body":"Export crashes on Linux", "url":"https://github.com/owner/repo/issues/42",
+  "author":"reporter", "paths":["src/export.py"],
+  "acceptance":["Reproduce and verify export on Linux"]}]
+```
+
+Use a source ID containing the repository/channel/account scope, not a bare local
+counter. Sources are `github`, `discord`, `x`, `local`; use actual repository-relative
+file paths. Missing, nonexistent or unsafe paths never grant permission to work.
+Set `feedback.project_terms` in `.autoloop/config.json` to the project's name and
+aliases before social filtering. Without terms social items are filtered out;
+inspect `feedback list` and configure terms before relying on the result.
+
+```bash
+python3 scripts/autoloop.py --repo /project feedback cycle --lane github --file /input/github.json
+python3 scripts/autoloop.py --repo /project feedback cycle --lane social --file /input/social.json
+python3 scripts/autoloop.py --repo /project feedback cycle --lane maintenance
+python3 scripts/autoloop.py --repo /project feedback list
+python3 scripts/autoloop.py --repo /project feedback promote --id fb-REPLACE_WITH_REAL_ID
+python3 scripts/autoloop.py --repo /project approve feedback-REPLACE_WITH_REAL_ID
+```
+
+Each invocation performs one bounded round. GitHub/social without an input file
+reports `source_not_configured`. Maintenance runs the existing bounded candidate
+scanner and extracts evidence from real failure events into `lessons.json`; these
+remain `pending_confirmation`, never automatic permanent rules or contributor bans.
+`feedback.json` deduplicates source + source ID, preserves a previous proposal on
+update, and records classification and any reply draft. Eligible bug/feature items
+become `needs_approval` tasks; an imported classification cannot approve a task.
+Advertisement replies stay drafts, including the specified intermediary-ad template.
+Rules make no paid model call; uncertain items require supervisor judgement. No Jev
+integration is claimed. GrokBot can use a separately authorized classifier, but its
+labels remain untrusted input and do not bypass review.
+
+Schedule these three commands through the GrokBot scheduler the user actually
+enabled, or invoke them manually. They share the original A/B worker slots and
+budgets; they do not create three workers or install a scheduler. New intake commands
+use the engine lock. This is not evidence that a remote scheduler wakes successfully.
 
 ## Install on the cloud box
 
@@ -66,11 +142,11 @@ git clone https://github.com/KEQingFeng/grokbot-autoloop.git ~/grokbot-autoloop 
 #    Every gap comes back with the exact command; the engine never runs them for you.
 python3 scripts/autoloop.py --repo /path/to/your/repo preflight
 
-# 3. probe the box's tools and install the skill into dsh's skill directory.
+# 3. probe tools and install into the supervisor's confirmed skill directory.
 #    --install additionally prints the install command for each missing tool — and
 #    stops there: this script never runs apt/brew for you (§八 forbids a script
 #    reinstalling the environment to keep a loop going).
-bash bootstrap.sh --repo /path/to/your/repo
+bash bootstrap.sh --skills-dir /actual/supervisor/skills --repo /path/to/your/repo
 
 # 4. teach the loop how to prove its work, and who does it
 python3 scripts/autoloop.py --repo /path/to/your/repo init \
