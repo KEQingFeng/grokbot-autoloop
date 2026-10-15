@@ -58,7 +58,7 @@ says *直接开发 myrepo* gets preflight → init → suggest → watch instead
 |---|---|---|
 | `PROTOCOL.md` | 278 | the supervision protocol, verbatim: roles, loop cadence, delivery, red lines, the two hourly report templates, the state record |
 | `SKILL.md` | 512 | the supervisor-side policy: trigger keywords, one-instruction onboarding (including the `start` fast path), cadence table, tick contract, red lines, quota rules |
-| `scripts/autoloop.py` | 6445 | the engine: 37 subcommands, state machine, gate, red lines, PR, `watch`/`light`/`round`/`preflight`/`start`, `watchdog`/`alerts`/`budget`, `lifecycle`/`metrics` |
+| `scripts/autoloop.py` | 6479 | the engine: 37 subcommands, state machine, gate, red lines, PR, `watch`/`light`/`round`/`preflight`/`start`, `watchdog`/`alerts`/`budget`, `lifecycle`/`metrics` |
 | `bootstrap.sh` | 158 | install into the configured supervisor skill directory, probe `env.manifest`, then preflight + init |
 | `scripts/feedback.py` | 345 | local feedback classification, pending proposals, failure lessons and bounded intake rounds |
 | `tests/test_*.py` | — | 70 additional tests for portable bootstrap, the nightly merge driver, PI adapter, launch guards, feedback CLI, progress clock and reporting |
@@ -621,15 +621,15 @@ Run it yourself (no network, no global state, throwaway repos in `$TMPDIR`):
 ```bash
 python3 -m py_compile scripts/autoloop.py
 python3 tests/selftest.py             # 51 scenarios; add --only <name> for one
-python3 -m unittest discover -s tests  # 70 tests: portable bootstrap + the merge drivers
+python3 -m unittest discover -s tests  # 80 tests: portable bootstrap + the merge drivers
 ```
 
 The `unittest` suite runs the real `install-cron.sh` against a `crontab` shim in `$TMPDIR`,
 so no version of this suite has ever touched the box's crontab — including the tests that
 install and remove the three nightly entries.
 
-Latest full run on this machine: **763 passed, 0 failed (173 s)** and **70 tests, OK
-(36 s)** — Python 3.14.6,
+Latest full run on this machine: **763 passed, 0 failed (373 s)** and **80 tests, OK
+(53 s)** — Python 3.14.6,
 git 2.50.1, macOS. The seconds are a property of the box, not a regression signal: the same
 selftest took 391 s one hour earlier on this box at load 16, and 1063 s at load average 213
 (`python3 -c pass` alone cost 3-9 s there), so the pass count is what matters. The engine
