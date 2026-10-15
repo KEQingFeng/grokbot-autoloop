@@ -112,10 +112,19 @@ FORBIDDEN_GLOBS = [
     "package.json", "pyproject.toml", "requirements*.txt", "go.mod", "Gemfile",
     "pom.xml", "build.gradle*", "Cargo.toml", "setup.py", "setup.cfg",
     "migrations/*", "**/migrations/*", "*migration*/*.sql",
-    ".github/workflows/*", ".github/*", "Dockerfile*", "docker-compose*",
+    ".github/workflows/*", ".github/*", "**/.github/*", "Dockerfile*", "docker-compose*",
     ".env*", "*.pem", "*.key", "*.p12", "*.jks", "*secret*", "*credential*",
     "id_rsa*", ".npmrc", ".pypirc", ".netrc",
-    ".autoloop/*", ".autoloop/**/*",
+    # The loop's own control directory is forbidden at any depth, not just at the
+    # root. A worker that creates `vendor/.autoloop/verify.sh` is smuggling in a
+    # second copy of the rules it is judged by (the §四 contract is that the gate
+    # runs from the control copy at the repo root), and a nested `.github/` is a
+    # CI config change wearing a path-scoped task's clothes. `.autoloop/*` only
+    # matches at the root, and `.autoloop/**/*` matches a file *inside* the
+    # directory but never the directory's own entry point, so both of these were
+    # reported clean by `redline_check` — proven by a committed diff, not a
+    # hypothetical. `migrations/` above already uses this `**/` form.
+    ".autoloop/*", ".autoloop/**/*", "**/.autoloop/*", "**/.autoloop/**/*",
 ]
 FORBIDDEN_GLOBS = sorted(set(FORBIDDEN_GLOBS))
 
@@ -1081,15 +1090,15 @@ def changed_files(ctx, wt, base):
 
 def diff_stat(ctx, wt, base):
     rc, out, _ = git("diff --stat %s...HEAD" % base, cwd=wt)
-    lines = 0
-    hit = re.search(r"(\d+) insertions?.*?(\d+) deletions?", out or "")
-    if hit:
-        lines = int(hit.group(1)) + int(hit.group(2))
-    elif out:
-        tail = out.strip().splitlines()
-        if tail and not hit:
-            add = re.search(r"(\d+)\s+", tail[-1])
-            lines = int(add.group(1)) if add else 0
+    # Count insertions and deletions independently, from the summary line only.
+    # The old parser required both phrases on one line, so a pure-addition diff
+    # ("1 file changed, 500 insertions(+)") matched nothing and fell through to a
+    # fallback that read the leading *file count* as the churn: a 500-line
+    # single-file change counted as 1 line and slipped under max_business_lines,
+    # while the risk score that shares this number was understated too.
+    summary = (out or "").strip().splitlines()
+    lines = sum(int(n) for n in re.findall(
+        r"(\d+) (?:insertion|deletion)s?\(", summary[-1] if summary else ""))
     return out or "", lines
 
 
@@ -1842,7 +1851,12 @@ def cmd_doctor(args):
     for cand in ("pi", "dsh", "codex", "claude", "qoder", "grok", "aider", "opencode"):
         if which(cand):
             rc, out, _ = run(cand + " --version", timeout=20, shell=True)
-            workers[cand] = (out or "").splitlines()[0][:60] if rc == 0 else "present"
+            # A worker can exit 0 while printing nothing (or only whitespace) to stdout
+            # -- e.g. `pi --version` writes the version to stderr. `splitlines()[0]` on
+            # that would raise IndexError and take the whole `doctor` down, so an empty
+            # answer is reported as "present" rather than as a version string.
+            ver = (out or "").strip()
+            workers[cand] = ver.splitlines()[0][:60] if rc == 0 and ver else "present"
     log("- worker CLIs on this box: %s"
         % (", ".join("%s(%s)" % kv for kv in workers.items()) or
            "NONE — set AUTOLOOP_WORKER_CMD / runner.cmd"))
@@ -2396,7 +2410,14 @@ def _finish(ctx, lines, idle, quiet=False):
     # wasted turn would make `watch` bail out while a worker is still developing.
     busy = any((ctx.state["slots"].get(s) or {}).get("state") in ACTIVE_STATES
                for s in SLOTS)
-    c["idle_ticks"] = c.get("idle_ticks", 0) + 1 if (idle and not busy) else 0
+    # 空转 means the loop ran and found nothing to do. A tick that refused because
+    # the operator wrote STOP/HALTED (or set AUTOLOOP_HARD_STOP) is not that: the
+    # loop is deliberately down. Counting those ticks tripped the `idle` breaker over
+    # the human's own stop after idle_gate ticks, and then the patrol said
+    # 「熔断已断开（idle）」 instead of 「人工停止」 — the exact 「who stopped it」
+    # confusion state.json["breakers"] exists to prevent. A stop resets the streak.
+    counting = bool(idle) and idle != "stopped"
+    c["idle_ticks"] = c.get("idle_ticks", 0) + 1 if (counting and not busy) else 0
     gate = int(ctx.cap("idle_gate"))
     if gate and c["idle_ticks"] >= gate:
         # 空转熔断 (#12). Saying "more ticking will not help" and then ticking again
@@ -4930,9 +4951,22 @@ def cmd_watch(args):
                c.get("idle_ticks", 0), st.get("next") or "-"))
         if rc not in (0,):
             log("watch: tick 退出码 %s（环境或红线问题，见上面输出）" % rc)
-        if args.until_stop and (os.path.exists(os.path.join(ctx.alo, "STOP"))
-                                or os.path.exists(os.path.join(ctx.alo, "HALTED"))):
-            log("watch: 检测到 STOP/HALTED，退出前台循环")
+        flags = [f for f in ("STOP", "HALTED")
+                 if os.path.exists(os.path.join(ctx.alo, f))]
+        if flags:
+            # Who wrote the flag is the message. A flag a breaker wrote is an engine
+            # stop (exit 4, with its reset command); a bare flag is the operator's
+            # own `stop`/`halt`, and paging them (exit 4) for their own command is
+            # how the channel gets ignored. Either way, stop ticking: the loop is
+            # down, not 空转, and more ticks only spend the turn budget.
+            mine = [k for k, v in (st.get("breakers") or {}).items()
+                    if v.get("flag") in flags]
+            if mine and not args.until_stop:
+                log("watch: %s 是 autoloop 自己的熔断（%s）—— 退出前台循环，`%s` 合闸后重跑"
+                    % ("/".join(flags), "、".join(mine), BREAKERS[mine[0]]["reset"]))
+                return 4
+            log("watch: 检测到 %s（%s），退出前台循环"
+                % ("/".join(flags), "熔断：%s" % "、".join(mine) if mine else "人工停机"))
             return 0
         if int(c.get("idle_ticks") or 0) >= int(ctx.cap("idle_gate")) and not args.keep_spinning:
             log("watch: 连续空转 %s 轮（阈值 %s）—— 再 tick 也不会产出 PR。熔断已断开，"
