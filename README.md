@@ -54,7 +54,7 @@ says *直接开发 myrepo* gets preflight → init → suggest → watch instead
 | `scripts/feedback.py` | 345 | local feedback classification, pending proposals, failure lessons and bounded intake rounds |
 | `tests/test_*.py` | — | 69 additional tests for portable bootstrap, the nightly merge driver, PI adapter, launch guards, feedback CLI, progress clock and reporting |
 | `env.manifest` | 23 | TAB-separated tool list (required / sched / pr / optional / worker) |
-| `install-cron.sh` | 207 | prints the three wake-up drivers — with the `review` → `merge` stage attached when the merge line is on — `--write` to install box cron, verifies |
+| `install-cron.sh` | 232 | prints the three wake-up drivers — with the `review` → `merge` stage attached when the merge line is on — `--write` to install box cron, verifies |
 | `config.example.json` | 143 | every knob, with the reason each cap exists |
 | `tests/selftest.py` | 2859 | 47 scenarios / 721 assertions against throwaway real git repos |
 | `tests/fake_worker.py` | 172 | stand-in worker, 16 modes: `good`/`slow`/`deliver` plus 13 misbehaviours |
