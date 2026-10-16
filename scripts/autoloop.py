@@ -3728,6 +3728,11 @@ def cmd_reject(args):
 
 def _triage(ctx, ids, approve, note=""):
     ctx.need_init()
+    # The same rule as `ack_alerts`: an operator-written note is persisted, so it goes
+    # through `scrub_secrets` first. The note is where somebody pastes the log line or
+    # command they are triaging from, and `candidates.json` / `queue.json` are state
+    # files the README promises contain no credentials.
+    note = scrub_secrets(note or "")
     queue, cands = load_tasks(ctx)
     hit = 0
     reopened = []
@@ -4220,6 +4225,12 @@ def ack_alerts(ctx, ids, note=""):
     for rec in alert_records(ctx):
         if rec.get("alert_id"):
             by_id[rec["alert_id"]] = rec
+    # The note is the field that invites a secret: `alerts --ack --note` is documented
+    # as 「确认时附一句处理说明」, so the natural thing to paste is the log line or the
+    # command being investigated. `alert()` and `ctx.event` both scrub what they write;
+    # this file was the one path into persistent state that did not, and README's
+    # invariant — no credentials in state files — has to hold for the note too.
+    note = scrub_secrets(note or "")
     done, unknown = [], []
     for aid in ids:
         rec = by_id.get(aid)
@@ -4229,11 +4240,11 @@ def ack_alerts(ctx, ids, note=""):
         acks[aid] = {"dedupe_key": rec.get("dedupe_key"),
                      "episode_first_seen": rec.get("first_seen_epoch"),
                      "kind": rec.get("kind"), "severity": rec.get("severity"),
-                     "ts": stamp(), "epoch": now(), "note": note or ""}
+                     "ts": stamp(), "epoch": now(), "note": note}
         done.append(aid)
     if done:
         write_json(os.path.join(ctx.alo, "alert_acks.json"), acks)
-        ctx.event("guard", "alert_acked", ids=done, note=(note or "")[:200])
+        ctx.event("guard", "alert_acked", ids=done, note=note[:200])
     return done, unknown
 
 

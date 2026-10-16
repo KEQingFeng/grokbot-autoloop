@@ -518,7 +518,7 @@ channel that copies the secret it is alerting about is a second incident.
 | tests are not negotiable | M/D/R on an existing test path is red; additions are fine | `redlines`, `unit` |
 | forbidden files untouched | `FORBIDDEN_GLOBS` (lockfiles, manifests, migrations, `.github/`, Dockerfiles, `.env*`, keys, `.autoloop/**`) — control dirs and CI config are refused at any depth, not only at the repo root | `redlines`, `unit` |
 | scope discipline | `paths` whitelist, disjoint between slots, new test files exempt | `collision`, `green` |
-| no secrets anywhere | `SECRET_LINE_RE` over the diff; state files and PR bodies are checked too | `redlines`, `unit` |
+| no secrets anywhere | `SECRET_LINE_RE` over the diff; state files and PR bodies are checked too, and the free-text notes an operator writes (`alerts --ack --note`, `approve`/`reject --note`) are scrubbed before they reach `alert_acks.json` / the task pools | `redlines`, `unit`, `test_operator_note_scrub.py` |
 | a finished worker does not squat in a slot | `AUTOLOOP_DONE` (or commits + silence) ⇒ session closed, gate run, delivery inside the same tick | `finish`, `nomarker` |
 | a silent worker is not waited on | `stall_s` ⇒ process group killed, reason recorded, repair round resumes the *same* agent session — and that round is judged on its own run, so one silence cannot block the task | `stall`, `dsh`, `test_stall_repair_recovers` |
 | a hung worker cannot burn the budget | timeout ⇒ kill process group ⇒ force red | `timeout` (also asserts a tick returns in <5 s while the worker sleeps 20 s) |
