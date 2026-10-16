@@ -159,6 +159,12 @@ SECRET_LINE_RE = re.compile(
 SLOTS = ("A", "B")
 ACTIVE_STATES = ("developing", "verifying", "repairing")
 DONE_STATES = ("pr_open", "pr_ready", "blocked", "idle", None)
+# Pool-row `status` values that mean "no human triage can start this": `eligible()`
+# and `pick_task()` already refuse all four, so anything that asks the operator for an
+# `approve` has to refuse them too. `rejected` is in here on purpose — `approve`
+# reverses it, but until somebody does, the row is not a pending decision.
+POOL_TERMINAL_STATUSES = ("done", "blocked", "pr_open", "rejected")
+
 
 # §三 task lifecycle. Slot states above describe *where the work is running*; these
 # describe what is known about the task itself, and they are the states a recovering
@@ -1687,7 +1693,7 @@ def known_keys(ctx):
 
 def eligible(ctx, task, pol, mode):
     """Why this task may/may not start right now. Returns (ok, reason)."""
-    if task.get("status") in ("done", "blocked", "pr_open", "rejected"):
+    if task.get("status") in POOL_TERMINAL_STATUSES:
         return False, "already %s" % task.get("status")
     for ref in ctx.state.get("pending_pr", []):
         if ref.get("task") == task.get("id"):
@@ -1713,8 +1719,8 @@ def pick_task(ctx, pol, mode):
     queue, cands = load_tasks(ctx)
     last = "pool is empty"
     for pool, label in ((queue, "queue"), (cands, "candidate")):
-        ranked = sorted([t for t in pool if t.get("status") not in ("done", "blocked",
-                                                                    "rejected", "pr_open")],
+        ranked = sorted([t for t in pool
+                         if t.get("status") not in POOL_TERMINAL_STATUSES],
                         key=lambda t: -int(t.get("priority") or 0))
         for task in ranked:
             ok, why = eligible(ctx, task, pol, mode)
@@ -1722,6 +1728,35 @@ def pick_task(ctx, pol, mode):
                 return task, label, ""
             last = why or last
     return None, "", last
+
+
+def awaiting_decision(ctx, pol=None):
+    """Pool rows a human still has to triage: `needs_approval`, not yet approved.
+
+    One definition for the three places that ask for that decision — `report`'s
+    「needs your decision」 line, `next_action` (the fixed footer's 下一步) and the
+    §十 「待我授权」 record — because each of them had its own, and all three were
+    wrong in the same way: they listed a row without reading `status`, so an id the
+    operator had already `reject`ed (which writes `status="rejected"`, a status
+    `pick_task` refuses outright) kept being named as 「waiting for your decision」,
+    while `plan` refused it as terminal. Two of the three also read only one pool,
+    so a `queue --add` row appeared in the report and vanished from `round`.
+
+    The policy rule is `eligible()`'s own: an explicit `policy` on the row wins,
+    otherwise the kind decides.
+    """
+    pol = pol if pol is not None else read_policy(ctx)
+    queue, cands = load_tasks(ctx)
+    out = []
+    for task in queue + cands:
+        if task.get("status") in POOL_TERMINAL_STATUSES:
+            continue
+        need = kind_policy(task.get("kind", "misc"), pol)
+        if task.get("policy") in ("auto_apply", "needs_approval"):
+            need = task["policy"]
+        if need == "needs_approval" and not task.get("approved"):
+            out.append(task)
+    return out
 
 
 def new_task_id(ctx, title):
@@ -1795,10 +1830,10 @@ def report_text(ctx):
         lines.append("| %(slot)s | `%(branch)s` | %(task)s | %(state)s | %(scope)s | "
                      "%(last)s | %(verify)s | %(job)s | %(pr)s | %(next)s |" % r)
     queue, cands = load_tasks(ctx)
-    pol = read_policy(ctx)
-    pend = [t for t in queue + cands
-            if (t.get("policy") or kind_policy(t.get("kind", "misc"), pol)) == "needs_approval"
-            and not t.get("approved") and t.get("status") not in ("done", "blocked")]
+    # A rejected row is not a pending decision: `reject` writes status="rejected" and
+    # `pick_task` refuses it, so naming it here sent the operator back to a call they
+    # had already made. `awaiting_decision` is the same rule `plan` uses.
+    pend = awaiting_decision(ctx)
     blocked = ctx.coll("blocked.json")
     lines.append("")
     lines.append("- PR today: %s/%s｜jobs today: %s/%s｜turns: %s/%s｜consecutive red: %s/%s"
@@ -2486,8 +2521,11 @@ def next_action(ctx):
             return "open PR for slot %s (`prbody %s`)" % (slot, slot)
     if st.get("maintenance"):
         return "maintenance only: suggest/approve, then resume"
-    pend = [t for t in ctx.coll("candidates.json") + ctx.coll("queue.json")
-            if not t.get("approved") and (t.get("policy") == "needs_approval")]
+    # `awaiting_decision`, not a `policy == "needs_approval"` grep: that missed a row
+    # whose policy is implied by its kind, and — the reason this line exists — counted
+    # a row the operator had already rejected, so the footer promised 「approve or
+    # reject 1 needs_approval candidates」 every tick for work that could never start.
+    pend = awaiting_decision(ctx)
     if not any(st["slots"].get(s) for s in SLOTS) and pend:
         return "approve or reject %d needs_approval candidates, then tick" % len(pend)
     if not ctx.coll("queue.json") and not ctx.coll("candidates.json"):
@@ -4660,8 +4698,11 @@ def state_record(ctx):
         "上次巡检时间": stamp(st.get("last_tick_at")) if st.get("last_tick_at") else "never",
         "最近异常与恢复结果": (st.get("last_recovery") or "无"),
         "待处理阻塞": [b.get("task") for b in ctx.coll("blocked.json")[-5:]],
-        "待我授权": [t.get("id") for t in ctx.coll("candidates.json")
-                    if t.get("policy") == "needs_approval" and not t.get("approved")][:8],
+        # Same rule as the report and the footer — this record is what a fresh
+        # supervisor restores from, so a rejected id here would be reported as
+        # 「待我授权」 for the rest of the night. It also read only candidates.json,
+        # while the report read both pools.
+        "待我授权": [t.get("id") for t in awaiting_decision(ctx)][:8],
         "下一次巡检与调度状态": {
             "next": st.get("next") or "tick",
             "idle_reason": st.get("idle_reason"),
