@@ -324,7 +324,9 @@ racing it. All of it lands in `.autoloop/review.json`.
 (PROTOCOL.md §八: 不擅自合并 PR，所有 PR 合并决定交给我). With both thrown it re-reads each PR
 from gh *immediately* before acting — `review` may be ten minutes stale, and a stale
 conclusion is not a reason to touch the base branch — refuses anything that is not
-`auto_merge_ok` and green, merges serially in the reviewed order, fast-forwards its own
+`auto_merge_ok` and green, refuses a PR whose head commit is not the SHA the local gate
+was measured on (a push or a rebase after the gate makes it unverified, however clean the
+diff reads), merges serially in the reviewed order, fast-forwards its own
 checkout so the regression sees the merged tree, and runs `merge_regression_cmd` after each
 merge. `--admin` and `--force` are never passed: bypassing branch protection is not a
 feature, and the test suite fails a run that emits either.
@@ -337,7 +339,7 @@ What it reports, and what it refuses to round up (§PR-6):
 | merged, regression red | `regression_red` — the queue stops *behind* it, the base SHA it stopped at is printed, and the rollback is **yours**. The engine does not revert and does not rewrite shared history |
 | merged, but no `merge_regression_cmd` (or the checkout could not be fast-forwarded) | `pending_verification` — reported as 待验证 with the reason, never as success |
 | PR already MERGED when re-read | `already_merged`, skipped. Not an error, so `--limit` can still make progress on the next tick |
-| anything else failing the re-read (CI red, conflict, draft, closed, base mismatch, forbidden path, secret line) | the queue stops at that PR; the ones behind it are neither skipped nor merged (§PR-4) |
+| anything else failing the re-read (CI red, conflict, draft, closed, base mismatch, head moved since the gate, forbidden path, secret line) | the queue stops at that PR; the ones behind it are neither skipped nor merged (§PR-4) |
 
 Exit code is 1 when the queue stopped or a regression was red, 0 otherwise, and
 `merge --json` prints parseable JSON on *every* path including refusals — a cron line that
@@ -504,7 +506,7 @@ channel that copies the secret it is alerting about is a second incident.
 |---|---|---|
 | worker cannot fake green | gate runs from the control copy; diff re-checked independently | `green`, `redlines` |
 | no auto-merge / no deploy | merging is off by default and needs `caps.merge_enabled` **and** `--yes-i-will-merge`; no deploy, no migration; `--admin`/`--force` are never passed — and `fake_gh.py` refuses them even in a scenario that allows merge, so a bypass cannot be tested into existence; `auto/` never `main`. Opening the nightly cap changes no behaviour inside the loop: `nightmerge` asserts a `tick` with `merge_enabled=true` still emits zero `gh pr merge` | `green`, `cap`, `backup`, `workerpr`, `mergegate`, `nightmerge` |
-| a merge decision is made against *now* | `_pr_fresh` re-reads each PR from gh immediately before acting; a disagreement (CI went red, conflict, draft, closed, already merged) stops the queue at that PR and the ones behind it wait | `mergeserial`, `mergegate` |
+| a merge decision is made against *now* | `_pr_fresh` re-reads each PR from gh immediately before acting — including its head commit, which must be the SHA the local gate verified (§七) — and a disagreement (CI went red, conflict, draft, closed, already merged, head moved since the gate) stops the queue at that PR and the ones behind it wait | `mergeserial`, `mergegate`, `test_stale_gate_merge.py` |
 | a schedule adds no new authority | the nightly driver is `tick` → `review` → `merge --yes-i-will-merge --now`, generated from whatever `config.json` says, so `init --auto-merge` and a hand-edited cap produce the same line; `--yes-i-will-merge` is still required every invocation, `--now` skips only the batching cap, and an empty queue reports `{"idle": true}` and exits 0 instead of dressing a quiet round up as a failure | `nightmerge`, `test_nightly_auto_merge.py` |
 | merged ≠ verified | `merge_regression_cmd` runs after each merge, on a checkout fast-forwarded to it; red ⇒ `regression_red`, queue stopped, base SHA printed, **no auto-rollback**; unconfigured ⇒ `pending_verification`, never success | `mergered` |
 | the queue cannot lie about what is left | `remaining` is computed against the whole reviewed order, so `--limit` cannot hide work; an already-MERGED PR is recorded `already_merged` — not a failure, and not a second merge | `mergeserial` |

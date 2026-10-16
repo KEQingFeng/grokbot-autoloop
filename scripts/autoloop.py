@@ -5284,6 +5284,16 @@ def _review_pr(ctx, pr, pol, rows, churn, added, seen_files):
                                     for r in (rec.get("red_reasons") or [])[:2]))
     else:
         blockers.append("本机没有这条分支的闸门记录 —— 无法自证，不自动合并")
+    # §七's binding, on the grading side: `verified_sha` is the commit the local gate
+    # measured, and gh reports the commit the PR carries *now*. They can disagree —
+    # the worker (or a human) pushed again, or rebased, after the gate ran — and then
+    # the note above names a commit that is no longer on the branch. That is a hold,
+    # not an auto-merge: "绿灯" here would be a verdict about a different tree.
+    head_sha = str(pr.get("headRefOid") or "")
+    verified_sha = str(rec.get("verified_sha") or "")
+    if head_sha and verified_sha and head_sha != verified_sha:
+        blockers.append("PR head %s 不是本机验过的 %s —— 闸门之后分支又被推过/rebase 过，"
+                        "先 `verify` 重跑闸门再 `review`" % (head_sha[:12], verified_sha[:12]))
     if str(pr.get("baseRefName") or "") and str(pr.get("baseRefName")) != ctx.base:
         blockers.append("base 是 %s，不是 %s" % (pr.get("baseRefName"), ctx.base))
     if pr.get("isDraft"):
@@ -5323,8 +5333,11 @@ def _pr_fresh(ctx, number):
     §PR-3: the merge decision must be made against the state of the PR *now*, not
     against a review that ran ten minutes ago. This is a paid call, which is exactly
     why it happens once per merge attempt and never on a timer."""
+    # headRefOid is the commit that would actually be merged. Without it the fresh
+    # read could not tell "the PR this box verified" from "the branch as it is now";
+    # so `_merge_gate` compares it against the SHA the gate was measured on.
     cmd = ("pr view %s %s--json number,headRefName,baseRefName,state,isDraft,mergeable,"
-           "mergeStateStatus,statusCheckRollup,mergeCommit,url"
+           "mergeStateStatus,statusCheckRollup,headRefOid,mergeCommit,url"
            % (number, repo_flag(ctx)))
     rc, out, err = run(gh_bin() + " " + cmd, cwd=ctx.root, timeout=90, shell=True)
     if rc != 0:
@@ -5350,6 +5363,21 @@ def _merge_gate(ctx, row, pr, pol):
     ci, detail = _ci_verdict(pr)
     if ci != "green" and not (ci == "none" and row.get("local_gate") == "green"):
         blockers.append("CI %s — %s" % (ci, detail))
+    # §七 binds a green gate to the exact SHA it was measured on, and §PR-3 re-reads the
+    # PR right before acting — but a branch is not frozen. The worker (or a human) can
+    # push another commit, or rebase onto a newer base, after the gate went green: the
+    # diff is then still "the reviewed one", the commit is not, and `gh pr merge` would
+    # put a commit on the base branch that no gate ever judged. So the head gh reports
+    # now has to be the SHA this box verified. Deliberately silent when gh reports no
+    # head SHA (a stand-in, or a record written before this field was kept): "unknown"
+    # is not evidence of a mismatch, and the missing-local-gate blocker already covers
+    # "we cannot prove this branch was verified at all".
+    head_sha = str(pr.get("headRefOid") or "")
+    verified_sha = str(row.get("verified_sha") or "")
+    if head_sha and verified_sha and head_sha != verified_sha:
+        blockers.append("PR head %s 不是本机验过的 %s（闸门之后分支又被推过/rebase 过）—— "
+                        "先 `verify` 重跑闸门再 `review`，不拿旧结论合并"
+                        % (head_sha[:12], verified_sha[:12]))
     if row.get("verdict") != "auto_merge_ok":
         blockers.append("审查结论是 %s，不是 auto_merge_ok" % row.get("verdict"))
     if int(row.get("risk") or 0) > ctx.cap("risk_low_max"):
