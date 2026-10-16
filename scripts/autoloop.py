@@ -2363,6 +2363,15 @@ def cmd_tick(args):
                              % ("；".join(plan["reasons"]) or "throttled"))
             else:
                 running = sum(1 for s in SLOTS if st["slots"].get(s))
+                # A slot that finds nothing to do is not the same as the loop having
+                # nothing to do. With two slots and one task in the pool, slot B reports
+                # "no eligible task" (the only task is already running in A) while A is
+                # developing — and recording that as idle_reason="no-work" made `report`
+                # and `report --patrol` print 「待办池空，需要 suggest 补任务」 in the same
+                # breath as 「队列 1」 and a running worker. The reason is therefore only
+                # written once the fill loop is over *and* nothing is in flight — the
+                # same condition `_finish()` uses to decide whether a tick was 空转.
+                no_task = ""
                 for slot in SLOTS:
                     if running >= plan["parallel"]:
                         # Deliberately *not* setting idle_reason here: the loop is
@@ -2375,13 +2384,16 @@ def cmd_tick(args):
                         continue
                     task, label, why = pick_task(ctx, pol, mode)
                     if not task:
-                        st["idle_reason"] = "no-work"
-                        lines.append("- slot %s: no eligible task (%s)"
-                                     % (slot, why or "pool empty"))
+                        no_task = why or "pool empty"
+                        lines.append("- slot %s: no eligible task (%s)" % (slot, no_task))
                         continue
                     st["idle_reason"] = None
                     running += 1
                     start_task(ctx, task, label, slot, mode, lines)
+                in_flight = any((st["slots"].get(s) or {}).get("state") in ACTIVE_STATES
+                                for s in SLOTS)
+                if no_task and not in_flight:
+                    st["idle_reason"] = "no-work"
         elif st.get("maintenance"):
             maintenance_tick(ctx, pol, lines)
 

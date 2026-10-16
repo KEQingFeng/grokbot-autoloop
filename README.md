@@ -415,10 +415,13 @@ Three pieces close it. `judge_running_job()` now classifies a *running* job as
 `watch` runs that judgement every `watch_interval_s` = 60 s in the foreground of a session
 you already have, so detection latency is about a minute, and it exits 4 once `idle_ticks`
 reaches `idle_gate` instead of spinning till dawn. And a tick that dispatched work is not
-counted as
-idle — `idle_ticks` only climbs while nothing is in flight, which is what makes the
-"stop ticking, go refill the pool" message arrive at the right time rather than after the
-sixth tick of a productive round.
+counted as idle — `idle_ticks` only climbs while nothing is in flight, which is what makes
+the "stop ticking, go refill the pool" message arrive at the right time rather than after
+the sixth tick of a productive round. `idle_reason` is written on that same condition,
+because it says why the *loop* found nothing to do: a second slot that had no eligible task
+next to a developing worker must not turn a busy round into
+「总体状态：正常（待办池空，需要 `suggest` 补任务）」 in a patrol report that is printing
+「队列 1」 and a slot in `developing`.
 
 ```bash
 autoloop.py watch --minutes 240     # 60s cadence; no daemon, Ctrl-C stops it
