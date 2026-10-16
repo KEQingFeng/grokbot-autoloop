@@ -3626,6 +3626,47 @@ def _push_only(ctx, rec, why):
     return False
 
 
+# What counts as a leftover-marker *note* rather than the word in prose.
+#
+# `grep` matches the word, and a repository that talks about this scanner is full
+# of it: "suggest reads TODO/FIXME", "manufactures TODOs", the scanner's own
+# `grep -nE "TODO|FIXME|XXX|HACK"` line, and a test fixture that plants a TODO on
+# purpose. Measured on this repository (zero real markers in a file that is not a
+# test): four candidates, one of them pointing at `scripts/autoloop.py` — the
+# scanner's own pattern line, whose "cleanup" can only delete the pattern.
+#
+# So a real note is a marker that starts a note: `TODO:`, `TODO(owner):`,
+# `TODO -`, `TODO[1]`, or a marker that ends the line. A marker glued to a `|` is
+# one arm of an alternation — a regex — not a note; text inside backticks is
+# quoting the syntax; and prose that merely says the word is documentation about
+# markers. Every rule here is a false positive measured on a real repository, not
+# a hypothetical: this scanner's own pattern line, the `实现|TODO[:：]|待办` claim
+# regex, "suggest reads TODO/FIXME", "manufactures TODOs".
+MARKER_PATTERN_RE = re.compile(r"\|\s*(TODO|FIXME|XXX|HACK)|(TODO|FIXME|XXX|HACK)\s*\|")
+MARKER_NOTE_RE = re.compile(r"(TODO|FIXME|XXX|HACK)[ \t]*([:：(（\[-]|$)")
+
+
+def marker_acceptance(path, body):
+    """The gate command for a leftover-marker task: *this line* is gone.
+
+    The previous command was `git grep -c -E 'TODO|FIXME|XXX|HACK' -- <path> || true`,
+    which is vacuous twice over: `|| true` makes it exit 0 whether or not the marker
+    survived, and `verify.sh` only reads the exit code, so the count it printed was
+    never asserted. A "fix" that left the marker exactly where it was still came back
+    [PASS] — the one outcome §四 forbids ("an unchecked diff is never green").
+    Anchoring on the exact line instead fails while that line is present and passes
+    once it is gone; a path that no longer exists fails too, rather than passing by
+    absence. `git grep -q -F` is used so the line is matched literally (no regex
+    metacharacters, no shell quoting surprises).
+    """
+    quoted = shlex.quote(path)
+    body = (body or "").strip()
+    if body:
+        return "test -e %s && ! git grep -qF -e %s -- %s" % (
+            quoted, shlex.quote(body), quoted)
+    return "test -e %s && ! git grep -qE '(TODO|FIXME|XXX|HACK)' -- %s" % (quoted, quoted)
+
+
 def cmd_suggest(args):
     ctx = Ctx(args.repo)
     ctx.need_init()
@@ -3634,21 +3675,30 @@ def cmd_suggest(args):
     rc, out, _ = git("grep -nE \"TODO|FIXME|XXX|HACK\" -- '*.py' '*.js' '*.ts' '*.tsx' "
                      "'*.vue' '*.java' '*.go' '*.rs' '*.md' ':!*.lock' || true",
                      cwd=ctx.root, timeout=120)
-    marks = []
+    by_file = {}
     for line in (out or "").splitlines():
-        head = line.split(":", 1)[0]
+        hit = re.match(r"([^:]+):(\d+):(.*)", line)
+        if not hit:
+            continue
+        head, body = hit.group(1), hit.group(3)
         if re.search(r"node_modules|dist|build|\.min\.|__pycache__", head):
             continue
-        marks.append(line)
-    by_file = {}
-    for line in marks:
-        head = line.split(":")[0]
-        by_file.setdefault(head, line)
-    for path, line in sorted(by_file.items())[: args.limit]:
-        text = line.split(":", 2)[-1].strip() if ":" in line else path
+        # A test file's markers are notes about the tests, and editing an existing
+        # test is a red line — a `docs_align` candidate there can never go green.
+        # The skipped-test scan below is the one that owns test files (add_tests,
+        # and adding a test is explicitly allowed).
+        if is_test_path(head):
+            continue
+        # A marker inside backticks is a doc quoting the syntax, not a note; one
+        # glued to `|` is an alternation arm inside a regex.
+        probe = re.sub(r"`[^`]*`", "", body)
+        if MARKER_PATTERN_RE.search(probe) or not MARKER_NOTE_RE.search(probe):
+            continue
+        by_file.setdefault(head, (line, body.strip()))
+    for path, (line, text) in sorted(by_file.items())[: args.limit]:
         found.append({"title": "清理遗留标记: %s" % text[:60],
                       "paths": [path], "kind": "docs_align",
-                      "acceptance": ["git grep -c -E 'TODO|FIXME|XXX|HACK' -- %s || true" % path],
+                      "acceptance": [marker_acceptance(path, text)],
                       "evidence": line[:200], "priority": 2})
     rc, out, _ = git("grep -nE '(pytest\\.mark\\.skip|it\\.skip|test\\.skip|@skip"
                      "|xfail)' -- 'tests/*' 'test/*' '*.test.*' '*.spec.*' "

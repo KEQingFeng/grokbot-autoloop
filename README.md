@@ -284,8 +284,14 @@ command prints `[SKIP]`, never `[PASS]` — and a tick whose every step is `[SKI
 forbidden globs, and `default_kind_policy` (`needs_approval`). `candidates.json` is
 *not* the queue: `queue.json` is work you or the user asked for, `candidates.json` is
 what the loop discovered (`suggest` reads TODO/FIXME, skipped tests, lint output,
-doc drift, and cites the evidence). Only `auto_apply` may self-start, and only during
-night hours does the whitelist become the sole source. Morning triage:
+doc drift, and cites the evidence). A marker counts only when it *starts a note* —
+a marker followed by a colon, a bracketed owner, a dash, or nothing at all — so a
+word inside prose, or an alternation arm of a regex, is not a marker; a marker
+inside a test file is left to the skipped-test scan (editing an existing test is
+red), and the task's `acceptance[]` is anchored on that exact line, so it fails
+while the line is there and passes once it is gone instead of passing either way.
+Only `auto_apply` may self-start, and only during night hours does the whitelist
+become the sole source. Morning triage:
 
 ```bash
 autoloop.py queue                       # what is waiting
