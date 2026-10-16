@@ -3689,6 +3689,8 @@ def _triage(ctx, ids, approve, note=""):
     ctx.need_init()
     queue, cands = load_tasks(ctx)
     hit = 0
+    reopened = []
+    terminal = []
     for pool in (queue, cands):
         for row in pool:
             if row.get("id") in ids:
@@ -3698,6 +3700,16 @@ def _triage(ctx, ids, approve, note=""):
                 row["triage_note"] = note
                 if not approve:
                     row["status"] = "rejected"
+                elif row.get("status") == "rejected":
+                    # `rejected` is this command's own state, so an explicit approve
+                    # reverses it. Leaving it behind made `approve` print "they may
+                    # now start on the next tick" while `pick_task` refused the same
+                    # row forever as "already rejected" — a success report for an
+                    # approval that could never take effect.
+                    row["status"] = "open"
+                    reopened.append(row["id"])
+                elif row.get("status") in ("done", "blocked", "pr_open"):
+                    terminal.append(row["id"])
                 hit += 1
     save_tasks(ctx, queue, cands)
     ctx.ledger({"turn": ctx.state.get("turn"), "result": "triage",
@@ -3705,7 +3717,12 @@ def _triage(ctx, ids, approve, note=""):
     log("%s %d task(s)%s" % ("approved" if approve else "rejected", hit,
                              "" if hit else " — id not found in queue/candidates"))
     if approve and hit:
-        log("they may now start on the next tick (subject to paths/night/policy).")
+        if reopened:
+            log("reopened: %s (rejected → open)" % ", ".join(reopened))
+        if terminal:
+            log("not restarted (already done/blocked/pr_open): %s" % ", ".join(terminal))
+        if not terminal:
+            log("they may now start on the next tick (subject to paths/night/policy).")
 
 
 def cmd_queue(args):

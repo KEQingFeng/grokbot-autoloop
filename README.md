@@ -293,6 +293,11 @@ autoloop.py approve <id> [<id>…] --note "why"
 autoloop.py reject <id> --note "no"
 ```
 
+`reject` writes `status=rejected`; `approve` reverses that same status back to `open`,
+because triage state is the human's to change. Rows that are already `done`, `blocked` or
+`pr_open` are *not* revived — the approval is recorded, and the command says so instead of
+promising a start the next tick would refuse.
+
 ### Reviewing the queue, and the merge line (`review`, `merge`)
 
 Both stages are **script-only**: no model call, no worker, `counters.jobs_today` does not
