@@ -298,6 +298,14 @@ because triage state is the human's to change. Rows that are already `done`, `bl
 `pr_open` are *not* revived — the approval is recorded, and the command says so instead of
 promising a start the next tick would refuse.
 
+Every place that asks for that decision — the report's `- needs your decision
+(approve/reject)` line, the fixed footer's 下一步, and the §十 「待我授权」 record that
+`round` restores from — reads the same predicate as `plan`, over *both* pools
+(`queue.json` and `candidates.json`). A row is named there only while an approval could
+actually start it: `rejected`/`done`/`blocked`/`pr_open` drop out immediately instead of
+sending you back to a decision you already made, and a row whose *kind* is what makes it
+need approval is listed just like one carrying an explicit `policy`.
+
 ### Reviewing the queue, and the merge line (`review`, `merge`)
 
 Both stages are **script-only**: no model call, no worker, `counters.jobs_today` does not
