@@ -172,6 +172,12 @@ SECRET_LINE_RE = re.compile(
 SLOTS = ("A", "B")
 ACTIVE_STATES = ("developing", "verifying", "repairing")
 DONE_STATES = ("pr_open", "pr_ready", "blocked", "idle", None)
+# Pool-row `status` values that mean "no human triage can start this": `eligible()`
+# and `pick_task()` already refuse all four, so anything that asks the operator for an
+# `approve` has to refuse them too. `rejected` is in here on purpose — `approve`
+# reverses it, but until somebody does, the row is not a pending decision.
+POOL_TERMINAL_STATUSES = ("done", "blocked", "pr_open", "rejected")
+
 
 # §三 task lifecycle. Slot states above describe *where the work is running*; these
 # describe what is known about the task itself, and they are the states a recovering
@@ -851,17 +857,49 @@ def path_matches(pattern, path):
     return False
 
 
+def _is_glob(pattern):
+    return any(ch in pattern for ch in "*?[")
+
+
+def _glob_root(pattern):
+    """The literal directory a glob is anchored in, or "" when it has none.
+
+    `scripts/*.py` is anchored in `scripts`, `src/*/x.py` in `src`, and a pattern
+    whose very first segment is a wildcard (`**/x`, `*.py`) has no anchor. Used only
+    to compare two globs, where `path_matches` cannot help."""
+    norm = pattern.replace("\\", "/")
+    cut = min([norm.find(ch) for ch in "*?[" if ch in norm] or [len(norm)])
+    if cut == len(norm):
+        return norm.rstrip("/")
+    head = norm[:cut]
+    return head.rsplit("/", 1)[0].rstrip("/") if "/" in head else ""
+
+
 def paths_overlap(left, right):
+    """Do two declared `paths` scopes share at least one file? Conservative: a
+    false positive only serialises two tasks, a false negative lets two slots
+    edit the same file.
+
+    The old check only compared the two pattern strings, so a glob that matched
+    the other side's literal path (`scripts/*.py` vs `scripts/autoloop.py`) was
+    reported clean whenever the wildcard was not the final character — exactly
+    the case `path_matches` already knows how to decide.
+    """
     for a in left or []:
         for b in right or []:
             if a == b:
                 return True
-            if ("/**" in a or "**" in b or "*" in a or "*" in b):
-                pa = a.replace("/**", "*")
-                pb = b.replace("/**", "*")
-                if pa == pb or pa.rstrip("*").rstrip("/") == pb.rstrip("*").rstrip("/"):
-                    return True
-                if pa.startswith(pb.rstrip("*")) or pb.startswith(pa.rstrip("*")):
+            # A glob owns every path it matches, not just a sibling of its own
+            # text; `path_matches` is the engine's own definition of that relation.
+            if path_matches(a, b) or path_matches(b, a):
+                return True
+            # Two globs can still collide when neither matches the other's text
+            # as-is (`src/*/handler.py` vs `src/api/*.py`): compare their literal
+            # anchors at a path boundary, never by string prefix of the raw globs.
+            if _is_glob(a) and _is_glob(b):
+                ra, rb = _glob_root(a), _glob_root(b)
+                if ra and rb and (ra == rb or ra.startswith(rb + "/")
+                                  or rb.startswith(ra + "/")):
                     return True
     return False
 
@@ -1670,7 +1708,7 @@ def known_keys(ctx):
 
 def eligible(ctx, task, pol, mode):
     """Why this task may/may not start right now. Returns (ok, reason)."""
-    if task.get("status") in ("done", "blocked", "pr_open", "rejected"):
+    if task.get("status") in POOL_TERMINAL_STATUSES:
         return False, "already %s" % task.get("status")
     for ref in ctx.state.get("pending_pr", []):
         if ref.get("task") == task.get("id"):
@@ -1696,8 +1734,8 @@ def pick_task(ctx, pol, mode):
     queue, cands = load_tasks(ctx)
     last = "pool is empty"
     for pool, label in ((queue, "queue"), (cands, "candidate")):
-        ranked = sorted([t for t in pool if t.get("status") not in ("done", "blocked",
-                                                                    "rejected", "pr_open")],
+        ranked = sorted([t for t in pool
+                         if t.get("status") not in POOL_TERMINAL_STATUSES],
                         key=lambda t: -int(t.get("priority") or 0))
         for task in ranked:
             ok, why = eligible(ctx, task, pol, mode)
@@ -1705,6 +1743,35 @@ def pick_task(ctx, pol, mode):
                 return task, label, ""
             last = why or last
     return None, "", last
+
+
+def awaiting_decision(ctx, pol=None):
+    """Pool rows a human still has to triage: `needs_approval`, not yet approved.
+
+    One definition for the three places that ask for that decision — `report`'s
+    「needs your decision」 line, `next_action` (the fixed footer's 下一步) and the
+    §十 「待我授权」 record — because each of them had its own, and all three were
+    wrong in the same way: they listed a row without reading `status`, so an id the
+    operator had already `reject`ed (which writes `status="rejected"`, a status
+    `pick_task` refuses outright) kept being named as 「waiting for your decision」,
+    while `plan` refused it as terminal. Two of the three also read only one pool,
+    so a `queue --add` row appeared in the report and vanished from `round`.
+
+    The policy rule is `eligible()`'s own: an explicit `policy` on the row wins,
+    otherwise the kind decides.
+    """
+    pol = pol if pol is not None else read_policy(ctx)
+    queue, cands = load_tasks(ctx)
+    out = []
+    for task in queue + cands:
+        if task.get("status") in POOL_TERMINAL_STATUSES:
+            continue
+        need = kind_policy(task.get("kind", "misc"), pol)
+        if task.get("policy") in ("auto_apply", "needs_approval"):
+            need = task["policy"]
+        if need == "needs_approval" and not task.get("approved"):
+            out.append(task)
+    return out
 
 
 def new_task_id(ctx, title):
@@ -1778,10 +1845,10 @@ def report_text(ctx):
         lines.append("| %(slot)s | `%(branch)s` | %(task)s | %(state)s | %(scope)s | "
                      "%(last)s | %(verify)s | %(job)s | %(pr)s | %(next)s |" % r)
     queue, cands = load_tasks(ctx)
-    pol = read_policy(ctx)
-    pend = [t for t in queue + cands
-            if (t.get("policy") or kind_policy(t.get("kind", "misc"), pol)) == "needs_approval"
-            and not t.get("approved") and t.get("status") not in ("done", "blocked")]
+    # A rejected row is not a pending decision: `reject` writes status="rejected" and
+    # `pick_task` refuses it, so naming it here sent the operator back to a call they
+    # had already made. `awaiting_decision` is the same rule `plan` uses.
+    pend = awaiting_decision(ctx)
     blocked = ctx.coll("blocked.json")
     lines.append("")
     lines.append("- PR today: %s/%s｜jobs today: %s/%s｜turns: %s/%s｜consecutive red: %s/%s"
@@ -2349,6 +2416,15 @@ def cmd_tick(args):
                              % ("；".join(plan["reasons"]) or "throttled"))
             else:
                 running = sum(1 for s in SLOTS if st["slots"].get(s))
+                # A slot that finds nothing to do is not the same as the loop having
+                # nothing to do. With two slots and one task in the pool, slot B reports
+                # "no eligible task" (the only task is already running in A) while A is
+                # developing — and recording that as idle_reason="no-work" made `report`
+                # and `report --patrol` print 「待办池空，需要 suggest 补任务」 in the same
+                # breath as 「队列 1」 and a running worker. The reason is therefore only
+                # written once the fill loop is over *and* nothing is in flight — the
+                # same condition `_finish()` uses to decide whether a tick was 空转.
+                no_task = ""
                 for slot in SLOTS:
                     if running >= plan["parallel"]:
                         # Deliberately *not* setting idle_reason here: the loop is
@@ -2361,13 +2437,16 @@ def cmd_tick(args):
                         continue
                     task, label, why = pick_task(ctx, pol, mode)
                     if not task:
-                        st["idle_reason"] = "no-work"
-                        lines.append("- slot %s: no eligible task (%s)"
-                                     % (slot, why or "pool empty"))
+                        no_task = why or "pool empty"
+                        lines.append("- slot %s: no eligible task (%s)" % (slot, no_task))
                         continue
                     st["idle_reason"] = None
                     running += 1
                     start_task(ctx, task, label, slot, mode, lines)
+                in_flight = any((st["slots"].get(s) or {}).get("state") in ACTIVE_STATES
+                                for s in SLOTS)
+                if no_task and not in_flight:
+                    st["idle_reason"] = "no-work"
         elif st.get("maintenance"):
             maintenance_tick(ctx, pol, lines)
 
@@ -2460,12 +2539,33 @@ def next_action(ctx):
             return "open PR for slot %s (`prbody %s`)" % (slot, slot)
     if st.get("maintenance"):
         return "maintenance only: suggest/approve, then resume"
-    pend = [t for t in ctx.coll("candidates.json") + ctx.coll("queue.json")
-            if not t.get("approved") and (t.get("policy") == "needs_approval")]
+    # `awaiting_decision`, not a `policy == "needs_approval"` grep: that missed a row
+    # whose policy is implied by its kind, and — the reason this line exists — counted
+    # a row the operator had already rejected, so the footer promised 「approve or
+    # reject 1 needs_approval candidates」 every tick for work that could never start.
+    pend = awaiting_decision(ctx)
     if not any(st["slots"].get(s) for s in SLOTS) and pend:
         return "approve or reject %d needs_approval candidates, then tick" % len(pend)
     if not ctx.coll("queue.json") and not ctx.coll("candidates.json"):
         return "pool empty: run `suggest`"
+    # A spent dispatch budget is a stop the engine has already decided on: step 6 of a
+    # tick leaves the slot empty and worker_launch_guard refuses the launch. Promising
+    # 「继续派发」 here is the one thing the footer must not do — the footer is the single
+    # line the supervisor relays (§三 of the skill) and `cap` is one of the words it
+    # escalates on, so the cap has to be visible in it. The turn counter is bumped at
+    # the top of every tick and the guard lets the tick that crosses the line finish
+    # (cap + counted_turn), hence `>` for turns and `>=` for jobs.
+    spent = []
+    counters = st.get("counters", {}) or {}
+    jobs_cap = int(ctx.cap("nightly_max_jobs") or 0)
+    turn_cap = int(ctx.cap("max_turns_per_day") or 0)
+    if int(counters.get("jobs_today", 0) or 0) >= jobs_cap:
+        spent.append("jobs %s/%s" % (counters.get("jobs_today", 0), jobs_cap))
+    if int(counters.get("turns_today", 0) or 0) > turn_cap:
+        spent.append("turns %s/%s" % (counters.get("turns_today", 0), turn_cap))
+    if spent:
+        return ("cap: %s spent — tick still reaps and verifies, but dispatches nothing "
+                "until the day rolls over (`budget --json`)" % "、".join(spent))
     if any((st["slots"].get(s) or {}).get("state") in ACTIVE_STATES for s in SLOTS):
         return "workers running; `watch` or tick again in %ss" % ctx.cap("watch_interval_s")
     got = int(st.get("counters", {}).get("prs_valid_today", 0))
@@ -2869,9 +2969,34 @@ def repair(ctx, rec, slot, pol, lines, failure):
         lines.append("- slot %s: repair resumes session %s" % (slot, sid[:24]))
     rec["job"] = meta["jid"]
     rec["state"] = "repairing"
+    # A repair round is a *new* run, so the flags that describe a run must not follow
+    # it. `stalled` is the one with teeth: verify_slot() reads it as a red reason
+    # ("went silent … never reported the task finished"), and `launch()` reuses the
+    # same job id for every round of a task, so a slot that stalled once could never
+    # go green again — the repair round that actually delivered was judged on the
+    # silence of the run it replaced and got blocked after max_repair_rounds. The
+    # *fact* is still worth keeping for the patrol (§七 must be able to say a run of
+    # this task was stopped), so it moves to `stall_seen`; the verdict does not.
+    if rec.get("stalled"):
+        rec["stall_seen"] = True
+        rec["stalled"] = False
     rec["worker_exit"] = None
     rec["timed_out"] = False
+    # Same class of leak, for the finish guard and the PR-claim check: a stale
+    # `marker_seen_at` closes the new session the moment it prints the marker, and a
+    # stale `done_signal` keeps reporting the old run's own claim.
+    rec["marker_seen_at"] = None
+    rec["done_signal"] = None
     ctx.state["counters"]["jobs_today"] = ctx.state["counters"].get("jobs_today", 0) + 1
+
+
+# `worker_launch_guard` tokens that mean "a budget or a cadence stopped this tick",
+# not "this box has no worker". The turn cap is the one a tick can still hit (step 6
+# already skips dispatch when the job cap is spent), but the lookup is keyed by token
+# so no caller has to grep a message for the word "worker" to find out why.
+DISPATCH_REFUSAL_IDLE = {"max_turns_per_day": "cap-turns",
+                         "nightly_max_jobs": "cap-jobs",
+                         "parallel limit": "backoff"}
 
 
 def start_task(ctx, task, label, slot, mode, lines):
@@ -2908,8 +3033,22 @@ def start_task(ctx, task, label, slot, mode, lines):
         lines.append("- slot %s: cannot dispatch (%s) — nothing pushed" % (slot, lerr))
         git("worktree remove --force %s" % shlex.quote(wt), cwd=ctx.root)
         git("branch -D %s" % shlex.quote(branch), cwd=ctx.root)
-        ctx.state["idle_reason"] = "no-runner" if "worker" in lerr else "dispatch-failed"
-        ctx.state["next"] = "configure runner.cmd, then tick"
+        # Why it refused decides what the operator has to do next, so it is classified
+        # by cause. `no-runner` is the word `init`, SKILL §3/§5, `report --patrol` and
+        # `watchdog` all escalate as an environment gap ("configure runner.cmd", "run
+        # `doctor`"), and it has to mean exactly that — no worker configured. A spent
+        # turn budget used to borrow it (`"worker" in lerr` matched the guard's own
+        # message), so the patrol printed 【异常告警｜循环停摆：no-runner】 and the
+        # watchdog raised `loop_broken` for a CLI that was installed and working, while
+        # the real cause (caps.max_turns_per_day) stayed out of the footer entirely.
+        if not runner_cmd(ctx):
+            ctx.state["idle_reason"] = "no-runner"
+            ctx.state["next"] = "configure runner.cmd, then tick"
+            return
+        why = worker_launch_guard(ctx, replacing_slot=slot,
+                                  counted_turn=getattr(ctx, "_counted_tick", False))
+        ctx.state["idle_reason"] = DISPATCH_REFUSAL_IDLE.get(why) or "dispatch-failed"
+        ctx.state["next"] = "cannot dispatch (%s) — nothing was started" % lerr[:120]
         return
     rec = {"slot": slot, "task": tid, "branch": branch, "title": task.get("title"),
            "paths": task.get("paths") or [], "kind": task.get("kind", "misc"),
@@ -3607,6 +3746,47 @@ def _push_only(ctx, rec, why):
     return False
 
 
+# What counts as a leftover-marker *note* rather than the word in prose.
+#
+# `grep` matches the word, and a repository that talks about this scanner is full
+# of it: "suggest reads TODO/FIXME", "manufactures TODOs", the scanner's own
+# `grep -nE "TODO|FIXME|XXX|HACK"` line, and a test fixture that plants a TODO on
+# purpose. Measured on this repository (zero real markers in a file that is not a
+# test): four candidates, one of them pointing at `scripts/autoloop.py` — the
+# scanner's own pattern line, whose "cleanup" can only delete the pattern.
+#
+# So a real note is a marker that starts a note: `TODO:`, `TODO(owner):`,
+# `TODO -`, `TODO[1]`, or a marker that ends the line. A marker glued to a `|` is
+# one arm of an alternation — a regex — not a note; text inside backticks is
+# quoting the syntax; and prose that merely says the word is documentation about
+# markers. Every rule here is a false positive measured on a real repository, not
+# a hypothetical: this scanner's own pattern line, the `实现|TODO[:：]|待办` claim
+# regex, "suggest reads TODO/FIXME", "manufactures TODOs".
+MARKER_PATTERN_RE = re.compile(r"\|\s*(TODO|FIXME|XXX|HACK)|(TODO|FIXME|XXX|HACK)\s*\|")
+MARKER_NOTE_RE = re.compile(r"(TODO|FIXME|XXX|HACK)[ \t]*([:：(（\[-]|$)")
+
+
+def marker_acceptance(path, body):
+    """The gate command for a leftover-marker task: *this line* is gone.
+
+    The previous command was `git grep -c -E 'TODO|FIXME|XXX|HACK' -- <path> || true`,
+    which is vacuous twice over: `|| true` makes it exit 0 whether or not the marker
+    survived, and `verify.sh` only reads the exit code, so the count it printed was
+    never asserted. A "fix" that left the marker exactly where it was still came back
+    [PASS] — the one outcome §四 forbids ("an unchecked diff is never green").
+    Anchoring on the exact line instead fails while that line is present and passes
+    once it is gone; a path that no longer exists fails too, rather than passing by
+    absence. `git grep -q -F` is used so the line is matched literally (no regex
+    metacharacters, no shell quoting surprises).
+    """
+    quoted = shlex.quote(path)
+    body = (body or "").strip()
+    if body:
+        return "test -e %s && ! git grep -qF -e %s -- %s" % (
+            quoted, shlex.quote(body), quoted)
+    return "test -e %s && ! git grep -qE '(TODO|FIXME|XXX|HACK)' -- %s" % (quoted, quoted)
+
+
 def cmd_suggest(args):
     ctx = Ctx(args.repo)
     ctx.need_init()
@@ -3615,21 +3795,30 @@ def cmd_suggest(args):
     rc, out, _ = git("grep -nE \"TODO|FIXME|XXX|HACK\" -- '*.py' '*.js' '*.ts' '*.tsx' "
                      "'*.vue' '*.java' '*.go' '*.rs' '*.md' ':!*.lock' || true",
                      cwd=ctx.root, timeout=120)
-    marks = []
+    by_file = {}
     for line in (out or "").splitlines():
-        head = line.split(":", 1)[0]
+        hit = re.match(r"([^:]+):(\d+):(.*)", line)
+        if not hit:
+            continue
+        head, body = hit.group(1), hit.group(3)
         if re.search(r"node_modules|dist|build|\.min\.|__pycache__", head):
             continue
-        marks.append(line)
-    by_file = {}
-    for line in marks:
-        head = line.split(":")[0]
-        by_file.setdefault(head, line)
-    for path, line in sorted(by_file.items())[: args.limit]:
-        text = line.split(":", 2)[-1].strip() if ":" in line else path
+        # A test file's markers are notes about the tests, and editing an existing
+        # test is a red line — a `docs_align` candidate there can never go green.
+        # The skipped-test scan below is the one that owns test files (add_tests,
+        # and adding a test is explicitly allowed).
+        if is_test_path(head):
+            continue
+        # A marker inside backticks is a doc quoting the syntax, not a note; one
+        # glued to `|` is an alternation arm inside a regex.
+        probe = re.sub(r"`[^`]*`", "", body)
+        if MARKER_PATTERN_RE.search(probe) or not MARKER_NOTE_RE.search(probe):
+            continue
+        by_file.setdefault(head, (line, body.strip()))
+    for path, (line, text) in sorted(by_file.items())[: args.limit]:
         found.append({"title": "清理遗留标记: %s" % text[:60],
                       "paths": [path], "kind": "docs_align",
-                      "acceptance": ["git grep -c -E 'TODO|FIXME|XXX|HACK' -- %s || true" % path],
+                      "acceptance": [marker_acceptance(path, text)],
                       "evidence": line[:200], "priority": 2})
     rc, out, _ = git("grep -nE '(pytest\\.mark\\.skip|it\\.skip|test\\.skip|@skip"
                      "|xfail)' -- 'tests/*' 'test/*' '*.test.*' '*.spec.*' "
@@ -3709,8 +3898,15 @@ def cmd_reject(args):
 
 def _triage(ctx, ids, approve, note=""):
     ctx.need_init()
+    # The same rule as `ack_alerts`: an operator-written note is persisted, so it goes
+    # through `scrub_secrets` first. The note is where somebody pastes the log line or
+    # command they are triaging from, and `candidates.json` / `queue.json` are state
+    # files the README promises contain no credentials.
+    note = scrub_secrets(note or "")
     queue, cands = load_tasks(ctx)
     hit = 0
+    reopened = []
+    terminal = []
     for pool in (queue, cands):
         for row in pool:
             if row.get("id") in ids:
@@ -3720,6 +3916,16 @@ def _triage(ctx, ids, approve, note=""):
                 row["triage_note"] = note
                 if not approve:
                     row["status"] = "rejected"
+                elif row.get("status") == "rejected":
+                    # `rejected` is this command's own state, so an explicit approve
+                    # reverses it. Leaving it behind made `approve` print "they may
+                    # now start on the next tick" while `pick_task` refused the same
+                    # row forever as "already rejected" — a success report for an
+                    # approval that could never take effect.
+                    row["status"] = "open"
+                    reopened.append(row["id"])
+                elif row.get("status") in ("done", "blocked", "pr_open"):
+                    terminal.append(row["id"])
                 hit += 1
     save_tasks(ctx, queue, cands)
     ctx.ledger({"turn": ctx.state.get("turn"), "result": "triage",
@@ -3727,7 +3933,12 @@ def _triage(ctx, ids, approve, note=""):
     log("%s %d task(s)%s" % ("approved" if approve else "rejected", hit,
                              "" if hit else " — id not found in queue/candidates"))
     if approve and hit:
-        log("they may now start on the next tick (subject to paths/night/policy).")
+        if reopened:
+            log("reopened: %s (rejected → open)" % ", ".join(reopened))
+        if terminal:
+            log("not restarted (already done/blocked/pr_open): %s" % ", ".join(terminal))
+        if not terminal:
+            log("they may now start on the next tick (subject to paths/night/policy).")
 
 
 def cmd_queue(args):
@@ -4016,7 +4227,7 @@ def anomalies_of(ctx):
         if rec.get("pr_wrong_base"):
             out.append("PR #%s 的基分支是 %s，不是 %s"
                        % (rec.get("pr"), rec["pr_wrong_base"], ctx.base))
-        if rec.get("stalled"):
+        if rec.get("stalled") or rec.get("stall_seen"):
             out.append("slot %s worker 静默 %ss 被停（未打印 %s）"
                        % (slot, ctx.cap("stall_s"), DONE_MARKER))
         if rec.get("timed_out"):
@@ -4184,6 +4395,12 @@ def ack_alerts(ctx, ids, note=""):
     for rec in alert_records(ctx):
         if rec.get("alert_id"):
             by_id[rec["alert_id"]] = rec
+    # The note is the field that invites a secret: `alerts --ack --note` is documented
+    # as 「确认时附一句处理说明」, so the natural thing to paste is the log line or the
+    # command being investigated. `alert()` and `ctx.event` both scrub what they write;
+    # this file was the one path into persistent state that did not, and README's
+    # invariant — no credentials in state files — has to hold for the note too.
+    note = scrub_secrets(note or "")
     done, unknown = [], []
     for aid in ids:
         rec = by_id.get(aid)
@@ -4193,11 +4410,11 @@ def ack_alerts(ctx, ids, note=""):
         acks[aid] = {"dedupe_key": rec.get("dedupe_key"),
                      "episode_first_seen": rec.get("first_seen_epoch"),
                      "kind": rec.get("kind"), "severity": rec.get("severity"),
-                     "ts": stamp(), "epoch": now(), "note": note or ""}
+                     "ts": stamp(), "epoch": now(), "note": note}
         done.append(aid)
     if done:
         write_json(os.path.join(ctx.alo, "alert_acks.json"), acks)
-        ctx.event("guard", "alert_acked", ids=done, note=(note or "")[:200])
+        ctx.event("guard", "alert_acked", ids=done, note=note[:200])
     return done, unknown
 
 
@@ -4577,7 +4794,11 @@ def state_record(ctx):
         "插件技能安装及验证状态": {
             "protocol": protocol_path(ctx) or "MISSING",
             "protocol_sha256": (sha256_file(protocol_path(ctx)) if protocol_path(ctx) else "")[:12],
-            "verify.sh_sha256": sha256_file(os.path.join(ctx.alo, "verify.sh"))[:12],
+            # A missing gate script is a suspect state, not a crash: `sha256_file`
+            # returns None for a file that is not there, and `round` exists precisely
+            # to report a control directory we cannot fully trust.
+            "verify.sh_sha256": (sha256_file(os.path.join(ctx.alo, "verify.sh"))
+                                 or "missing")[:12],
             "preflight": read_json(os.path.join(ctx.alo, "preflight.json"), {}) or {},
         },
         "运行中的 Agent 和任务": {
@@ -4608,8 +4829,11 @@ def state_record(ctx):
         "上次巡检时间": stamp(st.get("last_tick_at")) if st.get("last_tick_at") else "never",
         "最近异常与恢复结果": (st.get("last_recovery") or "无"),
         "待处理阻塞": [b.get("task") for b in ctx.coll("blocked.json")[-5:]],
-        "待我授权": [t.get("id") for t in ctx.coll("candidates.json")
-                    if t.get("policy") == "needs_approval" and not t.get("approved")][:8],
+        # Same rule as the report and the footer — this record is what a fresh
+        # supervisor restores from, so a rejected id here would be reported as
+        # 「待我授权」 for the rest of the night. It also read only candidates.json,
+        # while the report read both pools.
+        "待我授权": [t.get("id") for t in awaiting_decision(ctx)][:8],
         "下一次巡检与调度状态": {
             "next": st.get("next") or "tick",
             "idle_reason": st.get("idle_reason"),
@@ -5723,6 +5947,16 @@ def _review_pr(ctx, pr, pol, rows, churn, added, seen_files):
                                     for r in (rec.get("red_reasons") or [])[:2]))
     else:
         blockers.append("本机没有这条分支的闸门记录 —— 无法自证，不自动合并")
+    # §七's binding, on the grading side: `verified_sha` is the commit the local gate
+    # measured, and gh reports the commit the PR carries *now*. They can disagree —
+    # the worker (or a human) pushed again, or rebased, after the gate ran — and then
+    # the note above names a commit that is no longer on the branch. That is a hold,
+    # not an auto-merge: "绿灯" here would be a verdict about a different tree.
+    head_sha = str(pr.get("headRefOid") or "")
+    verified_sha = str(rec.get("verified_sha") or "")
+    if head_sha and verified_sha and head_sha != verified_sha:
+        blockers.append("PR head %s 不是本机验过的 %s —— 闸门之后分支又被推过/rebase 过，"
+                        "先 `verify` 重跑闸门再 `review`" % (head_sha[:12], verified_sha[:12]))
     if str(pr.get("baseRefName") or "") and str(pr.get("baseRefName")) != ctx.base:
         blockers.append("base 是 %s，不是 %s" % (pr.get("baseRefName"), ctx.base))
     if pr.get("isDraft"):
@@ -5762,8 +5996,11 @@ def _pr_fresh(ctx, number):
     §PR-3: the merge decision must be made against the state of the PR *now*, not
     against a review that ran ten minutes ago. This is a paid call, which is exactly
     why it happens once per merge attempt and never on a timer."""
+    # headRefOid is the commit that would actually be merged. Without it the fresh
+    # read could not tell "the PR this box verified" from "the branch as it is now";
+    # so `_merge_gate` compares it against the SHA the gate was measured on.
     cmd = ("pr view %s %s--json number,headRefName,baseRefName,state,isDraft,mergeable,"
-           "mergeStateStatus,statusCheckRollup,mergeCommit,url"
+           "mergeStateStatus,statusCheckRollup,headRefOid,mergeCommit,url"
            % (number, repo_flag(ctx)))
     rc, out, err = run(gh_bin() + " " + cmd, cwd=ctx.root, timeout=90, shell=True)
     if rc != 0:
@@ -5789,6 +6026,21 @@ def _merge_gate(ctx, row, pr, pol):
     ci, detail = _ci_verdict(pr)
     if ci != "green" and not (ci == "none" and row.get("local_gate") == "green"):
         blockers.append("CI %s — %s" % (ci, detail))
+    # §七 binds a green gate to the exact SHA it was measured on, and §PR-3 re-reads the
+    # PR right before acting — but a branch is not frozen. The worker (or a human) can
+    # push another commit, or rebase onto a newer base, after the gate went green: the
+    # diff is then still "the reviewed one", the commit is not, and `gh pr merge` would
+    # put a commit on the base branch that no gate ever judged. So the head gh reports
+    # now has to be the SHA this box verified. Deliberately silent when gh reports no
+    # head SHA (a stand-in, or a record written before this field was kept): "unknown"
+    # is not evidence of a mismatch, and the missing-local-gate blocker already covers
+    # "we cannot prove this branch was verified at all".
+    head_sha = str(pr.get("headRefOid") or "")
+    verified_sha = str(row.get("verified_sha") or "")
+    if head_sha and verified_sha and head_sha != verified_sha:
+        blockers.append("PR head %s 不是本机验过的 %s（闸门之后分支又被推过/rebase 过）—— "
+                        "先 `verify` 重跑闸门再 `review`，不拿旧结论合并"
+                        % (head_sha[:12], verified_sha[:12]))
     if row.get("verdict") != "auto_merge_ok":
         blockers.append("审查结论是 %s，不是 auto_merge_ok" % row.get("verdict"))
     if int(row.get("risk") or 0) > ctx.cap("risk_low_max"):

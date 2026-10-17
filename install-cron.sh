@@ -47,14 +47,39 @@ ACTION="print"
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --repo)   REPO_ARG="${2:-}"; shift 2 ;;
-    --every)  EVERY="${2:-10}"; shift 2 ;;
+    --repo)
+      # A flag with no value must fail here: `shift 2` with only one argument
+      # left is a no-op in bash, so the while loop would re-read `--repo` and
+      # spin forever with no output and no error.
+      if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+        echo "!! --repo needs a non-empty repository path (try --help)" >&2
+        exit 2
+      fi
+      REPO_ARG="$2"; shift 2 ;;
+    --every)
+      if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+        echo "!! --every needs a positive integer of minutes (try --help)" >&2
+        exit 2
+      fi
+      EVERY="$2"; shift 2 ;;
     --write)  ACTION="write"; shift ;;
     --remove) ACTION="remove"; shift ;;
     -h|--help) sed -n '1,39p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "unknown flag: $1 (try --help)" >&2; exit 2 ;;
   esac
 done
+# `--every` goes straight into the cron field `*/$EVERY`; a non-numeric or zero
+# value would install a line cron silently never runs. Validate the flag and the
+# AUTOLOOP_EVERY default together, before anything is printed or written.
+case "$EVERY" in
+  ''|*[!0-9]*)
+    echo "!! --every/AUTOLOOP_EVERY must be a positive integer (got: ${EVERY:-<empty>})" >&2
+    exit 2 ;;
+esac
+if [ "$EVERY" -lt 1 ]; then
+  echo "!! --every/AUTOLOOP_EVERY must be at least 1 minute (got: $EVERY)" >&2
+  exit 2
+fi
 
 [ -f "$ENGINE" ] || { echo "engine missing at $ENGINE — plugin not installed correctly" >&2; exit 2; }
 if [ -z "$REPO_ARG" ]; then REPO_ARG="${AUTOLOOP_REPO:-$(pwd)}"; fi

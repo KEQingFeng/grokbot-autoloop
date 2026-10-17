@@ -59,7 +59,7 @@ class NightlyAutoMergeDriverTests(unittest.TestCase):
         # with a space would break the very line this test is checking.
         return "%s:%s" % (bare, os.path.dirname(sys.executable))
 
-    def run_installer(self, repo, *args, crontab=True):
+    def run_installer(self, repo, *args, crontab=True, timeout=60):
         home = str(Path(repo).parent)
         if crontab:
             path = "%s:%s:/usr/bin:/bin" % (self.bin, os.path.dirname(sys.executable))
@@ -69,7 +69,7 @@ class NightlyAutoMergeDriverTests(unittest.TestCase):
         return subprocess.run(["/bin/bash", str(INSTALLER), "--repo", repo, *args],
                               cwd=home, env=env, text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              timeout=60)
+                              timeout=timeout)
 
     def table_lines(self):
         if not self.store.exists():
@@ -200,6 +200,37 @@ class NightlyAutoMergeDriverTests(unittest.TestCase):
             self.assertIn("no crontab(1)", proc.stdout)
             self.assertIn("Option 1", proc.stdout)
             self.assertIn("review --json", proc.stdout)
+        finally:
+            box.cleanup()
+
+    # -- argument validation ------------------------------------------------------
+
+    def test_missing_flag_value_is_refused_not_hung(self):
+        """`--repo`/`--every` with no value used to loop forever (no output, no exit)."""
+        box = Box("driverdangling")
+        try:
+            for dangling in ("--repo", "--every"):
+                with self.subTest(flag=dangling):
+                    proc = self.run_installer(box.repo, dangling, timeout=10)
+                    self.assertEqual(proc.returncode, 2, proc.stdout)
+                    self.assertIn(dangling, proc.stdout)
+                    self.assertFalse(proc.stdout.startswith("== AutoLoop"),
+                                     "must fail before printing or writing anything")
+                    self.assertEqual(self.table_lines(), [], self.store.read_text()
+                                     if self.store.exists() else "")
+        finally:
+            box.cleanup()
+
+    def test_invalid_every_is_refused_before_any_cron_line(self):
+        box = Box("driverbadevery")
+        try:
+            for value in ("0", "abc", "1.5", "-1", ""):
+                with self.subTest(every=value):
+                    proc = self.run_installer(box.repo, "--write", "--every", value, timeout=10)
+                    self.assertEqual(proc.returncode, 2, proc.stdout)
+                    self.assertNotIn("PASS", proc.stdout)
+                    self.assertEqual(self.table_lines(), [], self.store.read_text()
+                                     if self.store.exists() else "")
         finally:
             box.cleanup()
 

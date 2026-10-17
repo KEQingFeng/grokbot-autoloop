@@ -58,14 +58,14 @@ says *直接开发 myrepo* gets preflight → init → suggest → watch instead
 |---|---|---|
 | `PROTOCOL.md` | 278 | the supervision protocol, verbatim: roles, loop cadence, delivery, red lines, the two hourly report templates, the state record |
 | `SKILL.md` | 512 | the supervisor-side policy: trigger keywords, one-instruction onboarding (including the `start` fast path), cadence table, tick contract, red lines, quota rules |
-| `scripts/autoloop.py` | 6479 | the engine: 37 subcommands, state machine, gate, red lines, PR, `watch`/`light`/`round`/`preflight`/`start`, `watchdog`/`alerts`/`budget`, `lifecycle`/`metrics` |
+| `scripts/autoloop.py` | 6731 | the engine: 37 subcommands, state machine, gate, red lines, PR, `watch`/`light`/`round`/`preflight`/`start`, `watchdog`/`alerts`/`budget`, `lifecycle`/`metrics` |
 | `bootstrap.sh` | 158 | install into the configured supervisor skill directory, probe `env.manifest`, then preflight + init |
-| `scripts/feedback.py` | 345 | local feedback classification, pending proposals, failure lessons and bounded intake rounds |
-| `tests/test_*.py` | — | 70 additional tests for portable bootstrap, the nightly merge driver, PI adapter, launch guards, feedback CLI, progress clock and reporting |
+| `scripts/feedback.py` | 359 | local feedback classification, pending proposals, failure lessons and bounded intake rounds |
+| `tests/test_*.py` | — | 114 additional tests for portable bootstrap, the nightly merge driver, PI adapter, launch guards, feedback CLI, progress clock and reporting |
 | `env.manifest` | 23 | TAB-separated tool list (required / sched / pr / optional / worker) |
-| `install-cron.sh` | 251 | prints the three wake-up drivers — the business `tick` (with the `review` → `merge` stage when the merge line is on), the 15-minute `light` check, and the hourly silent report — `--write` to install box cron, verifies |
+| `install-cron.sh` | 276 | prints the three wake-up drivers — the business `tick` (with the `review` → `merge` stage when the merge line is on), the 15-minute `light` check, and the hourly silent report — `--write` to install box cron, verifies |
 | `config.example.json` | 153 | every knob, with the reason each cap exists |
-| `tests/selftest.py` | 3069 | 51 scenarios / 763 assertions against throwaway real git repos |
+| `tests/selftest.py` | 3069 | 51 scenarios / 762 assertions against throwaway real git repos |
 | `tests/fake_worker.py` | 172 | stand-in worker, 16 modes: `good`/`slow`/`deliver` plus 13 misbehaviours |
 | `tests/fake_gh.py` | 244 | `gh` stand-in; records every call, always refuses `--admin`/`--force`, refuses `pr merge` unless a scenario opts in, file-locked |
 | `tests/bin/dsh` | 90 | `dsh` stand-in, so the DeepSeekHarness adapter (stdin prompt, `--json` events, `--session-id` resume) is really exercised |
@@ -321,14 +321,33 @@ command prints `[SKIP]`, never `[PASS]` — and a tick whose every step is `[SKI
 forbidden globs, and `default_kind_policy` (`needs_approval`). `candidates.json` is
 *not* the queue: `queue.json` is work you or the user asked for, `candidates.json` is
 what the loop discovered (`suggest` reads TODO/FIXME, skipped tests, lint output,
-doc drift, and cites the evidence). Only `auto_apply` may self-start, and only during
-night hours does the whitelist become the sole source. Morning triage:
+doc drift, and cites the evidence). A marker counts only when it *starts a note* —
+a marker followed by a colon, a bracketed owner, a dash, or nothing at all — so a
+word inside prose, or an alternation arm of a regex, is not a marker; a marker
+inside a test file is left to the skipped-test scan (editing an existing test is
+red), and the task's `acceptance[]` is anchored on that exact line, so it fails
+while the line is there and passes once it is gone instead of passing either way.
+Only `auto_apply` may self-start, and only during night hours does the whitelist
+become the sole source. Morning triage:
 
 ```bash
 autoloop.py queue                       # what is waiting
 autoloop.py approve <id> [<id>…] --note "why"
 autoloop.py reject <id> --note "no"
 ```
+
+`reject` writes `status=rejected`; `approve` reverses that same status back to `open`,
+because triage state is the human's to change. Rows that are already `done`, `blocked` or
+`pr_open` are *not* revived — the approval is recorded, and the command says so instead of
+promising a start the next tick would refuse.
+
+Every place that asks for that decision — the report's `- needs your decision
+(approve/reject)` line, the fixed footer's 下一步, and the §十 「待我授权」 record that
+`round` restores from — reads the same predicate as `plan`, over *both* pools
+(`queue.json` and `candidates.json`). A row is named there only while an approval could
+actually start it: `rejected`/`done`/`blocked`/`pr_open` drop out immediately instead of
+sending you back to a decision you already made, and a row whose *kind* is what makes it
+need approval is listed just like one carrying an explicit `policy`.
 
 ### Reviewing the queue, and the merge line (`review`, `merge`)
 
@@ -356,7 +375,9 @@ racing it. All of it lands in `.autoloop/review.json`.
 (PROTOCOL.md §八: 不擅自合并 PR，所有 PR 合并决定交给我). With both thrown it re-reads each PR
 from gh *immediately* before acting — `review` may be ten minutes stale, and a stale
 conclusion is not a reason to touch the base branch — refuses anything that is not
-`auto_merge_ok` and green, merges serially in the reviewed order, fast-forwards its own
+`auto_merge_ok` and green, refuses a PR whose head commit is not the SHA the local gate
+was measured on (a push or a rebase after the gate makes it unverified, however clean the
+diff reads), merges serially in the reviewed order, fast-forwards its own
 checkout so the regression sees the merged tree, and runs `merge_regression_cmd` after each
 merge. `--admin` and `--force` are never passed: bypassing branch protection is not a
 feature, and the test suite fails a run that emits either.
@@ -369,7 +390,7 @@ What it reports, and what it refuses to round up (§PR-6):
 | merged, regression red | `regression_red` — the queue stops *behind* it, the base SHA it stopped at is printed, and the rollback is **yours**. The engine does not revert and does not rewrite shared history |
 | merged, but no `merge_regression_cmd` (or the checkout could not be fast-forwarded) | `pending_verification` — reported as 待验证 with the reason, never as success |
 | PR already MERGED when re-read | `already_merged`, skipped. Not an error, so `--limit` can still make progress on the next tick |
-| anything else failing the re-read (CI red, conflict, draft, closed, base mismatch, forbidden path, secret line) | the queue stops at that PR; the ones behind it are neither skipped nor merged (§PR-4) |
+| anything else failing the re-read (CI red, conflict, draft, closed, base mismatch, head moved since the gate, forbidden path, secret line) | the queue stops at that PR; the ones behind it are neither skipped nor merged (§PR-4) |
 
 Exit code is 1 when the queue stopped or a regression was red, 0 otherwise, and
 `merge --json` prints parseable JSON on *every* path including refusals — a cron line that
@@ -451,10 +472,13 @@ Three pieces close it. `judge_running_job()` now classifies a *running* job as
 `watch` runs that judgement every `watch_interval_s` = 60 s in the foreground of a session
 you already have, so detection latency is about a minute, and it exits 4 once `idle_ticks`
 reaches `idle_gate` instead of spinning till dawn. And a tick that dispatched work is not
-counted as
-idle — `idle_ticks` only climbs while nothing is in flight, which is what makes the
-"stop ticking, go refill the pool" message arrive at the right time rather than after the
-sixth tick of a productive round.
+counted as idle — `idle_ticks` only climbs while nothing is in flight, which is what makes
+the "stop ticking, go refill the pool" message arrive at the right time rather than after
+the sixth tick of a productive round. `idle_reason` is written on that same condition,
+because it says why the *loop* found nothing to do: a second slot that had no eligible task
+next to a developing worker must not turn a busy round into
+「总体状态：正常（待办池空，需要 `suggest` 补任务）」 in a patrol report that is printing
+「队列 1」 and a slot in `developing`.
 
 `light` is the fourth piece, and the one that runs *between* ticks (#v1.6). It never runs
 `git`, never calls `gh`, and never takes `loop.lock` — so it can run every 15 minutes on a
@@ -574,7 +598,7 @@ channel that copies the secret it is alerting about is a second incident.
 |---|---|---|
 | worker cannot fake green | gate runs from the control copy; diff re-checked independently | `green`, `redlines` |
 | no auto-merge / no deploy | merging is off by default and needs `caps.merge_enabled` **and** `--yes-i-will-merge`; no deploy, no migration; `--admin`/`--force` are never passed — and `fake_gh.py` refuses them even in a scenario that allows merge, so a bypass cannot be tested into existence; `auto/` never `main`. Opening the nightly cap changes no behaviour inside the loop: `nightmerge` asserts a `tick` with `merge_enabled=true` still emits zero `gh pr merge` | `green`, `cap`, `backup`, `workerpr`, `mergegate`, `nightmerge` |
-| a merge decision is made against *now* | `_pr_fresh` re-reads each PR from gh immediately before acting; a disagreement (CI went red, conflict, draft, closed, already merged) stops the queue at that PR and the ones behind it wait | `mergeserial`, `mergegate` |
+| a merge decision is made against *now* | `_pr_fresh` re-reads each PR from gh immediately before acting — including its head commit, which must be the SHA the local gate verified (§七) — and a disagreement (CI went red, conflict, draft, closed, already merged, head moved since the gate) stops the queue at that PR and the ones behind it wait | `mergeserial`, `mergegate`, `test_stale_gate_merge.py` |
 | a schedule adds no new authority | the nightly driver is `tick` → `review` → `merge --yes-i-will-merge --now`, generated from whatever `config.json` says, so `init --auto-merge` and a hand-edited cap produce the same line; `--yes-i-will-merge` is still required every invocation, `--now` skips only the batching cap, and an empty queue reports `{"idle": true}` and exits 0 instead of dressing a quiet round up as a failure | `nightmerge`, `test_nightly_auto_merge.py` |
 | merged ≠ verified | `merge_regression_cmd` runs after each merge, on a checkout fast-forwarded to it; red ⇒ `regression_red`, queue stopped, base SHA printed, **no auto-rollback**; unconfigured ⇒ `pending_verification`, never success | `mergered` |
 | the queue cannot lie about what is left | `remaining` is computed against the whole reviewed order, so `--limit` cannot hide work; an already-MERGED PR is recorded `already_merged` — not a failure, and not a second merge | `mergeserial` |
@@ -586,9 +610,9 @@ channel that copies the secret it is alerting about is a second incident.
 | tests are not negotiable | M/D/R on an existing test path is red; additions are fine | `redlines`, `unit` |
 | forbidden files untouched | `FORBIDDEN_GLOBS` (lockfiles, manifests, migrations, `.github/`, Dockerfiles, `.env*`, keys, `.autoloop/**`) — control dirs and CI config are refused at any depth, not only at the repo root | `redlines`, `unit` |
 | scope discipline | `paths` whitelist, disjoint between slots, new test files exempt | `collision`, `green` |
-| no secrets anywhere | `SECRET_LINE_RE` over the diff; state files and PR bodies are checked too | `redlines`, `unit` |
+| no secrets anywhere | `SECRET_LINE_RE` over the diff; state files and PR bodies are checked too, and the free-text notes an operator writes (`alerts --ack --note`, `approve`/`reject --note`) are scrubbed before they reach `alert_acks.json` / the task pools | `redlines`, `unit`, `test_operator_note_scrub.py` |
 | a finished worker does not squat in a slot | `AUTOLOOP_DONE` (or commits + silence) ⇒ session closed, gate run, delivery inside the same tick | `finish`, `nomarker` |
-| a silent worker is not waited on | `stall_s` ⇒ process group killed, reason recorded, repair round resumes the *same* agent session | `stall`, `dsh` |
+| a silent worker is not waited on | `stall_s` ⇒ process group killed, reason recorded, repair round resumes the *same* agent session — and that round is judged on its own run, so one silence cannot block the task | `stall`, `dsh`, `test_stall_repair_recovers` |
 | a hung worker cannot burn the budget | timeout ⇒ kill process group ⇒ force red | `timeout` (also asserts a tick returns in <5 s while the worker sleeps 20 s) |
 | a spinning loop says so out loud | `idle_gate` idle ticks ⇒ writes `STOP` (an open breaker, not a log line) + `watch` exits 4; a tick with work in flight never counts as idle; adding a task does **not** auto-resume | `idlespin` |
 | a loop that delivers nothing stops itself | `no_progress_gate` tasks ending blocked with nothing delivered ⇒ `HALTED` + a critical alert; a real PR resets the streak; `resume` clears file, record and streak | `noprog` |
@@ -621,16 +645,20 @@ Run it yourself (no network, no global state, throwaway repos in `$TMPDIR`):
 ```bash
 python3 -m py_compile scripts/autoloop.py
 python3 tests/selftest.py             # 51 scenarios; add --only <name> for one
-python3 -m unittest discover -s tests  # 80 tests: portable bootstrap + the merge drivers
+python3 -m unittest discover -s tests  # 114 tests: portable bootstrap + the merge drivers
 ```
 
 The `unittest` suite runs the real `install-cron.sh` against a `crontab` shim in `$TMPDIR`,
 so no version of this suite has ever touched the box's crontab — including the tests that
 install and remove the three nightly entries.
 
-Latest full run on this machine: **763 passed, 0 failed (373 s)** and **80 tests, OK
-(53 s)** — Python 3.14.6,
-git 2.50.1, macOS. The seconds are a property of the box, not a regression signal: the same
+Latest full run on this machine: **762 passed, 0 failed (172 s)** and **114 tests, OK
+(61 s)** — Python 3.14.6,
+git 2.50.1, macOS, on a tree that includes main through PR #16. The assertion count reads
+762 rather than 763 because two upstream PRs landed a `subTest` change that alters how many
+expansions the runner reports; the per-scenario `check(...)` count is byte-identical on both
+sides (608), so nothing was lost in the merge. The seconds are a property of the box, not a
+regression signal: the same
 selftest took 391 s one hour earlier on this box at load 16, and 1063 s at load average 213
 (`python3 -c pass` alone cost 3-9 s there), so the pass count is what matters. The engine
 never touches the network in tests:
